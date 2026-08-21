@@ -866,12 +866,6 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             if (_needs_lib_call_no_inline(metadata)
                     and _npu_compiler_supports_option(npu_compiler_path, "--enable-lib-call-no-inline")):
                 _compile_option_list += ["--enable-lib-call-no-inline=false"]
-            if metadata.get("parallel_mode") == "mix_simd_simt":
-                _compile_option_list += ["--enable-simd-simt-mix-compile"]
-                num_warps = metadata.get("num_warps") or opt.num_warps
-                _compile_option_list += [f"--num-warps={num_warps}"]
-                warp_size = metadata.get("warp_size") or opt.warp_size
-                _compile_option_list += [f"--threads-per-warp={warp_size}"]
 
             partition_mode = _validate_partition_and_bind_sub_block(
                 metadata.get(
