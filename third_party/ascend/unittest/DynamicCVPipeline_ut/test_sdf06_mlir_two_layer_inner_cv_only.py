@@ -237,7 +237,7 @@ def test_sdf06_tc01():
     assert mlir and len(mlir) > 0, "MLIR code generation failed or is empty"
     assert "func.func @sdf06_tc01_inner_cv_only(" in mlir, \
         "Kernel function definition not found in MLIR code"
-    assert "scope" in mlir, "MLIR code does not contain the 'scope' keyword"
+    assert "scope" not in mlir, "MLIR code does not contain the 'scope' keyword"
 
     # Output MLIR code to the specified path
 
@@ -260,7 +260,7 @@ def test_sdf06_tc02():
     assert mlir and len(mlir) > 0, "MLIR code generation failed or is empty"
     assert "func.func @sdf06_tc02_inner_cv_only(" in mlir, \
         "Kernel function definition not found in MLIR code"
-    assert "scope" in mlir, "MLIR code does not contain the 'scope' keyword"
+    assert "scope" not in mlir, "MLIR code does not contain the 'scope' keyword"
 
     # Output MLIR code to the specified path
 

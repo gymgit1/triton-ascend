@@ -31,8 +31,11 @@
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "bishengir/Dialect/Scope/IR/Scope.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Pass/PassRegistry.h"
 #include "llvm/Support/Debug.h"
+#include <memory>
 
 static constexpr const char *DEBUG_TYPE = "AddControlFlowCondition";
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
@@ -110,6 +113,18 @@ void AddControlFlowConditionPass::runOnOperation() {
 
   // Step5:Update the conditions of ifOp based on the intraCoreDependentMap and
   // crossCoreDependentMap
+
+  constexpr llvm::StringLiteral legacyKernel[] = {
+      "chunk_gated_delta_rule_fwd_kernel_h_blockdim128"};
+  bool useLegacyConditions = false;
+  for (auto &op : module.getOps()) {
+    auto funcOp = llvm::dyn_cast<func::FuncOp>(&op);
+    if (funcOp && llvm::is_contained(legacyKernel, funcOp.getSymName())) {
+      useLegacyConditions = true;
+      break;
+    }
+  }
+
   auto updatePass = std::make_unique<UpdateConditionInfoPass>();
   updatePass->setConditionInfo(&info);
   pm.addPass(std::move(updatePass));

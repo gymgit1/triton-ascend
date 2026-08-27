@@ -1072,7 +1072,8 @@ void DataDependencyAnalysisPass::runOnOperation() {
   }
   createBlockInfoMap(info);
 
-  // Step 3: Analyze dependencies (populate v2c, c2v lists)
+  // Step 3: Analyze dependencies (v2c/c2v).  Scalar V->C deps come from
+  // analyzeExternalInputs (VECTOR scalars crossing into CUBE).
   analyzeExternalInputs(info);
 
   analyzeExternalOutputs(info);

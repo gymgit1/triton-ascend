@@ -2,42 +2,45 @@
 
 // UpdateConditionInfo on scf.while: cross-core (核间) buffer conditions.
 // Same dual-scope crossCoreDeps skeleton as while-update-condition-counter;
-// CHECKs focus on ssbuffer ptr init, llvm.load/cmpi before ssbuffer.if, and
-// load/addi|subi/store updates inside then.
+// CHECKs focus on ssbuffer memref init, memref.load/cmpi before ssbuffer.if,
+// and load/addi|subi/store updates inside then (post-#1359 MLIR ssbuffer).
 
 // CHECK-LABEL: func.func @while_update_condition_crosscore
 
-// SSBuffer slots initialized to 0.
-// CHECK: %[[ZERO:.*]] = llvm.mlir.constant(0 : i32) : i32
-// CHECK: llvm.store volatile %[[ZERO]], %{{.*}} : i32, !llvm.ptr<11>
-// CHECK: llvm.store volatile %[[ZERO]], %{{.*}} : i32, !llvm.ptr<11>
+// SSBuffer slots initialized to 0 via pointer_cast + memref.store.
+// CHECK: hivm.hir.pointer_cast(%{{.*}}) : memref<i32, #hivm.address_space<ssbuf>>
+// CHECK: memref.store %{{.*}}, %{{.*}}[] : memref<i32, #hivm.address_space<ssbuf>>
+// CHECK: memref.store %{{.*}}, %{{.*}}[] : memref<i32, #hivm.address_space<ssbuf>>
 
 // CHECK: scf.while
 
 // Vector if=5: consumer sgt 0 + producer slt limit, then and-ed with while counter.
-// CHECK: %[[LD_IN5:.*]] = llvm.load volatile %{{.*}} : !llvm.ptr<11> -> i32
+// CHECK: %[[LD_IN5:.*]] = memref.load %{{.*}}[] : memref<i32, #hivm.address_space<ssbuf>>
+// CHECK: annotation.mark %[[LD_IN5]] {memref_ext.volatile}
 // CHECK: %[[SGT5:.*]] = arith.cmpi sgt, %[[LD_IN5]], %{{.*}} : i32
-// CHECK: %[[LD_OUT5:.*]] = llvm.load volatile %{{.*}} : !llvm.ptr<11> -> i32
+// CHECK: %[[LD_OUT5:.*]] = memref.load %{{.*}}[] : memref<i32, #hivm.address_space<ssbuf>>
+// CHECK: annotation.mark %[[LD_OUT5]] {memref_ext.volatile}
 // CHECK: %[[SLT5:.*]] = arith.cmpi slt, %[[LD_OUT5]], %{{.*}} : i32
 // CHECK: %[[CROSS5:.*]] = arith.andi %[[SGT5]], %[[SLT5]]
 // CHECK: %[[AND5:.*]] = arith.andi %[[CROSS5]], %{{.*}}
 // CHECK: scf.if %[[AND5]]
-// CHECK: %[[LD_DEC5:.*]] = llvm.load volatile %{{.*}} : !llvm.ptr<11> -> i32
+// CHECK: %[[LD_DEC5:.*]] = memref.load %{{.*}}[] : memref<i32, #hivm.address_space<ssbuf>>
 // CHECK: %[[SUB5:.*]] = arith.subi %[[LD_DEC5]], %{{.*}} : i32
-// CHECK: llvm.store volatile %[[SUB5]], %{{.*}} : i32, !llvm.ptr<11>
-// CHECK: %[[LD_INC5:.*]] = llvm.load volatile %{{.*}} : !llvm.ptr<11> -> i32
+// CHECK: memref.store %[[SUB5]], %{{.*}}[] : memref<i32, #hivm.address_space<ssbuf>>
+// CHECK: %[[LD_INC5:.*]] = memref.load %{{.*}}[] : memref<i32, #hivm.address_space<ssbuf>>
 // CHECK: %[[ADD5:.*]] = arith.addi %[[LD_INC5]], %{{.*}} : i32
-// CHECK: llvm.store volatile %[[ADD5]], %{{.*}} : i32, !llvm.ptr<11>
+// CHECK: memref.store %[[ADD5]], %{{.*}}[] : memref<i32, #hivm.address_space<ssbuf>>
 // CHECK: } {{.*}}ssbuffer.if = 5
 
 // Vector if=6: consumer-only sgt 0, then and-ed with while counter.
-// CHECK: %[[LD_IN6:.*]] = llvm.load volatile %{{.*}} : !llvm.ptr<11> -> i32
+// CHECK: %[[LD_IN6:.*]] = memref.load %{{.*}}[] : memref<i32, #hivm.address_space<ssbuf>>
+// CHECK: annotation.mark %[[LD_IN6]] {memref_ext.volatile}
 // CHECK: %[[SGT6:.*]] = arith.cmpi sgt, %[[LD_IN6]], %{{.*}} : i32
 // CHECK: %[[AND6:.*]] = arith.andi %[[SGT6]], %{{.*}}
 // CHECK: scf.if %[[AND6]]
-// CHECK: %[[LD_DEC6:.*]] = llvm.load volatile %{{.*}} : !llvm.ptr<11> -> i32
+// CHECK: %[[LD_DEC6:.*]] = memref.load %{{.*}}[] : memref<i32, #hivm.address_space<ssbuf>>
 // CHECK: %[[SUB6:.*]] = arith.subi %[[LD_DEC6]], %{{.*}} : i32
-// CHECK: llvm.store volatile %[[SUB6]], %{{.*}} : i32, !llvm.ptr<11>
+// CHECK: memref.store %[[SUB6]], %{{.*}}[] : memref<i32, #hivm.address_space<ssbuf>>
 // CHECK: } {{.*}}ssbuffer.if = 6
 
 // CHECK: scf.yield

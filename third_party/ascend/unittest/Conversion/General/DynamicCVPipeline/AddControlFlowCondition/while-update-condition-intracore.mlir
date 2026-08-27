@@ -10,8 +10,8 @@
 
 // CHECK: scf.while
 
-// Producer if=5: skip cross llvm.load/slt, then intra control_var < 1.
-// CHECK: llvm.load volatile
+// Producer if=5: skip cross memref.load/slt, then intra control_var < 1.
+// CHECK: memref.load %{{.*}}[] : memref<i32, #hivm.address_space<ssbuf>>
 // CHECK: arith.cmpi slt, %{{.*}}, %{{.*}} : i32
 // CHECK: %[[LIM:.*]] = arith.constant 1 : i32
 // CHECK: %[[SLT:.*]] = arith.cmpi slt, %{{.*}}, %[[LIM]] : i32

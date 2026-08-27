@@ -95,9 +95,6 @@ static inline MatmulInputs parseMatmulInputs(linalg::MatmulOp matmulOp) {
 
 // The user is responsible for checking biasDefOp is not null.
 static bool operationIsFillZero(Operation *op) {
-  if (!op) {
-    return false;
-  }
   auto fillOp = dyn_cast<linalg::FillOp>(op);
   if (!fillOp) {
     return false;
@@ -484,10 +481,26 @@ static bool shouldSplitByInput(linalg::MatmulOp matmulOp, Value &outerOutValue,
   if (isInputFilter(matmulOp, outerOutValue, outerInValue)) {
     return true;
   }
+  auto outerInOp = outerInValue.getDefiningOp();
+  if (!outerInOp) {
+    return true;
+  }
+
   if (operationIsFillZero(outerInValue.getDefiningOp())) {
     LOG_DEBUG("Not split because bias is zero. " << matmulOp);
     return false;
   }
+
+  auto broadcastOp = dyn_cast<linalg::BroadcastOp>(outerInOp);
+  if (!broadcastOp)
+    return true;
+  if (auto btUsage = CVPipeline::getBTSizeFromValidBroadcastOp(broadcastOp)) {
+    if (btUsage != -1 && btUsage <= CVPipeline::CACHE_TABLE_BUFFER_SIZE) {
+      LOG_DEBUG("Not split because broadcast bias is small. " << matmulOp);
+      return false;
+    }
+  }
+
   auto defMatmul = dyn_cast_if_present<linalg::MatmulOp>(
       hivm::traceDefOp<linalg::MatmulOp>(outerInValue).value_or(nullptr));
   if (defMatmul) {
@@ -707,6 +720,8 @@ static LogicalResult splitMatmul(linalg::MatmulOp matmulOp,
                                                   splitInfo.outerOutValue);
     auto selectOp = rewriter.create<arith::SelectOp>(
         loc, executed, splitInfo.outerOutValue, fillOp.getResult(0));
+    fillOp->setAttr(CVPipeline::kForMayNotExec, rewriter.getUnitAttr());
+    selectOp->setAttr(CVPipeline::kForMayNotExec, rewriter.getUnitAttr());
     newOutValue = selectOp.getResult();
     preservedUsers.insert(selectOp);
     preservedUsers.insert(fillOp);

@@ -172,21 +172,18 @@ static FillInfo findFillOpInSCFIf(Value allocResult) {
 }
 
 /**
- * @brief Check if scf.if needs to be split
+ * @brief Check if the scf.if containing linalg.fill has other operations
  *
- * Determines whether the scf.if operation containing linalg.fill needs to be
- * split. Split is needed when the if branch contains multiple operations (not
- * just linalg.fill).
+ * Determines whether the then region of the scf.if that contains linalg.fill
+ * also contains other operations besides linalg.fill. If it does, unification
+ * must be aborted, because the linalg.fill is mixed with unrelated operations
+ * and unifying the whole scf.if block_id would be incorrect.
  *
  * @param info FillInfo structure containing fillOp and parentIf
- * @return bool Returns true if split is needed, false otherwise
- *
- * @note Split logic:
- *       - If branch only has linalg.fill (+ scf.yield terminator), no split
- * needed
- *       - If branch has other operations besides linalg.fill, split needed
+ * @return bool Returns true if there are other ops besides linalg.fill in the
+ *         then region, false otherwise
  */
-static bool needsSplitIf(const FillInfo &info) {
+static bool hasOtherOpsInIf(const FillInfo &info) {
   if (!info.fillOp || !info.parentIf) {
     return false;
   }
@@ -198,72 +195,6 @@ static bool needsSplitIf(const FillInfo &info) {
     opCount++;
   }
   return opCount > 1;
-}
-
-/**
- * @brief Split scf.if into two separate scf.if blocks
- *
- * When an scf.if branch contains multiple operations (linalg.fill + other ops),
- * this function splits it into two scf.if blocks:
- * - One containing only linalg.fill (will be unified)
- * - One containing other operations (keeps original block_id)
- *
- * @param info FillInfo structure containing fillOp and parentIf
- * @return FillInfo Updated FillInfo pointing to the new fill-only scf.if
- *
- * @note Split pattern:
- *       Before:
- *         scf.if %cond {
- *           linalg.fill {block_id=8} ins(%v) outs(%alloc)  // keep
- *           arith.addf {block_id=12} %x, %y               // move to new scf.if
- *         } {hivm.unlikely_condition}
- *
- *       After:
- *         scf.if %cond {
- *           linalg.fill {block_id=8} ins(%v) outs(%alloc)  // keep
- *         } {hivm.unlikely_condition}
- *
- *         scf.if %cond {
- *           arith.addf {block_id=12} %x, %y               // new scf.if
- *         } {hivm.unlikely_condition}
- */
-static FillInfo splitSCFIfIfNeeded(FillInfo &info) {
-  Block *originalBlock = info.fillOp->getBlock();
-  Operation *fillOp = info.fillOp.getOperation();
-  scf::IfOp originalIf = info.parentIf;
-  Value cond = originalIf.getCondition();
-  Location loc = originalIf.getLoc();
-
-  SmallVector<Operation *> otherOps;
-  for (auto &op : originalBlock->without_terminator()) {
-    if (&op != fillOp) {
-      otherOps.push_back(&op);
-    }
-  }
-
-  if (otherOps.empty()) {
-    return info;
-  }
-
-  DictionaryAttr originalAttrs = originalIf->getAttrDictionary();
-
-  OpBuilder builder(originalIf);
-
-  fillOp->moveBefore(originalIf.getOperation()->getNextNode());
-  builder.setInsertionPointAfter(fillOp);
-
-  auto newFillIf =
-      builder.create<scf::IfOp>(loc, cond, /*withElseRegion=*/false);
-  if (originalAttrs) {
-    for (auto attr : originalAttrs) {
-      newFillIf->setAttr(attr.getName(), attr.getValue());
-    }
-  }
-
-  fillOp->moveBefore(newFillIf.getThenRegion().front().getTerminator());
-
-  info.parentIf = newFillIf;
-  return info;
 }
 
 /**
@@ -302,10 +233,10 @@ tryUnifyForAlloc(memref::AllocOp allocOp,
   }
   LOG_DEBUG("[getSameBlockId] GetSameBlockId: " << targetBlockId);
 
-  // Step4: Split if scf.if contains multiple operations
-  if (needsSplitIf(fillInfo)) {
-    LOG_DEBUG("[needsSplitIf] SCF.IF need split ");
-    fillInfo = splitSCFIfIfNeeded(fillInfo);
+  // Step4: If the scf.if has other operations besides linalg.fill, abort
+  if (hasOtherOpsInIf(fillInfo)) {
+    LOG_DEBUG("[warning] SCF.IF has other ops, failed to unify");
+    return success();
   }
 
   // Step5: Cycle detection and block_id assignment

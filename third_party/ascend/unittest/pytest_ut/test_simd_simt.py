@@ -103,7 +103,7 @@ def indirect_index_load_add_kernel(src_ptr, add_ptr, indices_ptr, out_ptr, BLOCK
 
 @simd_simt_910_95_only
 def test_indirect_index_load_add_kernel():
-    src = torch.arange(256, dtype=torch.float32, device='npu')
+    src = torch.arange(260, dtype=torch.float32, device='npu')
     add_src = torch.arange(8, dtype=torch.float32, device='npu')
     print(f"Source data: [{src[0]}, {src[1]}, ..., {src[255]}]")
 
@@ -233,7 +233,7 @@ def indirect_index_load_mul_kernel(src_ptr, add_ptr, indices_ptr, out_ptr, offse
 
 @simd_simt_910_95_only
 def test_indirect_index_load_mul_kernel():
-    src = torch.arange(256, dtype=torch.float32, device='npu')
+    src = torch.arange(280, dtype=torch.float32, device='npu')
     add_src = torch.arange(8, dtype=torch.float32, device='npu')
     print(f"Source data: [{src[0]}, {src[1]}, ..., {src[255]}]")
 

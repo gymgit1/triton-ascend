@@ -22,11 +22,13 @@
 
 #ifndef ADD_AUTO_SCHEDULING_COMMON_UTILS_H
 #define ADD_AUTO_SCHEDULING_COMMON_UTILS_H
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
 #include "llvm/ADT/StringRef.h"
+#include <cstdint>
 #include <optional>
 #include <string_view>
 
@@ -59,8 +61,11 @@ inline constexpr llvm::StringLiteral kLoopCarriedL0C =
 inline constexpr llvm::StringLiteral kCrossCoreDeps = "ssbuffer.crossCoreDeps";
 inline constexpr llvm::StringLiteral kIntraDeps = "ssbuffer.intraDeps";
 inline constexpr llvm::StringLiteral kMemCrossDeps = "ssbuffer.memCrossDeps";
+inline constexpr llvm::StringLiteral kDepMark = "ssbuffer.dep_mark";
 inline constexpr llvm::StringLiteral kMayNotExec = "ssbuffer.may_not_exec";
 inline constexpr llvm::StringLiteral kIterCounter = "ssbuffer.iterCounter";
+inline constexpr llvm::StringLiteral kForMayNotExec =
+    "ssbuffer.for_may_not_exec";
 inline constexpr llvm::StringLiteral kClone = "ssbuffer.clone";
 inline constexpr llvm::StringLiteral kEnableUbRefineOpt =
     "ssbuffer.enable_ub_refine_opt";
@@ -71,6 +76,7 @@ inline constexpr llvm::StringLiteral kWhileArg = "ssbuffer.while_arg";
 static constexpr llvm::StringLiteral kInlinableQuantScaleAttr =
     "enable_fast_tf32_mul";
 inline constexpr llvm::StringLiteral kGMLoadMultiBufferHintAttr = "gm_load";
+inline constexpr llvm::StringLiteral kGMLoadHintAttr = "gm_load_hint";
 inline constexpr llvm::StringLiteral kHIVMMatmulLimitedInCubeAttr =
     "hivm.matmul_limited_in_cube";
 inline constexpr llvm::StringLiteral kTightlyCoupledBufferAttr =
@@ -230,6 +236,7 @@ bool isViewLike(Operation *op);
 // 0 scalar constant. Used to detect the "add 0" operand of VECTOR pseudo-ops
 // (`arith.addf` / `arith.addi` carrying `ssbuffer.add_from_matmul`).
 bool isZeroFillValue(Value v);
+bool isZeroAdd(mlir::Operation *op);
 
 // Read the `hivm.tightly_coupled_buffer<N>` id attached to a `memref.alloc`
 // via its `annotation.mark` user. Returns nullopt when no annotation with
@@ -241,6 +248,10 @@ std::optional<int> getTightlyCoupledBufferId(Value allocVal);
 // `bufferization.to_tensor`'s source. Returns the input unchanged when no
 // such cast is found.
 Value traceBackToMemrefAlloc(Value v);
+bool allResultHasOneUser(Operation *op);
+
+int64_t getBTSizeFromValidBroadcastOp(linalg::BroadcastOp broadcastOp);
+
 int getLoopCarriedArgIndex(Value operand, Block *block);
 
 } // namespace CVPipeline
