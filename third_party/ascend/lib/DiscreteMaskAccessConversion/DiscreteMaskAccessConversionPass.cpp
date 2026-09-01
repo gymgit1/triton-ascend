@@ -184,6 +184,16 @@ LogicalResult isDiscreteMask(Operation *op, Value mask,
   }
 
   MaskState mstate;
+
+  // For non-XCHG atomics, when the ptr is structured and the mask is not classified as discrete 
+  // when in this pass but would be classified as discrete in T2L, it will fail.
+  // Temporarily modify the mask analysis logic so that the mask can also be recognized as discrete when in this pass.
+  // TODO: Re evaluate and align ptr analysis/mask analysis for T2U and T2L passes.
+  if (auto atomicOp = dyn_cast<mlir::triton::AtomicRMWOp>(op)) {
+    if (atomicOp.getAtomicRmwOp() != RMWOp::XCHG)
+      mstate.strictNoLoop = true;
+  }
+
   auto isContMask = mstate.parse(mask, op->getLoc(), rewriter);
   if (!isContMask.failed()) {
     mstate.eraseInsertedOps(op, rewriter);

@@ -55,6 +55,8 @@ public:
   SmallVector<OpFoldResult> offsets;
   OpFoldResult scalar;
 
+  bool strictNoLoop = false;
+
   int64_t getRank() const {
     assert(dims.size() == offsets.size() && "dims and offsets rank mismatch!");
     return dims.size();
@@ -201,6 +203,10 @@ private:
   // Operand is the result of insert
   LogicalResult parseInsert(tensor::InsertOp insertOp, const Location &loc,
                             OpBuilder &builder);
+
+  void inheritStrictFlags(const MaskState &parent) {
+    strictNoLoop = parent.strictNoLoop;
+  }
 };
 
 std::optional<MaskState> runMaskAnalysis(Operation *op, OpBuilder &builder);

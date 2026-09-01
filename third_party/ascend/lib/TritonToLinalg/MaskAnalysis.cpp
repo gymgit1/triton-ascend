@@ -92,6 +92,8 @@ LogicalResult MaskState::parse(Value operand, const Location &loc,
   if (auto blockArgument = dyn_cast<BlockArgument>(operand)) {
     auto parentOp = blockArgument.getOwner()->getParentOp();
     if (auto loopOp = dyn_cast<LoopLikeOpInterface>(parentOp)) {
+      if (this->strictNoLoop)
+        return failure(); // temporarily disable loop
       OpOperand *initArgOperand = loopOp.getTiedLoopInit(blockArgument);
       if (initArgOperand) {
         Value initArg = initArgOperand->get();
@@ -356,11 +358,13 @@ LogicalResult MaskState::parseAdd(arith::AddIOp addOp, const Location &loc,
                                   OpBuilder &builder) {
   assert(this->isEmpty());
   MaskState lhsState;
+  lhsState.inheritStrictFlags(*this);
   if (failed(lhsState.parse(addOp.getLhs(), loc, builder))) {
     return failure();
   }
 
   MaskState rhsState;
+  rhsState.inheritStrictFlags(*this);
   if (failed(rhsState.parse(addOp.getRhs(), loc, builder))) {
     return failure();
   }
@@ -372,11 +376,13 @@ LogicalResult MaskState::parseDiv(arith::DivSIOp divOp, const Location &loc,
   assert(this->isEmpty());
   return failure(); // temporarily disable parseDiv
   MaskState lhsState;
+  lhsState.inheritStrictFlags(*this);
   if (failed(lhsState.parse(divOp.getLhs(), loc, builder))) {
     return failure();
   }
 
   MaskState rhsState;
+  rhsState.inheritStrictFlags(*this);
   if (failed(rhsState.parse(divOp.getRhs(), loc, builder))) {
     return failure();
   }
@@ -387,12 +393,14 @@ LogicalResult MaskState::parseAnd(arith::AndIOp andOp, const Location &loc,
                                   OpBuilder &builder) {
   assert(this->isEmpty());
   MaskState lhsState;
+  lhsState.inheritStrictFlags(*this);
   if (failed(lhsState.parse(andOp.getLhs(), loc, builder)) ||
       !lhsState.isMask()) {
     return failure();
   }
 
   MaskState rhsState;
+  rhsState.inheritStrictFlags(*this);
   if (failed(rhsState.parse(andOp.getRhs(), loc, builder)) ||
       !rhsState.isMask()) {
     return failure();
@@ -413,6 +421,7 @@ LogicalResult MaskState::parseSel(arith::SelectOp selOp, const Location &loc,
   auto falseValue = selOp.getFalseValue();
 
   MaskState condState;
+  condState.inheritStrictFlags(*this);
   auto condition = selOp.getCondition();
   auto cmpOp = condition.getDefiningOp<arith::CmpIOp>();
   if (!cmpOp || failed(condState.parse(condition, loc, builder))) {
@@ -420,11 +429,13 @@ LogicalResult MaskState::parseSel(arith::SelectOp selOp, const Location &loc,
   }
 
   MaskState trueState;
+  trueState.inheritStrictFlags(*this);
   if (failed(trueState.parse(trueValue, loc, builder)) || !trueState.scalar) {
     return failure();
   }
 
   MaskState falseState;
+  falseState.inheritStrictFlags(*this);
   if (failed(falseState.parse(falseValue, loc, builder)) || !falseState.scalar) {
     return failure();
   }
@@ -462,7 +473,9 @@ LogicalResult MaskState::parseCmp(arith::CmpIOp cmpOp, const Location &loc,
   }
 
   MaskState lhsState;
+  lhsState.inheritStrictFlags(*this);
   MaskState rhsState;
+  rhsState.inheritStrictFlags(*this);
   auto lhs = cmpOp.getLhs();
   auto rhs = cmpOp.getRhs();
 
