@@ -2237,6 +2237,7 @@ class AutoTilingTuner(Autotuner):
         if self.is_simt_mode and kwargs.get('simt_stack_limit', None) is None:
             kwargs['simt_stack_limit'] = self.simt_stack_limit
         used_cached_result = True
+        single_config_cache_pending = False
         if cache_miss:
             # prune configs
             pruned_configs = self.prune_configs(kwargs)
@@ -2253,6 +2254,7 @@ class AutoTilingTuner(Autotuner):
                 config = self.cache[key]
             else:
                 config = pruned_configs[0]
+                single_config_cache_pending = True
         else:
             config = self.cache[key]
 
@@ -2278,6 +2280,8 @@ class AutoTilingTuner(Autotuner):
                 *args,
                 **final_kwargs,
             )
+            if single_config_cache_pending:
+                self.cache[key] = config
             return ret
         finally:
             self.nargs = None
