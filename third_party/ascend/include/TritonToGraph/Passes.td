@@ -74,7 +74,7 @@ def GraphOptimize : Pass<"graph-optimize", "mlir::ModuleOp"> {
   let constructor = "mlir::triton::cfg::createGraphOptimizePass()";
   let options = [
     Option<"ruleMask", "rule-mask", "uint64_t", "3071",
-           "Bitmask of known 32-bit graph rule identities; default 3071 preserves the legacy native bundle and enables IAT/PTSM. RLF/IPBE/SCP/CBAF remain explicit opt-in">,
+           "Bitmask of known 32-bit graph rule identities; default 3071 preserves the legacy native bundle and enables IAT/PTSM. RLF/IPBE/SCP/CBAF/SelectedBlockScan remain explicit opt-in; SelectedBlockScan is default-off and rewrites nothing until the QueryRowBatching gate (Rule B) accepts">,
     Option<"maxRewritesPerFunction", "max-rewrites-per-function", "uint64_t",
            "64", "Maximum graph rewrites per function">,
     Option<"ubCapacityBytes", "ub-capacity-bytes", "uint64_t", "0",
@@ -97,6 +97,8 @@ def GraphOptimize : Pass<"graph-optimize", "mlir::ModuleOp"> {
            "Percent of L0A/L0B/L0C capacity available to resource candidates">,
     Option<"compileMode", "compile-mode", "std::string", "\"simd_simt_template\"",
            "Compilation mode; legacy elementwise RowCoalescing is enabled only for simt_only">,
+    Option<"selectedBlockScanForceApply", "selected-block-scan-force-apply", "bool", "false",
+           "Test-only: force the selected-block-scan rewrite, bypassing the joint Rule A + Rule B gate. Not reachable from the Python backend.">,
   ];
 }
 

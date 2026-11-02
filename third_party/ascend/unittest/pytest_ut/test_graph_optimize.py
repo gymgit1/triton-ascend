@@ -21,6 +21,7 @@
 import json
 import os
 import subprocess
+from pathlib import Path
 
 os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
 
@@ -32,8 +33,12 @@ from triton._C.libtriton.ascend import ir as ascend_ir
 from triton.backends.ascend.compiler import NPUOptions, make_ttir
 from triton.backends.ascend.program_grid import (
     DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK,
+    GRAPH_OPTIMIZATION_KNOWN_RULE_MASK,
     INDEPENDENT_AXIS_TENSORIZE_RULE_BIT,
     PERSISTENT_TASK_STRIP_MINING_RULE_BIT,
+    ProgramGridContractError,
+    SELECTED_BLOCK_SCAN_RULE_BIT,
+    normalize_graph_optimization_rule_mask,
 )
 from triton.compiler.code_generator import ast_to_ttir
 from triton.compiler.compiler import ASTSource
@@ -914,3 +919,96 @@ def test_convert_modulo_to_mask_numerical_equivalence(monkeypatch, tmp_path):
 
 def test_graph_optimize_options_contribute_to_npu_hash():
     assert (NPUOptions(enable_graph_optimize=False).hash() != NPUOptions(enable_graph_optimize=True).hash())
+
+
+# --- #2686 Rule A (SelectedBlockScanRule, rule bit SELECTED_BLOCK_SCAN_RULE_BIT) ---
+#
+# The bit is wired through TWO whitelists that must be changed together:
+#   * the C++ one, kKnownGraphOptimizationRuleMask in
+#     third_party/ascend/include/TritonToGraph/GraphOptimization.h:225, enforced
+#     by triton-opt and by add_graph_optimize, and
+#   * the Python one, GRAPH_OPTIMIZATION_KNOWN_RULE_MASK in
+#     third_party/ascend/backend/program_grid.py, which moved from 0xFBFF (15
+#     bits: 0-9 and 11-15) to 0x1FBFF (those 15 bits plus bit 16), enforced by
+#     NPUOptions and normalize_graph_optimization_rule_mask.
+# Widening only one layer fails differently: C++-only keeps NPUOptions raising
+# at option construction; Python-only lets the option through and the pybind
+# add_graph_optimize rejects it instead.  The five cases below pin both layers
+# plus the "default stays off", "unknown bits stay rejected" and "accepted means
+# eligible, not force-applied" contracts.
+
+RULE_A_TTIR_FIXTURES = (Path(__file__).resolve().parent.parent / "Conversion" / "General" / "TritonToGraph" /
+                        "Inputs")
+
+
+def test_rule_mask_accepts_selected_block_scan():
+    # The two whitelists must land together: the C++ kKnown mask and the
+    # Python GRAPH_OPTIMIZATION_KNOWN_RULE_MASK (0xFBFF -> 0x1FBFF).
+    options = NPUOptions(arch="Ascend910_95", rule_mask=SELECTED_BLOCK_SCAN_RULE_BIT)
+    assert options.rule_mask == SELECTED_BLOCK_SCAN_RULE_BIT
+    assert GRAPH_OPTIMIZATION_KNOWN_RULE_MASK & SELECTED_BLOCK_SCAN_RULE_BIT
+
+
+def test_rule_mask_still_rejects_unknown_bits():
+    with pytest.raises(ValueError):
+        NPUOptions(arch="Ascend910_95", rule_mask=1 << 20)
+    with pytest.raises(ProgramGridContractError):
+        normalize_graph_optimization_rule_mask(1 << 20)
+
+
+def test_default_graph_mask_unchanged():
+    assert DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK == 3071
+    assert NPUOptions(arch="Ascend910_95").rule_mask == 3071
+    assert not (DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK & SELECTED_BLOCK_SCAN_RULE_BIT)
+
+
+def test_add_graph_optimize_accepts_selected_block_scan(tmp_path):
+    module = make_ast_ttir(NPUOptions(arch="Ascend910_95"))
+    pm = ir.pass_manager(module.context)
+    ascend.passes.ttir.add_graph_optimize(pm, rule_mask=SELECTED_BLOCK_SCAN_RULE_BIT)
+    pm.run(module, "")
+
+    assert "tt.func" in str(module)
+    assert_reparseable(module, tmp_path, "selected-block-scan-mask")
+
+
+def test_rule_a_gate_off_leaves_real_kernel_ir_unchanged():
+    """`accepted` must mean `eligible`, not `force applied`.
+
+    The earlier version of this test ran on `graph_optimize_kernel`, which has no
+    gather loop at all: a byte-identical result only proved that the matcher
+    never ran, not that the gate held.  This one uses the positive TTIR fixture
+    the lit tests rewrite (a real NSA forward kernel that does contain the
+    pattern), asserts the pattern really is present, and then pins that adding
+    bit 16 to the default mask changes nothing -- the rule is eligible but not
+    force-applied, so the joint Rule A + Rule B gate declines while the plan is
+    being built.  The rewriting half of the gate is covered by the lit
+    `-force-apply` RUN lines, which can pass the escape hatch the Python option
+    surface deliberately does not expose; that escape hatch does rewrite this
+    exact fixture, which is what makes the equality here attributable to the
+    gate rather than to a non-match.
+
+    Shared fixture: this is the same file
+    `unittest/Conversion/General/TritonToGraph/nsa_selected_block_scan.mlir`
+    feeds to triton-opt, so moving or renaming `Inputs/nsa_fwd_const_ns.mlir`
+    has to update both places -- the pytest reads the fixture directly instead
+    of duplicating it.
+    """
+    fixture = RULE_A_TTIR_FIXTURES / "nsa_fwd_const_ns.mlir"
+    source = fixture.read_text()
+    # The pattern Rule A matches: an i64 gather-table load inside the scan loop.
+    assert "!tt.ptr<i64>" in source
+    assert "scf.for" in source
+
+    def render(mask):
+        context = ir.context()
+        ir.load_dialects(context)
+        ascend_ir.load_dialects(context)
+        module = ir.parse_mlir_module(str(fixture), context)
+        pm = ir.pass_manager(context)
+        ascend.passes.ttir.add_graph_optimize(pm, rule_mask=mask)
+        pm.run(module, "")
+        return str(module)
+
+    default_mask = DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK
+    assert render(default_mask) == render(default_mask | SELECTED_BLOCK_SCAN_RULE_BIT)

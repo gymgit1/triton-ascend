@@ -59,9 +59,10 @@ namespace triton {
 namespace cfg {
 namespace {
 
-constexpr std::array<GraphOptimizationRulePhase, 11> kRulePhases = {
+constexpr std::array<GraphOptimizationRulePhase, 12> kRulePhases = {
     GraphOptimizationRulePhase::DiagonalMaskRemoval,
     GraphOptimizationRulePhase::ConvertModuloToMask,
+    GraphOptimizationRulePhase::SelectedBlockScan,
     GraphOptimizationRulePhase::ProgramMapping,
     GraphOptimizationRulePhase::PersistentTaskMapping,
     GraphOptimizationRulePhase::LoadStoreTranspose,
@@ -135,6 +136,7 @@ public:
     this->mappingL0CCapacityBytes = options.mappingL0CCapacityBytes;
     this->l0SafetyPercent = options.l0SafetyPercent;
     this->compileMode = options.compileMode;
+    this->selectedBlockScanForceApply = options.selectedBlockScan.forceApply;
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {
@@ -269,6 +271,7 @@ GraphOptimizePass::getStableOptions(GraphOptimizationOptions &options) {
       *compileMode != triton::ascend::CompileMode::SimtOnly;
   options.storeCoalescing.enabledForCompileMode =
       *compileMode != triton::ascend::CompileMode::SimtOnly;
+  options.selectedBlockScan.forceApply = this->selectedBlockScanForceApply;
   return success();
 }
 
@@ -582,6 +585,10 @@ void populateBuiltinGraphOptimizationRules(
                     GraphOptimizationRuleId::ContiguousBlockAccessFormation)) {
     rules.push_back(createContiguousBlockAccessFormationRule(
         options.contiguousBlockAccessFormation));
+  }
+  if (isRuleEnabled(options.enabledRuleMask,
+                    GraphOptimizationRuleId::SelectedBlockScan)) {
+    rules.push_back(createSelectedBlockScanRule(options.selectedBlockScan));
   }
   const auto compileMode =
       triton::ascend::parseCompileMode(options.compileMode);

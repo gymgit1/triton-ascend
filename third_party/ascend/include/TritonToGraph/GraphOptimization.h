@@ -66,11 +66,13 @@ enum class GraphOptimizationRuleId : GraphOptimizationRuleMask {
   IntermediatePrecisionBoundaryElision = 8192,
   StoreCoveragePlanning = 16384,
   ContiguousBlockAccessFormation = 32768,
+  SelectedBlockScan = 65536,
 };
 
 enum class GraphOptimizationRulePhase : uint8_t {
   DiagonalMaskRemoval,
   ConvertModuloToMask,
+  SelectedBlockScan,
   ProgramMapping,
   PersistentTaskMapping,
   LoadStoreTranspose,
@@ -117,6 +119,8 @@ getGraphOptimizationRuleName(GraphOptimizationRuleId rule) {
     return "StoreCoveragePlanningRule";
   case GraphOptimizationRuleId::ContiguousBlockAccessFormation:
     return "ContiguousBlockAccessFormationRule";
+  case GraphOptimizationRuleId::SelectedBlockScan:
+    return "SelectedBlockScanRule";
   }
   return "Unknown";
 }
@@ -133,6 +137,8 @@ getGraphOptimizationRulePhase(GraphOptimizationRuleId rule) {
     return GraphOptimizationRulePhase::DiagonalMaskRemoval;
   case GraphOptimizationRuleId::ConvertModuloToMask:
     return GraphOptimizationRulePhase::ConvertModuloToMask;
+  case GraphOptimizationRuleId::SelectedBlockScan:
+    return GraphOptimizationRulePhase::SelectedBlockScan;
   case GraphOptimizationRuleId::IndependentAxisTensorize:
     return GraphOptimizationRulePhase::ProgramMapping;
   case GraphOptimizationRuleId::PersistentTaskStripMining:
@@ -161,7 +167,7 @@ getGraphOptimizationRulePhase(GraphOptimizationRuleId rule) {
   return GraphOptimizationRulePhase::Compatibility;
 }
 
-constexpr std::array<GraphOptimizationRuleId, 15>
+constexpr std::array<GraphOptimizationRuleId, 16>
     kGraphOptimizationRuleRegistry = {
         GraphOptimizationRuleId::LoadStoreTranspose,
         GraphOptimizationRuleId::TransposePointwiseReorder,
@@ -178,6 +184,7 @@ constexpr std::array<GraphOptimizationRuleId, 15>
         GraphOptimizationRuleId::IntermediatePrecisionBoundaryElision,
         GraphOptimizationRuleId::StoreCoveragePlanning,
         GraphOptimizationRuleId::ContiguousBlockAccessFormation,
+        GraphOptimizationRuleId::SelectedBlockScan,
 };
 
 constexpr bool hasUniqueSingleBitGraphOptimizationRuleIds() {
@@ -227,7 +234,8 @@ constexpr GraphOptimizationRuleMask kKnownGraphOptimizationRuleMask =
     getGraphOptimizationRuleMask(
         GraphOptimizationRuleId::StoreCoveragePlanning) |
     getGraphOptimizationRuleMask(
-        GraphOptimizationRuleId::ContiguousBlockAccessFormation);
+        GraphOptimizationRuleId::ContiguousBlockAccessFormation) |
+    getGraphOptimizationRuleMask(GraphOptimizationRuleId::SelectedBlockScan);
 
 constexpr GraphOptimizationRuleMask kDefaultEligibleGraphOptimizationRuleMask =
     kLegacyGraphOptimizationRuleMask |
@@ -244,7 +252,8 @@ constexpr GraphOptimizationRuleMask kFixedDefaultOffGraphOptimizationRuleMask =
     getGraphOptimizationRuleMask(
         GraphOptimizationRuleId::StoreCoveragePlanning) |
     getGraphOptimizationRuleMask(
-        GraphOptimizationRuleId::ContiguousBlockAccessFormation);
+        GraphOptimizationRuleId::ContiguousBlockAccessFormation) |
+    getGraphOptimizationRuleMask(GraphOptimizationRuleId::SelectedBlockScan);
 
 constexpr GraphOptimizationRuleMask kDefaultGraphOptimizationRuleMask =
     kDefaultEligibleGraphOptimizationRuleMask;
@@ -277,6 +286,16 @@ static_assert(static_cast<unsigned>(getGraphOptimizationRulePhase(
                   static_cast<unsigned>(getGraphOptimizationRulePhase(
                       GraphOptimizationRuleId::ContiguousBlockAccessFormation)),
               "store planning must run before access formation");
+static_assert(static_cast<unsigned>(getGraphOptimizationRulePhase(
+                  GraphOptimizationRuleId::ConvertModuloToMask)) <
+                  static_cast<unsigned>(getGraphOptimizationRulePhase(
+                      GraphOptimizationRuleId::SelectedBlockScan)),
+              "modulo-to-mask must run before the selected-block scan");
+static_assert(static_cast<unsigned>(getGraphOptimizationRulePhase(
+                  GraphOptimizationRuleId::SelectedBlockScan)) <
+                  static_cast<unsigned>(getGraphOptimizationRulePhase(
+                      GraphOptimizationRuleId::IndependentAxisTensorize)),
+              "selected-block scan must run before program mapping");
 
 constexpr bool
 isValidGraphOptimizationRuleMask(GraphOptimizationRuleMask ruleMask) {
@@ -299,6 +318,9 @@ struct ResidentLoadForwardingRuleOptions {};
 struct IntermediatePrecisionBoundaryElisionRuleOptions {};
 struct StoreCoveragePlanningRuleOptions {};
 struct ContiguousBlockAccessFormationRuleOptions {};
+struct SelectedBlockScanRuleOptions {
+  bool forceApply = false;
+};
 
 struct GraphOptimizationOptions {
   // A zero mask intentionally disables every native GraphOptimizationRule.
@@ -329,6 +351,7 @@ struct GraphOptimizationOptions {
       intermediatePrecisionBoundaryElision;
   StoreCoveragePlanningRuleOptions storeCoveragePlanning;
   ContiguousBlockAccessFormationRuleOptions contiguousBlockAccessFormation;
+  SelectedBlockScanRuleOptions selectedBlockScan;
 };
 
 std::unique_ptr<OperationPass<ModuleOp>>

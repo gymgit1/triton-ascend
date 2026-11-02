@@ -34,6 +34,8 @@ add_triton_library(TritonToGraph
   Rules/DotRowCoalescing.cpp
   Rules/TransposePointwiseReorderRule.cpp
   Rules/StoreCoalescingRule.cpp
+  Rules/SelectedBlockScanRule.cpp
+  Rules/QueryRowBatchingRule.cpp
 
   DEPENDS
   TritonToGraphPassIncGen
