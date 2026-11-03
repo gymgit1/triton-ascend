@@ -74,7 +74,7 @@ def GraphOptimize : Pass<"graph-optimize", "mlir::ModuleOp"> {
   let constructor = "mlir::triton::cfg::createGraphOptimizePass()";
   let options = [
     Option<"ruleMask", "rule-mask", "uint64_t", "3071",
-           "Bitmask of known 32-bit graph rule identities; default 3071 preserves the legacy native bundle and enables IAT/PTSM. RLF/IPBE/SCP/CBAF/SelectedBlockScan remain explicit opt-in; SelectedBlockScan is default-off and rewrites nothing until the QueryRowBatching gate (Rule B) accepts">,
+           "Bitmask of known 32-bit graph rule identities; default 3071 preserves the legacy native bundle and enables IAT/PTSM. RLF/IPBE/SCP/CBAF/SelectedBlockScan/QueryRowBatching remain explicit opt-in; both NSA rules are default-off and SelectedBlockScan only commits when the QueryRowBatching gate (Rule B) accepts">,
     Option<"maxRewritesPerFunction", "max-rewrites-per-function", "uint64_t",
            "64", "Maximum graph rewrites per function">,
     Option<"ubCapacityBytes", "ub-capacity-bytes", "uint64_t", "0",

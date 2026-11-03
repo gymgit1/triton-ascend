@@ -66,12 +66,28 @@ enum class GraphOptimizationRuleId : GraphOptimizationRuleMask {
   IntermediatePrecisionBoundaryElision = 8192,
   StoreCoveragePlanning = 16384,
   ContiguousBlockAccessFormation = 32768,
+  // 规则 A（selected-block scan）：把按下标表选择的稀疏循环改写成顺序扫描，
+  // 且必须在规则 B 行提升之前完成。默认关闭，只有显式置位该规则位时才注册。
+  // Rule A (selected-block scan) turns the table-indexed sparse loop into a
+  // sequential scan and must run before rule B lifts it.  It is default-off and
+  // is registered only when this bit is explicitly opted in.
   SelectedBlockScan = 65536,
+  // 规则 B（query row batching）：把按下标表选择的稀疏块循环按查询行批量提升，
+  // 每组 R 行共享 K/V tile。它与 RowCoalescing 共用 RowLiftBuilder，但 matcher
+  // 独立，因此两条规则可分别开关；按 RFC #2686 与 IAT 同处 ProgramMapping 阶段。
+  // Rule B (query row batching) batches R query rows of a table-indexed sparse
+  // block loop so one K/V tile feeds them.  It shares RowLiftBuilder with
+  // RowCoalescing but owns its own matcher, so the two rules stay independently
+  // gated; RFC #2686 places it in the ProgramMapping phase, alongside IAT.
+  QueryRowBatching = 131072,
 };
 
 enum class GraphOptimizationRulePhase : uint8_t {
   DiagonalMaskRemoval,
   ConvertModuloToMask,
+  // 规则 A 紧跟地址线性化之后执行，让后面带预算的访存类规则看到顺序扫描形态。
+  // Rule A runs right after address linearization so the memory-access rules
+  // below already see the sequential-scan form.
   SelectedBlockScan,
   ProgramMapping,
   PersistentTaskMapping,
@@ -121,6 +137,8 @@ getGraphOptimizationRuleName(GraphOptimizationRuleId rule) {
     return "ContiguousBlockAccessFormationRule";
   case GraphOptimizationRuleId::SelectedBlockScan:
     return "SelectedBlockScanRule";
+  case GraphOptimizationRuleId::QueryRowBatching:
+    return "QueryRowBatchingRule";
   }
   return "Unknown";
 }
@@ -137,8 +155,6 @@ getGraphOptimizationRulePhase(GraphOptimizationRuleId rule) {
     return GraphOptimizationRulePhase::DiagonalMaskRemoval;
   case GraphOptimizationRuleId::ConvertModuloToMask:
     return GraphOptimizationRulePhase::ConvertModuloToMask;
-  case GraphOptimizationRuleId::SelectedBlockScan:
-    return GraphOptimizationRulePhase::SelectedBlockScan;
   case GraphOptimizationRuleId::IndependentAxisTensorize:
     return GraphOptimizationRulePhase::ProgramMapping;
   case GraphOptimizationRuleId::PersistentTaskStripMining:
@@ -157,6 +173,17 @@ getGraphOptimizationRulePhase(GraphOptimizationRuleId rule) {
     return GraphOptimizationRulePhase::StoreCoalescing;
   case GraphOptimizationRuleId::ContiguousBlockAccessFormation:
     return GraphOptimizationRulePhase::ContiguousBlockAccessFormation;
+  // 规则 A 必须在规则 B 检查循环之前完成改写，因此该阶段排在所有带预算的
+  // 访存阶段之前。
+  // Rule A has to finish rewriting the loop before rule B inspects it; the
+  // phase sits before every budgeted memory-access phase for that reason.
+  case GraphOptimizationRuleId::SelectedBlockScan:
+    return GraphOptimizationRulePhase::SelectedBlockScan;
+  // 按 RFC #2686，规则 B（query row batching）与 IAT 同处 ProgramMapping 阶段。
+  // Rule B (query row batching) runs in the ProgramMapping phase, alongside IAT,
+  // as specified by RFC #2686.
+  case GraphOptimizationRuleId::QueryRowBatching:
+    return GraphOptimizationRulePhase::ProgramMapping;
   case GraphOptimizationRuleId::RowCoalescing:
     return GraphOptimizationRulePhase::RowCoalescing;
   case GraphOptimizationRuleId::StridedAxisCoalescing:
@@ -167,7 +194,7 @@ getGraphOptimizationRulePhase(GraphOptimizationRuleId rule) {
   return GraphOptimizationRulePhase::Compatibility;
 }
 
-constexpr std::array<GraphOptimizationRuleId, 16>
+constexpr std::array<GraphOptimizationRuleId, 17>
     kGraphOptimizationRuleRegistry = {
         GraphOptimizationRuleId::LoadStoreTranspose,
         GraphOptimizationRuleId::TransposePointwiseReorder,
@@ -185,6 +212,7 @@ constexpr std::array<GraphOptimizationRuleId, 16>
         GraphOptimizationRuleId::StoreCoveragePlanning,
         GraphOptimizationRuleId::ContiguousBlockAccessFormation,
         GraphOptimizationRuleId::SelectedBlockScan,
+        GraphOptimizationRuleId::QueryRowBatching,
 };
 
 constexpr bool hasUniqueSingleBitGraphOptimizationRuleIds() {
@@ -235,7 +263,10 @@ constexpr GraphOptimizationRuleMask kKnownGraphOptimizationRuleMask =
         GraphOptimizationRuleId::StoreCoveragePlanning) |
     getGraphOptimizationRuleMask(
         GraphOptimizationRuleId::ContiguousBlockAccessFormation) |
-    getGraphOptimizationRuleMask(GraphOptimizationRuleId::SelectedBlockScan);
+    getGraphOptimizationRuleMask(
+        GraphOptimizationRuleId::SelectedBlockScan) |
+    getGraphOptimizationRuleMask(
+        GraphOptimizationRuleId::QueryRowBatching);
 
 constexpr GraphOptimizationRuleMask kDefaultEligibleGraphOptimizationRuleMask =
     kLegacyGraphOptimizationRuleMask |
@@ -253,7 +284,10 @@ constexpr GraphOptimizationRuleMask kFixedDefaultOffGraphOptimizationRuleMask =
         GraphOptimizationRuleId::StoreCoveragePlanning) |
     getGraphOptimizationRuleMask(
         GraphOptimizationRuleId::ContiguousBlockAccessFormation) |
-    getGraphOptimizationRuleMask(GraphOptimizationRuleId::SelectedBlockScan);
+    getGraphOptimizationRuleMask(
+        GraphOptimizationRuleId::SelectedBlockScan) |
+    getGraphOptimizationRuleMask(
+        GraphOptimizationRuleId::QueryRowBatching);
 
 constexpr GraphOptimizationRuleMask kDefaultGraphOptimizationRuleMask =
     kDefaultEligibleGraphOptimizationRuleMask;
@@ -320,6 +354,12 @@ struct StoreCoveragePlanningRuleOptions {};
 struct ContiguousBlockAccessFormationRuleOptions {};
 struct SelectedBlockScanRuleOptions {
   bool forceApply = false;
+  // Rule A 只有与规则 B 同批开启时才允许连带 materialize B；规则位的判断在
+  // 注册阶段完成，避免规则内部再去解码 mask。
+  // Rule A may materialize Rule B only when Rule B's bit is opted in as well.
+  // The mask decision is made at registration time, so the rule itself never
+  // decodes the mask.
+  bool queryRowBatchingEnabled = false;
 };
 
 struct GraphOptimizationOptions {

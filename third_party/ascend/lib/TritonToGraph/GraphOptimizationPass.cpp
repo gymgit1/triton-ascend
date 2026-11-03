@@ -62,6 +62,12 @@ namespace {
 constexpr std::array<GraphOptimizationRulePhase, 12> kRulePhases = {
     GraphOptimizationRulePhase::DiagonalMaskRemoval,
     GraphOptimizationRulePhase::ConvertModuloToMask,
+    // 规则 A（selected-block scan）阶段：它要在后面的访存类规则之前改写
+    // 稀疏循环；规则 B（query row batching）按 RFC #2686 与 IAT 同处
+    // ProgramMapping 阶段，随该阶段循环一起调度。
+    // Rule A's phase: it rewrites the sparse loop before the memory-access
+    // rules below look at it.  Rule B (query row batching) runs in the
+    // ProgramMapping phase, alongside IAT, as specified by RFC #2686.
     GraphOptimizationRulePhase::SelectedBlockScan,
     GraphOptimizationRulePhase::ProgramMapping,
     GraphOptimizationRulePhase::PersistentTaskMapping,
@@ -586,9 +592,22 @@ void populateBuiltinGraphOptimizationRules(
     rules.push_back(createContiguousBlockAccessFormationRule(
         options.contiguousBlockAccessFormation));
   }
+  // 规则 A 只在显式置位 65536 时注册；它允许连带 materialize 规则 B 的前提
+  // 是 B 的规则位 131072 也一并打开。
+  // Rule A is registered only when bit 65536 is opted in.  It may materialize
+  // Rule B only when Rule B's bit is opted in as well.
   if (isRuleEnabled(options.enabledRuleMask,
                     GraphOptimizationRuleId::SelectedBlockScan)) {
-    rules.push_back(createSelectedBlockScanRule(options.selectedBlockScan));
+    SelectedBlockScanRuleOptions scanOptions = options.selectedBlockScan;
+    scanOptions.queryRowBatchingEnabled =
+        isRuleEnabled(options.enabledRuleMask,
+                      GraphOptimizationRuleId::QueryRowBatching);
+    rules.push_back(createSelectedBlockScanRule(scanOptions));
+  }
+  // 规则 B（query row batching）默认关闭，只有显式置位规则位 131072 时才注册。
+  if (isRuleEnabled(options.enabledRuleMask,
+                    GraphOptimizationRuleId::QueryRowBatching)) {
+    rules.push_back(createQueryRowBatchingRule());
   }
   const auto compileMode =
       triton::ascend::parseCompileMode(options.compileMode);

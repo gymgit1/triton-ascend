@@ -23,6 +23,11 @@
 // the joint gate closed, i.e. without the escape hatch — no change).
 // RUN: triton-opt %S/Inputs/nsa_fwd_const_ns.mlir -graph-optimize='rule-mask=65536' -o /dev/null
 
+// Joint Rule A + Rule B path: 65536 | 131072 = 196608.  Rule A rewrites the
+// sparse loop and materializes Rule B's contract inside its own sandbox, so
+// the output must carry the dynamic grid contract and the 128-row dot shapes.
+// RUN: triton-opt %S/Inputs/nsa_fwd_const_ns.mlir -graph-optimize='rule-mask=196608' -o - | FileCheck %s --check-prefix=JOINT
+
 // CHECK-LABEL: tt.func @graph_optimize_selected_block_scan_accept()
 tt.func @graph_optimize_selected_block_scan_accept() {
   // CHECK-NEXT: tt.return
@@ -47,3 +52,10 @@ tt.func @graph_optimize_selected_block_scan_with_defaults(%value: i32) -> i32 {
 tt.func @graph_optimize_reject_unknown_bit() {
   tt.return
 }
+
+// -----
+
+// Joint A+B contract checks (fed by the RUN line above from the real kernel).
+// JOINT: hacc.program_grid_transforms
+// JOINT-SAME: factor = 8
+// JOINT: tensor<128x128xbf16>

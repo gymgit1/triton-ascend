@@ -42,6 +42,8 @@
 // signalPassFailure).
 
 #include "TritonToGraph/GraphOptimizationRule.h"
+#include "TritonToGraph/ProgramGridTransform.h"
+#include "TritonToGraph/QueryRowBatching.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -74,18 +76,15 @@ using namespace mlir;
 using namespace triton;
 using namespace cfg;
 
-// Joint Rule A + Rule B decision point:
-//   bool canQueryRowBatch(triton::FuncOp function);
-// Returns true when the query-row batching matcher (Rule B) accepts
-// `function`. It must stay pure (read-only, no diagnostics, no IR mutation)
-// because it is called on the rewritten sandbox.
-namespace mlir {
-namespace triton {
-namespace cfg {
-bool canQueryRowBatch(triton::FuncOp function);
-} // namespace cfg
-} // namespace triton
-} // namespace mlir
+// Joint Rule A + Rule B decision point: Rule A does not consult a read-only
+// matcher any more.  It hands its private sandbox to
+// `cfg::materializeQueryRowBatchingCandidate`, which rewrites Rule B's row
+// lifting in place and verifies the result.  Landing the sandbox therefore
+// means both rewrites are already in it; a failure means neither lands.
+//
+// This replaced the old `cfg::canQueryRowBatch` pure matcher: querying without
+// rewriting left a window where Rule A could commit and Rule B then fail, and
+// it could pick a different row factor than the rewrite would use.
 
 namespace {
 
@@ -193,18 +192,6 @@ static bool dependsOnExcludingImpl(Value v, Value pivot, Operation *cut,
 static bool dependsOnExcluding(Value v, Value pivot, Operation *cut) {
   llvm::DenseSet<Value> visited;
   return dependsOnExcludingImpl(v, pivot, cut, visited, 0);
-}
-
-// The query position: axis-0 program id, tolerant of integer width casts.
-// A load-derived value (the varlen dispatch) does not match.
-static bool isProgramIdAxis0(Value v) {
-  if (auto pid = v.getDefiningOp<triton::GetProgramIdOp>())
-    return pid.getAxisAsInt() == 0;
-  if (auto ext = v.getDefiningOp<arith::ExtSIOp>())
-    return isProgramIdAxis0(ext.getIn());
-  if (auto ext = v.getDefiningOp<arith::ExtUIOp>())
-    return isProgramIdAxis0(ext.getIn());
-  return false;
 }
 
 // A splat/expand_dims/broadcast chain down to the pivot.
@@ -338,6 +325,33 @@ static std::optional<int64_t> matchIdxTimesBS(Value offset, Value rawIndex) {
   return factor;
 }
 
+// The causal query position. It is the axis-0 program id itself, or the
+// program id advanced by a loop-invariant offset: the decode path compares
+// block tokens against `pid + Q_OFFSET`, where Q_OFFSET = TK - TQ is a kernel
+// argument. Returns the SSA value every causal use must share, or a null value
+// when the operand is load-derived (the varlen dispatch) or computed inside the
+// loop (an iteration-dependent row position cannot be a single scan bound).
+static Value matchRowPosition(Value v, Value pid, scf::ForOp loop) {
+  Value stripped = stripIntegerCasts(v);
+  if (stripped == pid)
+    return pid;
+  auto add = stripped.getDefiningOp<arith::AddIOp>();
+  if (!add)
+    return Value();
+  Value lhs = stripIntegerCasts(add.getLhs());
+  Value rhs = stripIntegerCasts(add.getRhs());
+  Value offset;
+  if (lhs == pid)
+    offset = rhs;
+  else if (rhs == pid)
+    offset = lhs;
+  else
+    return Value();
+  if (!isDefinedOutsideLoop(offset, loop) || reachesLoad(offset))
+    return Value();
+  return stripped;
+}
+
 // The [G] vector a 2-D operand broadcasts from, or v itself.
 static Value peelBroadcasts(Value v) {
   while (Operation *op = v.getDefiningOp())
@@ -416,6 +430,11 @@ struct ScanCandidate {
   // and the tensor mask.
   Value pid;
 
+  // The causal row position: `pid` itself, or `pid + offset` when the kernel
+  // compares against a decode offset (Q_OFFSET = TK - TQ in the production
+  // fwd kernel).  Every causal use of the row position reads this value.
+  Value rowPosition;
+
   // The index-table row base; loop-invariant, i64 pointee in production.
   Value tableBase;
   int64_t tableLength = 0;  // S, from the i_h*S multiplier of the row base
@@ -489,6 +508,8 @@ struct ScanMatchContext {
   Value tableBase;
   int64_t tableLength = 0;
   Value pid;
+  // matchBlockGuard: pid, or pid advanced by a loop-invariant offset.
+  Value rowPosition;
 
   // matchBlockGuard.
   Value rawIndex;
@@ -691,7 +712,9 @@ static bool matchIndexTable(ScanMatchContext &ctx) {
     return false;
   }
   if (slotTerm) {
-    auto mul = dyn_cast<arith::MulIOp>(slotTerm.getDefiningOp());
+    // The front end may widen the i_h*S term (extsi(muli(i_h, S))), so peel
+    // the integer width casts before reading the multiplier.
+    auto mul = dyn_cast<arith::MulIOp>(stripIntegerCasts(slotTerm).getDefiningOp());
     if (!mul)
       return false;
     std::optional<int64_t> multiplier;
@@ -741,10 +764,11 @@ static bool matchBlockGuard(ScanMatchContext &ctx) {
   scf::IfOp &branch = ctx.branch;
   Value &rawIndex = ctx.rawIndex;
   SmallVector<int64_t, 2> &predicateFactors = ctx.predicateFactors;
-  // The guard is andi(causal, range) over the SCALED index: i_s <= pid_x and
-  // 0 <= i_s. Direction flips and operand order are free; the causal right
-  // operand must be the axis-0 program id itself (a load-derived value there
-  // is the varlen dispatch). Comparisons on the unscaled index do not match.
+  // The guard is andi(causal, range) over the SCALED index: i_s <= row and
+  // 0 <= i_s. Direction flips and operand order are free; the causal operand
+  // must be the axis-0 program id itself, or the program id advanced by a
+  // loop-invariant offset (the decode Q_OFFSET). A load-derived value there is
+  // the varlen dispatch. Comparisons on the unscaled index do not match.
   unsigned guards = 0;
   for (Operation &op : loop.getBody()->without_terminator())
     if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
@@ -774,12 +798,18 @@ static bool matchBlockGuard(ScanMatchContext &ctx) {
     arith::CmpIPredicate pred = cmp.getPredicate();
     Value lhs = cmp.getLhs();
     Value rhs = cmp.getRhs();
-    if ((pred == arith::CmpIPredicate::sle && isScaledIndex(lhs) &&
-         isProgramIdAxis0(rhs)) ||
-        (pred == arith::CmpIPredicate::sge && isProgramIdAxis0(lhs) &&
-         isScaledIndex(rhs))) {
-      causalFound = true;
-      continue;
+    if (pred == arith::CmpIPredicate::sle && isScaledIndex(lhs)) {
+      if (Value position = matchRowPosition(rhs, ctx.pid, loop)) {
+        ctx.rowPosition = position;
+        causalFound = true;
+        continue;
+      }
+    } else if (pred == arith::CmpIPredicate::sge && isScaledIndex(rhs)) {
+      if (Value position = matchRowPosition(lhs, ctx.pid, loop)) {
+        ctx.rowPosition = position;
+        causalFound = true;
+        continue;
+      }
     }
     auto isZero = [](Value v) {
       auto constant = getConstantIntValue(v);
@@ -1067,13 +1097,16 @@ static bool matchTiles(ScanMatchContext &ctx) {
 // The tensor-level causal mask.
 static bool matchCausalMask(ScanMatchContext &ctx) {
   arith::SelectOp maskSelect = ctx.maskSelect;
-  Value pid = ctx.pid;
+  Value rowPosition = ctx.rowPosition;
   Value kTokenOffset = ctx.kTokenOffset;
   Value vTokenOffset = ctx.vTokenOffset;
   int64_t blockSize = ctx.blockSize;
-  // The neutral-path select's condition broadcasts a token-vs-pid_x
-  // comparison, pid_x on the greater side, and the token side is built from
-  // the scaled index. This pins the third pid_x use to the same SSA value.
+  if (!rowPosition)
+    return false;
+  // The neutral-path select's condition broadcasts a token-vs-row comparison,
+  // the row on the greater side, and the token side is built from the scaled
+  // index. This pins the third row-position use to the same SSA value the
+  // block guard read.
   Value maskCmp = maskSelect.getCondition();
   while (Operation *def = maskCmp.getDefiningOp())
     if (isa<triton::BroadcastOp, triton::ExpandDimsOp>(def))
@@ -1083,12 +1116,12 @@ static bool matchCausalMask(ScanMatchContext &ctx) {
   auto causalCmp = maskCmp.getDefiningOp<arith::CmpIOp>();
   if (!causalCmp || !isa<RankedTensorType>(causalCmp.getLhs().getType()))
     return false;
-  // The query-position side is a broadcast of pid_x, possibly widened: the
-  // bwd form compares its tokens against extsi(pid_x) in i64. Peeling the
-  // width casts is not a relaxation of identity: the value must still be
-  // built from the same pid SSA the row base and the block guard use.
+  // The query-position side is a broadcast of the row position, possibly
+  // widened: the bwd form compares its tokens against extsi(pid_x) in i64.
+  // Peeling the width casts is not a relaxation of identity: the value must
+  // still be built from the same SSA the row base and the block guard use.
   auto isPidBroadcast = [&](Value v) {
-    return stripIntegerCasts(peelBroadcasts(v)) == pid;
+    return stripIntegerCasts(peelBroadcasts(v)) == rowPosition;
   };
   Value pidSide, tokenSide;
   if (isPidBroadcast(causalCmp.getLhs())) {
@@ -1179,7 +1212,7 @@ static bool checkVocabulary(ScanMatchContext &ctx) {
     if (isa<triton::AddPtrOp, triton::LoadOp, triton::MakeTensorPtrOp,
             triton::DotOp, triton::MakeRangeOp, triton::SplatOp,
             triton::ExpandDimsOp, triton::BroadcastOp, triton::ReduceOp,
-            triton::ReduceReturnOp>(op))
+            triton::ReduceReturnOp, triton::AssertOp>(op))
       return;
     if (additive && isa<triton::TransOp>(op))
       return;
@@ -1198,17 +1231,28 @@ static bool checkVocabulary(ScanMatchContext &ctx) {
 static std::optional<ScanCandidate> matchSelectedBlockScan(triton::FuncOp fn) {
   ScanMatchContext ctx;
   ctx.fn = fn;
-  if (!matchLoopSkeleton(ctx) || !matchIndexTable(ctx) ||
-      !matchBlockGuard(ctx) || !matchIfShape(ctx) ||
-      !matchCarriedState(ctx) || !matchDotOperands(ctx) ||
-      !matchTiles(ctx) || !matchCausalMask(ctx) ||
-      !matchTileContract(ctx) || !checkVocabulary(ctx))
+  auto check = [&](const char *stage, bool ok) {
+    LLVM_DEBUG(if (!ok) llvm::dbgs()
+                   << "selected-block-scan: stage " << stage << " declined\n");
+    return ok;
+  };
+  if (!check("skeleton", matchLoopSkeleton(ctx)) ||
+      !check("index-table", matchIndexTable(ctx)) ||
+      !check("block-guard", matchBlockGuard(ctx)) ||
+      !check("if-shape", matchIfShape(ctx)) ||
+      !check("carried-state", matchCarriedState(ctx)) ||
+      !check("dot-operands", matchDotOperands(ctx)) ||
+      !check("tiles", matchTiles(ctx)) ||
+      !check("causal-mask", matchCausalMask(ctx)) ||
+      !check("tile-contract", matchTileContract(ctx)) ||
+      !check("vocabulary", checkVocabulary(ctx)))
     return std::nullopt;
 
   ScanCandidate candidate;
   candidate.function = fn;
   candidate.loop = ctx.loop;
   candidate.pid = ctx.pid;
+  candidate.rowPosition = ctx.rowPosition ? ctx.rowPosition : ctx.pid;
   candidate.tableBase = ctx.tableBase;
   candidate.tableLength = ctx.tableLength;
   candidate.blockSize = ctx.blockSize;
@@ -1753,11 +1797,24 @@ static bool buildScanPrologue(IRRewriter &rewriter,
 
   // ---- Scan bound: cdiv(i_t + 1, BN) folded to divsi(pid_x + BN, BN), i32
   // regardless of the old iv's width. ----
+  // The bound and the causal mask are keyed by the causal row position, which
+  // is pid_x or pid_x advanced by the decode offset (Q_OFFSET).
+  Value rowPosition =
+      candidate.rowPosition ? candidate.rowPosition : candidate.pid;
+  if (rowPosition.getType() != i32) {
+    unsigned width = rowPosition.getType().getIntOrFloatBitWidth();
+    if (width > 32)
+      rowPosition = rewriter.create<arith::TruncIOp>(loc, i32, rowPosition);
+    else if (width < 32)
+      rowPosition = rewriter.create<arith::ExtSIOp>(loc, i32, rowPosition);
+    else
+      return false;
+  }
   Value c0 = rewriter.create<arith::ConstantIntOp>(loc, 0, 32);
   Value c1 = rewriter.create<arith::ConstantIntOp>(loc, 1, 32);
   Value cBN = rewriter.create<arith::ConstantIntOp>(loc, BN, 32);
   Value scanUpperBound = rewriter.create<arith::DivSIOp>(
-      loc, rewriter.create<arith::AddIOp>(loc, candidate.pid, cBN), cBN);
+      loc, rewriter.create<arith::AddIOp>(loc, rowPosition, cBN), cBN);
 
   // Re-create the K/V dynamic bound outside the loop, unfolded.
   Value bound64 = candidate.dynamicBoundResult;
@@ -1776,7 +1833,7 @@ static bool buildScanPrologue(IRRewriter &rewriter,
   Value tokensRange =
       rewriter.create<triton::MakeRangeOp>(loc, tensorTy({BN}, i32), 0, BN);
   Value pidRow =
-      rewriter.create<triton::SplatOp>(loc, tensorTy({BN}, i32), candidate.pid);
+      rewriter.create<triton::SplatOp>(loc, tensorTy({BN}, i32), rowPosition);
 
   // Fresh neutral constants; later canonicalization/CSE folds them into the
   // surviving ones. Keeping them fresh makes the builder independent of the
@@ -2383,7 +2440,10 @@ static LogicalResult runSandboxStructuralCleanup(ModuleOp sandbox) {
 class SelectedBlockScanPlan final : public RewritePlan {
   ScanCandidate candidate;
   unsigned epoch;
-  // The accepted sandbox: what canQueryRowBatch() accepted, committed as is.
+  // 已接受并自行验证过的沙箱：里面既有规则 A 的扫描重建，也可能已有规则 B
+  // 的行提升与启动契约。
+  // The accepted sandbox: it already carries Rule A's scan rebuild and, when the
+  // joint gate ran, Rule B's row lifting and launch contract.
   OwningOpRef<ModuleOp> prepared;
 
   SelectedBlockScanPlan(ScanCandidate candidate, unsigned epoch,
@@ -2422,12 +2482,34 @@ public:
   }
 
   LogicalResult apply(IRRewriter &rewriter) override {
-    // Commit only: the verified sandbox body replaces the function body. This
-    // cannot fail, which is the contract the shared driver relies on. No
-    // module attribute is added or removed, and no cleanup runs here.
+    // 沙箱已经通过 verify；这里只做提交。运行期网格时规则 B 会追加隐藏的
+    // extent 参数，因此必须连函数签名一起换，不能只 takeBody。
+    // Commit only: the sandbox is already verified.  A runtime grid makes Rule B
+    // append hidden extent arguments, so the function signature has to travel
+    // with the body instead of a plain takeBody.
     static_cast<void>(rewriter);
     auto replacement = cast<triton::FuncOp>(&prepared->getBody()->front());
+    ModuleOp preparedModule = *prepared;
+    ModuleOp module = candidate.function->getParentOfType<ModuleOp>();
+    if (!module)
+      return failure();
+
+    if (preparedModule->hasAttr(kProgramGridTransformsAttr)) {
+      if (failed(commitProgramGridFunctionFromSandbox(candidate.function,
+                                                      replacement)))
+        return failure();
+      module->setAttr(kProgramGridTransformsAttr,
+                      preparedModule->getAttr(kProgramGridTransformsAttr));
+      return success();
+    }
+
     candidate.function.getBody().takeBody(replacement.getBody());
+    for (StringLiteral name :
+         {StringLiteral("hacc.coalesce_factor"),
+          StringLiteral("hacc.coalesce_axis"),
+          StringLiteral("hacc.coalesce_grid_ceil_div")})
+      if (preparedModule->hasAttr(name))
+        module->setAttr(name, preparedModule->getAttr(name));
     return success();
   }
 
@@ -2435,7 +2517,8 @@ public:
   // unsupported rewrite must leave the input and its diagnostics untouched;
   // declining returns nullptr and never fails apply().
   static std::unique_ptr<SelectedBlockScanPlan>
-  create(const ScanCandidate &candidate, unsigned epoch, bool forceApply) {
+  create(const ScanCandidate &candidate, unsigned epoch, bool forceApply,
+         bool queryRowBatchingEnabled, const ResourceSnapshot &resources) {
     // The tablegen accessors used below are not const-qualified in this tree,
     // so work on a local mutable copy of the function.
     triton::FuncOp function = candidate.function;
@@ -2477,21 +2560,29 @@ public:
     if (failed(verify(*sandbox)))
       return nullptr;
 
-    // Joint decision: the rewrite lands only when Rule B accepts the
-    // rewritten sandbox. `canQueryRowBatch` is a pure matcher, so a decline
-    // leaves the real IR byte-identical and produces no diagnostic. A plain
-    // bool is enough: the accepted sandbox IS the body apply() commits. The
-    // force-apply escape hatch short-circuits ONLY this consult, never the
-    // structural match, cleanup or verification above.
+    // 联合决策：只有规则 B 的规则位也打开时，才允许 A 在沙箱里连带完成 B 的
+    // 行提升。materialize 就地重写并 verify，失败即整个计划作废；成功则沙箱
+    // 里已经有 B 的改写与启动契约，apply() 只需把沙箱提交回去。
+    // Joint decision: Rule A may only run Rule B's row lifting when Rule B's bit
+    // is opted in as well.  `materialize...` rewrites and verifies in place, so a
+    // failure discards the whole plan, and success means the sandbox already
+    // carries both rewrites and the launch contract.
     if (!forceApply) {
-      if (!canQueryRowBatch(cloned)) {
+      if (!queryRowBatchingEnabled) {
+        LLVM_DEBUG(llvm::dbgs() << "selected-block-scan: rule B bit is off, "
+                                   "declining @"
+                                << function.getName() << "\n");
+        return nullptr;
+      }
+      if (failed(materializeQueryRowBatchingCandidate(*sandbox, cloned,
+                                                      resources))) {
         LLVM_DEBUG(llvm::dbgs() << "selected-block-scan: joint query-row "
-                                   "batching gate declined @"
+                                   "batching materialization declined @"
                                 << function.getName() << "\n");
         return nullptr;
       }
       LLVM_DEBUG(llvm::dbgs() << "selected-block-scan: joint query-row "
-                                 "batching gate accepted @"
+                                 "batching materialized @"
                               << function.getName() << "\n");
     } else {
       LLVM_DEBUG(llvm::dbgs() << "selected-block-scan: force-apply bypasses "
@@ -2506,17 +2597,21 @@ public:
 
 class SelectedBlockScanRule final : public GraphOptimizationRule {
   bool forceApply;
+  bool queryRowBatchingEnabled;
 
 public:
   explicit SelectedBlockScanRule(const SelectedBlockScanRuleOptions &options)
-      : forceApply(options.forceApply) {}
+      : forceApply(options.forceApply),
+        queryRowBatchingEnabled(options.queryRowBatchingEnabled) {}
 
   GraphOptimizationRuleId getId() const override {
     return GraphOptimizationRuleId::SelectedBlockScan;
   }
 
+  // 规则 A 需要 L0 预算快照，转交给规则 B 的 materialize 使用。
+  // Rule A forwards the L0 budget snapshot to Rule B's materialize entry.
   AnalysisRequirement getAnalysisRequirements() const override {
-    return AnalysisRequirement::None;
+    return AnalysisRequirement::ResourceCost;
   }
 
   LogicalResult findCandidates(
@@ -2536,9 +2631,9 @@ public:
                << " BN=" << candidate->scanTileWidth
                << " S=" << candidate->tableLength << ")\n");
 
-    if (auto plan =
-            SelectedBlockScanPlan::create(*candidate, context.getEpoch(),
-                                          forceApply))
+    if (auto plan = SelectedBlockScanPlan::create(
+            *candidate, context.getEpoch(), forceApply, queryRowBatchingEnabled,
+            context.getResourceCostAnalysis().getResourceSnapshot()))
       plans.push_back(std::move(plan));
     return success();
   }
