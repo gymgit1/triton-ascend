@@ -100,8 +100,9 @@ std::unique_ptr<GraphOptimizationRule>
 createRowCoalescingRule(bool enableLegacy = true);
 std::unique_ptr<GraphOptimizationRule> createDiagonalMaskRemovalRule();
 std::unique_ptr<GraphOptimizationRule> createConvertModuloToMaskRule();
-std::unique_ptr<GraphOptimizationRule> createSelectedBlockScanRule(
-    const SelectedBlockScanRuleOptions &options);
+std::unique_ptr<GraphOptimizationRule>
+createSelectedBlockScanRule(const SelectedBlockScanRuleOptions &options);
+
 std::unique_ptr<GraphOptimizationRule> createIndependentAxisTensorizeRule(
     const IndependentAxisTensorizeRuleOptions &options);
 std::unique_ptr<GraphOptimizationRule> createPersistentTaskStripMiningRule(
@@ -120,8 +121,6 @@ std::unique_ptr<GraphOptimizationRule> createStoreCoveragePlanningRule(
     const StoreCoveragePlanningRuleOptions &options);
 std::unique_ptr<GraphOptimizationRule> createContiguousBlockAccessFormationRule(
     const ContiguousBlockAccessFormationRuleOptions &options);
-// 创建规则 B（QueryRowBatchingRule，规则位 131072）的规则对象。
-std::unique_ptr<GraphOptimizationRule> createQueryRowBatchingRule();
 
 } // namespace cfg
 } // namespace triton

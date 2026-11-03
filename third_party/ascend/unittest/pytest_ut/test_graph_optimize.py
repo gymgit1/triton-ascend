@@ -937,8 +937,7 @@ def test_graph_optimize_options_contribute_to_npu_hash():
 # plus the "default stays off", "unknown bits stay rejected" and "accepted means
 # eligible, not force-applied" contracts.
 
-RULE_A_TTIR_FIXTURES = (Path(__file__).resolve().parent.parent / "Conversion" / "General" / "TritonToGraph" /
-                        "Inputs")
+RULE_A_TTIR_FIXTURES = (Path(__file__).resolve().parent.parent / "Conversion" / "General" / "TritonToGraph" / "Inputs")
 
 
 def test_rule_mask_accepts_selected_block_scan():
