@@ -1188,6 +1188,18 @@ def l0_size_in_kbytes_for_arch(arch: str) -> tuple:
     return (0, 0, 0)
 
 
+def reserved_ub_kbytes_for_arch(arch: str) -> int:
+    """Return the UB capacity reserved before candidate budgeting, in KiB.
+
+    DAV_3510 (Ascend950PR/950DT) reports 256 KiB in the architecture table, but
+    its INI reserves 8 KiB for the runtime, so candidates may use 248 KiB
+    (RFC #2686 section 4).  Other targets keep the whole reported capacity.
+    """
+    if isinstance(arch, str) and arch.startswith(("Ascend910_95", "Ascend950")):
+        return 8
+    return 0
+
+
 def graph_ub_budget_bytes_for_arch(arch: str) -> int:
     """Return the conservative graph-optimization UB budget in bytes.
 

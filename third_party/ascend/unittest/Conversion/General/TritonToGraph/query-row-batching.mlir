@@ -19,6 +19,12 @@
 // RUN: triton-opt --split-input-file %t.no-target.mlir -canonicalize -cse -o %t.no-target.control
 // RUN: triton-opt --split-input-file --verify-each %t.no-target.mlir -graph-optimize='rule-mask=131072' -canonicalize -cse -o %t.no-target
 // RUN: diff %t.no-target.control %t.no-target
+// The row-count policy keeps one full wave: a static 64-program grid may only
+// coalesce to 64/R >= 28, so R drops from 8 to 2.
+// RUN: triton-opt --split-input-file --verify-each %s -graph-optimize='rule-mask=131072 core-num=28' -canonicalize -cse -o %t.corenum
+// RUN: FileCheck %s --check-prefix=CORENUM < %t.corenum
+// CORENUM-NOT: hacc.coalesce_factor = 8 : i32
+// CORENUM: hacc.coalesce_factor = 2 : i32
 
 // Rule B lifts the query-row axis of the loop that rule A handed over.  The
 // matcher no longer judges whether the loop is sequential.  It accepts a
@@ -26,15 +32,15 @@
 // the whole pid range, so the last row of the group supplies the loop trip
 // count and the per-row copy becomes the active mask.
 
-// CHECK: module attributes {{.*}}hacc.coalesce_factor = 8 : i32
+// CHECK: module attributes {{.*}}hacc.coalesce_factor = 64 : i32
 // CHECK-LABEL: tt.func @pid_bound_loop(
-// CHECK: tt.load {{.*}} : tensor<8x16x16x!tt.ptr<f16>>
+// CHECK: tt.load {{.*}} : tensor<64x16x16x!tt.ptr<f16>>
 // CHECK: scf.for
-// CHECK: arith.cmpi slt, {{.*}} : tensor<8xi32>
+// CHECK: arith.cmpi slt, {{.*}} : tensor<64xi32>
 // CHECK: %[[RHS:.*]] = tt.load {{.*}} : tensor<16x16x!tt.ptr<f16>>
-// CHECK: tt.dot %{{.*}}, %[[RHS]], %{{.*}} : tensor<128x16xf16> * tensor<16x16xf16> -> tensor<128x16xf32>
-// CHECK: arith.select {{.*}} : tensor<8x16x16xi1>, tensor<8x16x16xf32>
-// CHECK: tt.store {{.*}} : tensor<8x16x16x!tt.ptr<f32>>
+// CHECK: tt.dot %{{.*}}, %[[RHS]], %{{.*}} : tensor<1024x16xf16> * tensor<16x16xf16> -> tensor<1024x16xf32>
+// CHECK: arith.select {{.*}} : tensor<64x16x16xi1>, tensor<64x16x16xf32>
+// CHECK: tt.store {{.*}} : tensor<64x16x16x!tt.ptr<f32>>
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num_tiles = 64 : i32} {
   tt.func @pid_bound_loop(%A: !tt.ptr<f16>, %B: !tt.ptr<f16>, %C: !tt.ptr<f32>) {
     %pid = tt.get_program_id x : i32
@@ -79,14 +85,13 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num
 // A row-invariant scf.if may select between two monotone bound chains: the
 // envelope of both branches is monotone, and every row takes the same branch.
 
-// CHECK: module attributes {{.*}}hacc.coalesce_factor = 8 : i32
+// CHECK: module attributes {{.*}}hacc.coalesce_factor = 64 : i32
 // CHECK-LABEL: tt.func @row_invariant_if_bound(
-// CHECK: scf.if {{.*}} -> (i32)
-// CHECK: scf.if {{.*}} -> (tensor<8xi32>)
-// CHECK: tt.load {{.*}} : tensor<8x16x16x!tt.ptr<f16>>
+// CHECK: scf.if {{.*}} -> (i32, tensor<64xi32>)
+// CHECK: tt.load {{.*}} : tensor<64x16x16x!tt.ptr<f16>>
 // CHECK: scf.for
-// CHECK: tt.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<128x16xf16> * tensor<16x16xf16> -> tensor<128x16xf32>
-// CHECK: arith.select {{.*}} : tensor<8x16x16xi1>, tensor<8x16x16xf32>
+// CHECK: tt.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<1024x16xf16> * tensor<16x16xf16> -> tensor<1024x16xf32>
+// CHECK: arith.select {{.*}} : tensor<64x16x16xi1>, tensor<64x16x16xf32>
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num_tiles = 64 : i32} {
   tt.func @row_invariant_if_bound(%A: !tt.ptr<f16>, %B: !tt.ptr<f16>, %C: !tt.ptr<f32>) {
     %pid = tt.get_program_id x : i32
@@ -144,13 +149,13 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num
 // unknown, so the prover accepts the chain as monotone but never invents a
 // numeric range for it.
 
-// CHECK: module attributes {{.*}}hacc.coalesce_factor = 8 : i32
+// CHECK: module attributes {{.*}}hacc.coalesce_factor = 64 : i32
 // CHECK-LABEL: tt.func @reduce_shifted_bound(
 // CHECK: tt.reduce
-// CHECK: tt.load {{.*}} : tensor<8x16x16x!tt.ptr<f16>>
+// CHECK: tt.load {{.*}} : tensor<64x16x16x!tt.ptr<f16>>
 // CHECK: scf.for
-// CHECK: tt.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<128x16xf16> * tensor<16x16xf16> -> tensor<128x16xf32>
-// CHECK: arith.select {{.*}} : tensor<8x16x16xi1>, tensor<8x16x16xf32>
+// CHECK: tt.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<1024x16xf16> * tensor<16x16xf16> -> tensor<1024x16xf32>
+// CHECK: arith.select {{.*}} : tensor<64x16x16xi1>, tensor<64x16x16xf32>
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num_tiles = 64 : i32} {
   tt.func @reduce_shifted_bound(%A: !tt.ptr<f16>, %B: !tt.ptr<f16>, %C: !tt.ptr<f32>) {
     %pid = tt.get_program_id x : i32
@@ -251,14 +256,14 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num
 // run?" from an in-loop table read.  The table pointer is lifted with the query
 // rows, so every row reads its own index lane under the per-row active mask.
 
-// CHECK: module attributes {{.*}}hacc.coalesce_factor = 8 : i32
+// CHECK: module attributes {{.*}}hacc.coalesce_factor = 64 : i32
 // CHECK-LABEL: tt.func @scalar_table_load_in_loop(
 // CHECK: scf.for
-// CHECK: tt.load {{.*}} : tensor<8x!tt.ptr<i32>>
-// CHECK: tt.load {{.*}} : tensor<8x16x16x!tt.ptr<f16>>
-// CHECK: tt.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<128x16xf16> * tensor<16x16xf16> -> tensor<128x16xf32>
-// CHECK: arith.select {{.*}} : tensor<8x16x16xi1>, tensor<8x16x16xf32>
-// CHECK: tt.store {{.*}} : tensor<8x16x16x!tt.ptr<f32>>
+// CHECK: tt.load {{.*}} : tensor<64x!tt.ptr<i32>>
+// CHECK: tt.load {{.*}} : tensor<64x16x16x!tt.ptr<f16>>
+// CHECK: tt.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<1024x16xf16> * tensor<16x16xf16> -> tensor<1024x16xf32>
+// CHECK: arith.select {{.*}} : tensor<64x16x16xi1>, tensor<64x16x16xf32>
+// CHECK: tt.store {{.*}} : tensor<64x16x16x!tt.ptr<f32>>
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num_tiles = 64 : i32} {
   tt.func @scalar_table_load_in_loop(%A: !tt.ptr<f16>, %B: !tt.ptr<f16>, %C: !tt.ptr<f32>, %S: !tt.ptr<i32>) {
     %pid = tt.get_program_id x : i32
@@ -310,15 +315,15 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num
 // A runtime trip count is lifted too.  The bound stays a scalar load because it
 // is pid-invariant, and each row's active mask ends its own iterations.
 
-// CHECK: module attributes {{.*}}hacc.coalesce_factor = 8 : i32
+// CHECK: module attributes {{.*}}hacc.coalesce_factor = 64 : i32
 // CHECK-LABEL: tt.func @table_read_runtime_bound(
 // CHECK: tt.load {{.*}} : !tt.ptr<i32>
 // CHECK: scf.for
-// CHECK: tt.load {{.*}} : tensor<8x!tt.ptr<i32>>
-// CHECK: tt.load {{.*}} : tensor<8x16x16x!tt.ptr<f16>>
-// CHECK: tt.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<128x16xf16> * tensor<16x16xf16> -> tensor<128x16xf32>
-// CHECK: arith.select {{.*}} : tensor<8x16x16xi1>, tensor<8x16x16xf32>
-// CHECK: tt.store {{.*}} : tensor<8x16x16x!tt.ptr<f32>>
+// CHECK: tt.load {{.*}} : tensor<64x!tt.ptr<i32>>
+// CHECK: tt.load {{.*}} : tensor<64x16x16x!tt.ptr<f16>>
+// CHECK: tt.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<1024x16xf16> * tensor<16x16xf16> -> tensor<1024x16xf32>
+// CHECK: arith.select {{.*}} : tensor<64x16x16xi1>, tensor<64x16x16xf32>
+// CHECK: tt.store {{.*}} : tensor<64x16x16x!tt.ptr<f32>>
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num_tiles = 64 : i32} {
   tt.func @table_read_runtime_bound(%A: !tt.ptr<f16>, %B: !tt.ptr<f16>, %C: !tt.ptr<f32>, %S: !tt.ptr<i32>, %N: !tt.ptr<i32>) {
     %pid = tt.get_program_id x : i32

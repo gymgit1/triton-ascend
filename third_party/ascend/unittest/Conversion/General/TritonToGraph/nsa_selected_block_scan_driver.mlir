@@ -28,9 +28,12 @@
 // RUN: triton-opt %S/Inputs/nsa_fwd_const_ns.mlir -graph-optimize='rule-mask=196608' -o %t.joint
 // RUN: diff %t.rulea %t.joint
 
-// Joint Rule A + Rule B path: 65536 | 131072 = 196608.  Rule A rewrites the
+// Joint A + Rule B path: 65536 | 131072 = 196608.  Rule A rewrites the
 // sparse loop and materializes Rule B's contract inside its own sandbox, so
-// the output must carry the dynamic grid contract and the 128-row dot shapes.
+// the output must carry the dynamic grid contract and the lifted dot shapes.
+// The row count is now derived from the resource constraints alone: this run
+// passes no L0 budget, so the per-value byte budget caps the 8 KiB f32
+// intermediate at 128 KiB / 8 KiB = 16 rows (16 x 16 = 256 dot rows).
 // RUN: triton-opt %S/Inputs/nsa_fwd_const_ns.mlir -graph-optimize='rule-mask=196608' -o - | FileCheck %s --check-prefix=JOINT
 
 // CHECK-LABEL: tt.func @graph_optimize_selected_block_scan_accept()
@@ -62,5 +65,5 @@ tt.func @graph_optimize_reject_unknown_bit() {
 
 // Joint A+B contract checks (fed by the RUN line above from the real kernel).
 // JOINT: hacc.program_grid_transforms
-// JOINT-SAME: factor = 8
-// JOINT: tensor<128x128xbf16>
+// JOINT-SAME: factor = 16
+// JOINT: tensor<256x128xbf16>

@@ -534,7 +534,7 @@
 // H1DYNREW: hacc.program_grid_transforms = {extent_source = "runtime_original_grid"
 // H1DYNREW: tt.func public @parallel_nsa_fwd_kernel(
 // H1DYNREW-NOT: scf.if
-// H1DYNREW: tensor<8x16x!tt.ptr<i64>>
+// H1DYNREW: tensor<32x16x!tt.ptr<i64>>
 // H1DYNREW: scf.for
 // H1DYNREW: "tt.reduce"(%{{.*}}) <{axis = 2 : i32}>
 // H1DYNREW: tt.store

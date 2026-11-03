@@ -164,7 +164,8 @@ static int64_t tensorStorageBytes(RankedTensorType tensor) {
 // 不受 L0 约束。
 static std::optional<RowCandidate> matchDotRows(triton::FuncOp fn,
                                                 uint64_t l0aBudgetBytes,
-                                                uint64_t l0cBudgetBytes) {
+                                                uint64_t l0cBudgetBytes,
+                                                uint64_t coreNum) {
   ModuleOp module = fn->getParentOfType<ModuleOp>();
   auto grid = module->getAttrOfType<IntegerAttr>("hacc.grid_num_tiles");
   if ((grid && (grid.getInt() <= 0 || grid.getInt() > INT32_MAX)) ||
@@ -323,18 +324,20 @@ static std::optional<RowCandidate> matchDotRows(triton::FuncOp fn,
   if (!step || *step <= 0)
     return std::nullopt;
 
-  // Shared profitability policy: the factor stays a power of two, the widened
-  // M dimension is capped at 128 rows, and one lifted value may not exceed the
-  // shared byte budget.  L0A/L0C budgets are a correctness constraint, not a
-  // profitability one: the rewrite widens the lhs and accumulator tiles by the
-  // factor while the rhs stays shared, so a zero capacity disables the check.
+  // Shared profitability policy: the factor is derived from the resource
+  // constraints (the row count falls out of the smallest implied upper bound),
+  // the widened M dimension is capped at 128 rows, and one lifted value may not
+  // exceed the shared byte budget.  L0A/L0C budgets are a correctness
+  // constraint, not a profitability one: the rewrite widens the lhs and
+  // accumulator tiles by the factor while the rhs stays shared, so a zero
+  // capacity disables the check.
   RowCountPolicy policy;
-  policy.maxRows = 32;
   policy.targetDotRows = 128;
   policy.maxL0ABytes = maxL0ABytes;
   policy.maxL0CBytes = maxL0CBytes;
   policy.l0ABudgetBytes = l0aBudgetBytes;
   policy.l0CBudgetBytes = l0cBudgetBytes;
+  policy.coreNum = coreNum;
   int64_t rows = selectRowsPerProgram(grid ? grid.getInt() : 0, maxDotRows,
                                       maxTensorBytes, policy);
   if (rows <= 1)
@@ -357,13 +360,15 @@ class DotRowPlan final : public RewritePlan {
   // capacities are unknown and the factor stays unconstrained.
   uint64_t l0aBudgetBytes = 0;
   uint64_t l0cBudgetBytes = 0;
+  uint64_t coreNum = 0;
 
   // 保存候选、创建 epoch 以及已私有验证的沙箱模块。
   DotRowPlan(RowCandidate candidate, unsigned epoch,
              OwningOpRef<ModuleOp> prepared, uint64_t l0aBudgetBytes,
-             uint64_t l0cBudgetBytes)
+             uint64_t l0cBudgetBytes, uint64_t coreNum)
       : candidate(candidate), epoch(epoch), prepared(std::move(prepared)),
-        l0aBudgetBytes(l0aBudgetBytes), l0cBudgetBytes(l0cBudgetBytes) {}
+        l0aBudgetBytes(l0aBudgetBytes), l0cBudgetBytes(l0cBudgetBytes),
+        coreNum(coreNum) {}
 
 public:
   // 返回 RowCoalescing的规则 ID。
@@ -385,7 +390,7 @@ public:
       return failure();
 
     auto current =
-        matchDotRows(candidate.function, l0aBudgetBytes, l0cBudgetBytes);
+        matchDotRows(candidate.function, l0aBudgetBytes, l0cBudgetBytes, coreNum);
     return success(current && current->anchor == candidate.anchor &&
                    current->rowsPerProgram == candidate.rowsPerProgram &&
                    current->runtimeGrid == candidate.runtimeGrid);
@@ -395,7 +400,8 @@ public:
   static std::unique_ptr<DotRowPlan> create(RowCandidate candidate,
                                             unsigned epoch,
                                             uint64_t l0aBudgetBytes,
-                                            uint64_t l0cBudgetBytes) {
+                                            uint64_t l0cBudgetBytes,
+                                            uint64_t coreNum) {
     // Prepare and verify privately before offering a plan to the scheduler.
     // An unsupported rewrite must leave the input and its diagnostics
     // untouched.
@@ -434,8 +440,9 @@ public:
         return nullptr;
     }
 
-    return std::unique_ptr<DotRowPlan>(new DotRowPlan(
-        candidate, epoch, std::move(sandbox), l0aBudgetBytes, l0cBudgetBytes));
+    return std::unique_ptr<DotRowPlan>(
+        new DotRowPlan(candidate, epoch, std::move(sandbox), l0aBudgetBytes,
+                       l0cBudgetBytes, coreNum));
   }
 
   // 提交已验证的函数体并发布合并相关属性。
@@ -482,9 +489,11 @@ cfg::createDotRowCoalescingPlan(triton::FuncOp function, unsigned epoch,
     l0cBudgetBytes = resources.getSafeL0CBudget().value_or(0);
   }
 
-  auto candidate = matchDotRows(function, l0aBudgetBytes, l0cBudgetBytes);
+  auto candidate = matchDotRows(function, l0aBudgetBytes, l0cBudgetBytes,
+                                resources.coreNum);
   if (!candidate)
     return nullptr;
 
-  return DotRowPlan::create(*candidate, epoch, l0aBudgetBytes, l0cBudgetBytes);
+  return DotRowPlan::create(*candidate, epoch, l0aBudgetBytes, l0cBudgetBytes,
+                            resources.coreNum);
 }

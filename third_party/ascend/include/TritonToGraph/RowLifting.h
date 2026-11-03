@@ -125,6 +125,17 @@ struct RowLiftFeatures {
   // 输出累加器过宽，需要沿宽度拆成两半。
   // The output accumulator is too wide and must be split along its width.
   bool splitWideAccumulator = false;
+  // 与查询行相关的块指针保留成块描述符，把行维作为描述符的最外轴（运行期
+  // 形状即行数），行有效位交给 boundary check 的零填充，而不是把描述符展开
+  // 成指针张量再逐行掩码。展开的指针张量会被后端降级成逐元素间接访存，
+  // 并常驻 i64 地址向量；描述符形态则是一次 DMA。
+  // A query-row-dependent block pointer stays a descriptor with the row dimension
+  // as its outermost axis (whose runtime shape is the row count), and row
+  // validity is left to the boundary check's zero padding instead of expanding
+  // the descriptor into a pointer tensor and masking per row.  An expanded
+  // pointer tensor degrades to per-element indirect access and keeps an i64
+  // address vector resident; the descriptor form is one DMA.
+  bool rowDescriptor = false;
 };
 
 // 单个提升值的字节预算。超过该宽度的值默认被拒绝，由
@@ -133,13 +144,20 @@ struct RowLiftFeatures {
 // default and halved by the splitWideAccumulator capability.
 constexpr int64_t kMaxLiftedValueBytes = 128 * 1024;
 
+// 单个提升值在「一行」上的宽度上限：A2/A5 的向量寄存器是 128 个 f16 车道
+// （256 B），换成 f32 即 64 列。超过一个向量寄存器的值链要折半，否则单条链
+// 跨多个寄存器，后端无法把它整体常驻 UB。阈值由硬件位宽推出，不写死列数。
+// Per-row width ceiling of one lifted value: the A2/A5 vector register holds
+// 128 f16 lanes (256 bytes), which is 64 f32 columns.  A chain wider than one
+// vector register has to be halved, otherwise a single chain spans several
+// registers and the backend cannot keep it resident in UB.  The threshold is
+// derived from the hardware width rather than a hard-coded column count.
+constexpr int64_t kVectorRegisterBytes = 256;
+
 // 查询行数的收益策略。行数决策只在这里实现，资源模型只需替换本策略即可。
 // Profitability policy for the query-row count.  The row-count decision lives
 // here and nowhere else, so a resource model only has to replace this function.
 struct RowCountPolicy {
-  // 尝试的最大因子；候选为不高于它的 2 的幂（最小到 2）。
-  // Largest factor tried; the candidates are the powers of two down to 2.
-  int64_t maxRows = 8;
   // 提升后 M（dot 行）维的上限；0 表示不限制。
   // Cap on the lifted M (dot-row) dimension; zero disables the cap.
   int64_t targetDotRows = 0;
@@ -162,6 +180,12 @@ struct RowCountPolicy {
   // unknown and the corresponding check is disabled.
   uint64_t l0ABudgetBytes = 0;
   uint64_t l0CBudgetBytes = 0;
+  // 物理核数（纯 SIMT 用 AIV，其余用 AIC）；合并后轴 0 的程序数不得少于
+  // 该值，0 表示未知并关闭检查。
+  // Number of physical cores (AIV for pure-SIMT kernels, AIC otherwise); the
+  // coalesced axis-0 program count must stay at least this large.  Zero means
+  // unknown and disables the check.
+  uint64_t coreNum = 0;
 };
 
 // 为一个 program 选择要处理的查询行数。`grid` 是静态启动网格，为 0 表示
@@ -189,22 +213,30 @@ struct RowLiftCandidate {
   // lets the index-table read pick its column extent at compile time.
   int64_t grid = 0;
   RowLiftFeatures features;
-  // 行数决策的全部输入，供片上预算超限时下调因子重选。`maxDotRows` 是最宽的
-  // 原始 dot M 维，`maxTensorBytes` 是原始函数中最大的单值字节。
-  // Everything the row-count decision consumes, kept so a candidate can retry
-  // with a smaller factor when an on-chip budget overflows.  `maxDotRows` is the
-  // widest original dot M dimension and `maxTensorBytes` the largest value in
-  // the original function.
-  RowCountPolicy rowPolicy;
+  // 最宽的原始 dot M 维，供单值预算与拆分判据按「提升后的 M」换算。
+  // Widest original dot M dimension, used to derive the lifted M dimension that
+  // the per-value budget and the split predicate are expressed in.
   int64_t maxDotRows = 1;
-  int64_t maxTensorBytes = 1;
+  // 原始 dot 的值维（累加器 N 维）。按 kVectorRegisterBytes 换算后超过一个
+  // 向量寄存器宽度时，提升后的值链要么被拆成两条半宽链、要么留下一个超宽
+  // 累加器，静态活值估计都会低估，UB 预算判定据此放大需求。
+  // Value dimension of the original dots (the accumulator's N axis).  Once it
+  // exceeds one vector register at kVectorRegisterBytes, the lifted value chain
+  // is either split into two half-width chains or left as an over-wide
+  // accumulator, and the static live-byte estimate under-counts it; the UB
+  // budget check amplifies the demand accordingly.
+  int64_t maxDotCols = 1;
+  // 累加器元素的字节数，用来把列数换算成向量寄存器宽度；没有 dot 时为 f32。
+  // Bytes per accumulator element, used to convert the column count into vector
+  // register widths; defaults to f32 for a candidate without a dot.
+  int64_t accumulatorElemBytes = 4;
   // 单个提升进位值的字节预算，超过即由 splitWideAccumulator 能力对半拆分。
-  // 默认沿用全局单值预算；规则 B 用「M × 最多 64 个值列」重新设定它，使
-  // V 维超过 64 的累加器像手写 kernel 一样被拆成两半。
+  // 规则 B 用「提升后的 M × 每个值一行一个向量寄存器」重新设定它，于是末维
+  // 超过一个向量寄存器的累加器会被对半拆开，阈值不再是写死的列数。
   // Byte budget for one lifted carried value; anything above it is halved by the
-  // splitWideAccumulator capability.  The default is the global per-value
-  // budget; rule B re-derives it as "M × at most 64 value columns", so an
-  // accumulator wider than 64 columns is halved like the hand-written kernel.
+  // splitWideAccumulator capability.  Rule B re-derives it as "lifted M × one
+  // vector register per row", so an accumulator whose last dimension exceeds one
+  // vector register is halved and the threshold stops being a hard-coded count.
   int64_t splitValueBudgetBytes = kMaxLiftedValueBytes;
 };
 
@@ -302,6 +334,58 @@ private:
   // Rebuild a descriptor load on the expanded pointer tensor.
   bool rewriteDescriptorLoad(triton::LoadOp load,
                              const LiftedDescriptor &descriptor);
+  // 保留成块描述符的查询行相关块指针：`pointer` 是以行维为最外轴的新描述符。
+  // A query-row-dependent block pointer that stays a descriptor; `pointer` is
+  // the new descriptor whose outermost axis is the row dimension.
+  struct RowDescriptor {
+    Value pointer;
+    // 提升后的 tile 形状（[R] + 原 tile 形状，或拍平后的 [R·原最外轴, 其余]），
+    // 用于校验边界轴的取值范围。
+    // Lifted tile shape ([R] plus the original tile shape, or the flattened
+    // [R·outer axis, remaining axes]), used to validate the boundary-check axes.
+    SmallVector<int64_t> tileShape;
+    // 非空表示行维与原描述符最外轴已合并成一条轴，取值为原最外轴的完整
+    // extent（每行在该轴上前进的元素数）。此时 load/store 的值需要在
+    // [R, 原最外轴, 其余] 与 [R·原最外轴, 其余] 之间做按元素顺序的 reshape。
+    // Non-empty when the row dimension was merged into the descriptor's
+    // outermost axis; the value is that axis' full extent (the number of
+    // elements one row advances along it).  Load/store values then switch
+    // between [R, outer axis, rest] and [R·outer axis, rest] with an
+    // element-order-preserving reshape.
+    std::optional<int64_t> flattenedOuterExtent;
+  };
+  // 把查询行相关的块指针重建成「行维在最外层」的块描述符。只在能证明基址偏移
+  // 关于行号是仿射的、且其余索引都与行无关时才成功；否则返回 false，调用方
+  // 继续走原来的指针张量展开路径。
+  // Rebuild a query-row-dependent descriptor with the row dimension as the
+  // outermost axis.  It only succeeds when the base offset is provably affine in
+  // the row index and every other index is row-invariant; otherwise it returns
+  // false and the caller keeps the existing pointer-tensor expansion.
+  bool buildRowDescriptor(triton::MakeTensorPtrOp makePtr,
+                          RowDescriptor &descriptor);
+  // 用保留的块描述符重建 load：行有效位由 boundary check 的零填充承担，
+  // 因此不再生成逐行掩码。
+  // Rebuild a load on the retained descriptor; the boundary check's zero padding
+  // carries row validity, so no per-row mask is generated.
+  bool rewriteRowDescriptorLoad(triton::LoadOp load,
+                                const RowDescriptor &descriptor);
+  // 用保留的块描述符重建 store：最外轴的边界检查把写入范围夹到有效行内，
+  // 越界行不参与写回，因此也不再生成逐行掩码。
+  // Rebuild a store on the retained descriptor; the outermost axis' boundary
+  // check clamps the written region to valid rows, so out-of-range rows are not
+  // written and no per-row mask is generated.
+  bool rewriteRowDescriptorStore(triton::StoreOp store,
+                                 const RowDescriptor &descriptor);
+  // 证明 `value` 关于行号（原始 pid 结果）是仿射的，返回行步长（每行前进的
+  // 元素数）；不可分解时返回 nullopt。纯分析，不生成 IR。
+  // Prove that `value` is affine in the row index (the original pid result) and
+  // return the per-row stride in elements; nullopt when it cannot be
+  // decomposed.  Pure analysis, no IR is emitted.
+  std::optional<int64_t> analyzeAffineInRow(Value value, Value pid);
+  // 把同一个表达式在「行号取 0」处求值，用来得到描述符的标量基址。
+  // Evaluate the same expression at row index zero, which is the descriptor's
+  // scalar base offset.
+  Value materializeRowZeroPart(Value value, Value pid);
   // 用给定描述符发出一次 load 并交回结果，不做映射登记；拆半路径按两个描述符
   // 各调用一次，因此结果类型取自描述符的指针形状。
   // Emit one load for the given descriptor and hand back its result without
@@ -413,10 +497,17 @@ private:
   // Splits `value` along its last dimension into two contiguous halves; only used
   // for the loop-carried initial value, which has no structural source.
   bool splitLastDimension(Value value, SplitValue &halves);
-  // 拆进位初值：splat 常量直接生成半宽常量，其余形态退回 reshape+split。
-  // Splits an initial value: a splat constant yields half-width constants
-  // directly, anything else falls back to reshape+split.
-  bool splitInitialValue(Value value, SplitValue &halves);
+  // 取一个已规划拆半值的两个半宽提升值：先复用重写期已登记的两半，否则按规划
+  // 的半宽从原始值直接重建（splat 常量与 splat 折叠成半宽常量，其余形态先拆
+  // 再各自补行维），避免先提升成全宽再拆。两者都不可用时返回 false，调用方据
+  // 此放弃整次提升。
+  // Return the two half-width lifted values of a value planned for halving: reuse
+  // the halves registered during rewriting, otherwise rebuild them from the
+  // original value using the planned half width (a splat constant or a scalar
+  // splat collapses into a half-width constant; anything else is halved first and
+  // lifted per half), so a full-width lifted temporary is never materialised.
+  // Returning false makes the caller decline the whole lift.
+  bool ensureRowHalves(Value old, SplitValue &halves);
   // 把一个整宽操作数按半宽重建：只有「各列取值相同」的形态（标量 splat、
   // 沿最后一维从 1 广播、splat 常量）可以这样折叠，重建后同一个半宽值同时
   // 供两半使用。返回空 Value 表示无法结构折叠。
@@ -520,10 +611,26 @@ private:
   // types before it is created, so this decision cannot live only in the
   // rewrite-time `splitValues`.
   DenseSet<Value> plannedSplitValues;
+  // 规划阶段为每个要拆半的原始值登记的半宽（最后一维的宽度）。在生成任何 IR
+  // 之前填充，因此半宽值的类型无需等到重写期 splitValues 才知道。
+  // Half width (trailing extent) recorded during planning for every value that
+  // has to be halved.  It is filled before any IR is generated, so a half-width
+  // type no longer depends on the rewrite-time `splitValues`.
+  DenseMap<Value, int64_t> plannedHalfWidths;
   // 需要按最后一维拆半的描述符，键为 tt.make_tensor_ptr 的结果。
   // Descriptors to halve along their last dimension, keyed by the
   // tt.make_tensor_ptr result.
   DenseMap<Value, SplitDescriptor> splitDescriptors;
+  // 保留成「行维在最外层」块描述符的那些原始描述符。
+  // Original descriptors that were kept as row-major-axis block descriptors.
+  DenseMap<Value, RowDescriptor> rowDescriptors;
+  // 锚点展开出的行号信息：组内首行 base = pid * R 与运行期行数上界。
+  // 二者都在重建行描述符时使用；静态网格没有运行期上界。
+  // Row information expanded at the anchor: the group's first row
+  // `base = pid * R` and the runtime row extent.  Both are needed to rebuild a
+  // row descriptor; a static grid has no runtime extent.
+  Value liftedRowStart;
+  Value liftedRowExtent;
 };
 
 } // namespace cfg

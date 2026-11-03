@@ -286,6 +286,10 @@ constexpr GraphOptimizationRuleMask kDefaultEligibleGraphOptimizationRuleMask =
     getGraphOptimizationRuleMask(GraphOptimizationRuleId::SelectedBlockScan) |
     getGraphOptimizationRuleMask(GraphOptimizationRuleId::QueryRowBatching);
 
+// SelectedBlockScan / QueryRowBatching 位于上面的默认可用集；要让它们恢复
+// 默认关闭，请把这两项移回本常量。
+// SelectedBlockScan / QueryRowBatching now live in the default-eligible set
+// above; move them back here to make them opt-in again.
 constexpr GraphOptimizationRuleMask kFixedDefaultOffGraphOptimizationRuleMask =
     getGraphOptimizationRuleMask(
         GraphOptimizationRuleId::ResidentLoadForwarding) |
@@ -389,6 +393,12 @@ struct GraphOptimizationOptions {
   unsigned mappingL0BCapacityBytes = 0;
   unsigned mappingL0CCapacityBytes = 0;
   unsigned l0SafetyPercent = 80;
+  // 启动时实际调度的物理核块数（纯 SIMT 用 AIV，其余用 AIC）。行数策略用它
+  // 保证按 R 合并后仍能铺满一轮核；0 表示未知，关闭 gridX/R >= coreNum 检查。
+  // Physical AI-core blocks the launcher schedules (AIV for pure-SIMT kernels,
+  // AIC otherwise).  The row-count policy keeps one full wave after R-way
+  // coalescing; zero disables the gridX/R >= coreNum check.
+  unsigned coreNum = 0;
   // RowCoalescing changes the launch grid and is valid only for
   // compile_mode="simt_only".  Keep the source selector rather than a
   // second derived force flag so every consumer follows one mode contract.

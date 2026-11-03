@@ -121,6 +121,8 @@ std::unique_ptr<GraphOptimizationRule> createStoreCoveragePlanningRule(
     const StoreCoveragePlanningRuleOptions &options);
 std::unique_ptr<GraphOptimizationRule> createContiguousBlockAccessFormationRule(
     const ContiguousBlockAccessFormationRuleOptions &options);
+// 创建规则 B（QueryRowBatchingRule，规则位 131072）的规则对象。
+std::unique_ptr<GraphOptimizationRule> createQueryRowBatchingRule();
 
 } // namespace cfg
 } // namespace triton

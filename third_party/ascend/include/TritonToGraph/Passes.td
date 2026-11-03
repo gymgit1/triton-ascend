@@ -95,6 +95,8 @@ def GraphOptimize : Pass<"graph-optimize", "mlir::ModuleOp"> {
            "Physical L0C (cube accumulator) buffer capacity in bytes; zero disables L0C candidate checks">,
     Option<"l0SafetyPercent", "l0-safety-percent", "uint64_t", "80",
            "Percent of L0A/L0B/L0C capacity available to resource candidates">,
+    Option<"coreNum", "core-num", "uint64_t", "0",
+           "Physical AI-core blocks the launcher schedules (AIV for pure-SIMT kernels, AIC otherwise); zero disables the gridX/R >= coreNum row-count constraint">,
     Option<"compileMode", "compile-mode", "std::string", "\"simd_simt_template\"",
            "Compilation mode; legacy elementwise RowCoalescing is enabled only for simt_only">,
     Option<"selectedBlockScanForceApply", "selected-block-scan-force-apply", "bool", "false",

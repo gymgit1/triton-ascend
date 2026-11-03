@@ -35,12 +35,15 @@
 // The weight reduce is the new third reduction of the additive form (the
 // baseline has none): axis 2 of the row-lifted [R, G, BN] score tile.
 // MPTR: "tt.reduce"(%{{.*}}) <{axis = 2 : i32}>
-// Three dots, all with the lifted M = 128 row block.  The last one consumes
-// k^T, whose order attribute must be replayed verbatim (it is semantic).
-// MPTR: tt.dot {{.*}} : tensor<128x64xf16> * tensor<64x64xf16> -> tensor<128x64xf32>
-// MPTR: tt.dot {{.*}} : tensor<128x64xf16> * tensor<64x64xf16> -> tensor<128x64xf32>
+// Three dots, all with the lifted M = 512 row block (16 rows x 32).  The factor
+// comes from the shared row-count policy, which now derives its upper bound from
+// the per-value budget instead of the retired hard-coded 8-row cap.  The last
+// one consumes k^T, whose order attribute must be replayed verbatim (it is
+// semantic).
+// MPTR: tt.dot {{.*}} : tensor<512x64xf16> * tensor<64x64xf16> -> tensor<512x64xf32>
+// MPTR: tt.dot {{.*}} : tensor<512x64xf16> * tensor<64x64xf16> -> tensor<512x64xf32>
 // MPTR: tt.trans {{.*}} {order = array<i32: 1, 0>} : tensor<64x64xf16> -> tensor<64x64xf16>
-// MPTR: tt.dot {{.*}} : tensor<128x64xf16> * tensor<64x64xf16> -> tensor<128x64xf32>
+// MPTR: tt.dot {{.*}} : tensor<512x64xf16> * tensor<64x64xf16> -> tensor<512x64xf32>
 // The single dq store survives; nothing else was added to the function.
 // MPTR: tt.store
 // MPTR-NOT: scf.if

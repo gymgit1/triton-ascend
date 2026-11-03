@@ -391,9 +391,12 @@ static bool isTensorPointer(Type type) {
   return pointer && isa<RankedTensorType>(pointer.getPointeeType());
 }
 
-// 在 2..maxRows 的 2 的幂中选每个 program 处理的行数，返回 1 表示不提升。
-// 选择流程：预算换算 -> 从大到小枚举 2 的幂 -> 逐项检查网格整除、dot 行数
-// 上限与单值字节预算，第一个通过的因子即结果。
+// 由资源约束反推出每个 program 能处理的查询行数，返回 1 表示不提升。
+// R is the smallest upper bound implied by the resource constraints, floored to a
+// power of two because the rewrite and its retry paths walk factors by halving.
+// A constraint whose input is unknown (zero budget, zero demand, runtime grid)
+// does not bound R; when no constraint bounds it, no factor is proven safe and
+// lifting is declined.
 int64_t selectRowsPerProgram(int64_t grid, int64_t maxDotRows,
                              int64_t maxTensorBytes,
                              const RowCountPolicy &policy) {
@@ -405,34 +408,60 @@ int64_t selectRowsPerProgram(int64_t grid, int64_t maxDotRows,
                              ? 2 * policy.maxLiftedValueBytes
                              : policy.maxLiftedValueBytes;
 
-  // 从最大因子开始逐个减半，保证优先选择收益最大的因子。
-  for (int64_t factor = policy.maxRows; factor >= 2; factor /= 2) {
-    // 静态网格必须整除，否则会改变 program 与查询行的映射；运行期范围
-    // 用掩码处理最后一组，因此任意因子都可接受。
-    // A static grid must divide exactly; a runtime extent masks the last group,
-    // so any factor is admissible there.
-    if (grid && grid % factor != 0)
-      continue;
-    // 提升后 M 维上限检查：maxDotRows * factor 不得超过 targetDotRows。
-    if (policy.targetDotRows && maxDotRows > policy.targetDotRows / factor)
-      continue;
-    // 单值字节预算检查（乘法溢出时同样放弃该因子）。
-    int64_t lifted;
-    if (__builtin_mul_overflow(maxTensorBytes, factor, &lifted) ||
-        lifted > budget)
-      continue;
-    // L0 容量是正确性约束：重写按因子放大 lhs 与累加器 tile，预算按因子
-    // 均摊；预算为 0 表示目标架构容量未知，对应检查关闭。
-    if ((policy.l0ABudgetBytes &&
-         static_cast<uint64_t>(policy.maxL0ABytes) >
-             policy.l0ABudgetBytes / factor) ||
-        (policy.l0CBudgetBytes &&
-         static_cast<uint64_t>(policy.maxL0CBytes) >
-             policy.l0CBudgetBytes / factor))
-      continue;
-    return factor;
-  }
-  return 1;
+  // 每条约束都形如 demand * factor <= budget，等价于 factor <= budget / demand，
+  // 因此逐因子比较可以折叠成取所有上界的最小值。
+  // Every constraint has the form demand * factor <= budget, which is the same
+  // as factor <= budget / demand, so the per-factor checks collapse into one
+  // minimum over the implied upper bounds.
+  std::optional<int64_t> limit;
+  auto tighten = [&](int64_t bound) {
+    limit = limit ? std::min(*limit, bound) : bound;
+  };
+
+  // L0A/L0C 容量：重写按因子放大 lhs 与累加器 tile，预算被因子均摊。预算为 0
+  // 表示目标架构容量未知，此时该约束不参与定界。
+  // L0A/L0C capacity: the rewrite widens the lhs and accumulator tiles by the
+  // factor, so the budget is shared across the factor.  A zero budget means the
+  // target capacities are unknown and the constraint does not bound R.
+  if (policy.maxL0ABytes > 0 && policy.l0ABudgetBytes > 0)
+    tighten(static_cast<int64_t>(policy.l0ABudgetBytes /
+                                 static_cast<uint64_t>(policy.maxL0ABytes)));
+  if (policy.maxL0CBytes > 0 && policy.l0CBudgetBytes > 0)
+    tighten(static_cast<int64_t>(policy.l0CBudgetBytes /
+                                 static_cast<uint64_t>(policy.maxL0CBytes)));
+  // 单个提升值的字节预算。
+  // Per-value byte budget.
+  if (maxTensorBytes > 0)
+    tighten(budget / maxTensorBytes);
+  // 提升后 M 维上限；0 表示调用方不限制。
+  // Cap on the lifted M dimension; zero means the caller does not cap it.
+  if (policy.targetDotRows > 0 && maxDotRows > 0)
+    tighten(policy.targetDotRows / maxDotRows);
+  // 合并后轴 0 仍要铺满一轮物理核；只有静态网格可判定，运行期网格 grid 为 0。
+  // Axis 0 must still fill one full wave of physical cores.  Only a static
+  // extent can be judged; a runtime grid reports zero.
+  if (grid > 0 && policy.coreNum > 0)
+    tighten(grid / static_cast<int64_t>(policy.coreNum));
+
+  if (!limit)
+    return 1;
+
+  // 向下取 2 的幂：重写与重试都按 2 的幂收缩因子。
+  // Floor to a power of two: the rewrite and its retries shrink the factor by
+  // halving.
+  int64_t factor = 1;
+  while (factor <= *limit / 2)
+    factor *= 2;
+
+  // 静态网格必须整除，否则会改变 program 与查询行的映射；运行期网格用掩码
+  // 处理最后一组。整除不是单调条件，所以仍需向下回退。
+  // A static grid must divide exactly, otherwise the program-to-row mapping
+  // changes; a runtime extent masks the last group.  Divisibility is not
+  // monotone, so it still needs the downward walk.
+  while (factor >= 2 && grid && grid % factor != 0)
+    factor /= 2;
+
+  return factor >= 2 ? factor : 1;
 }
 
 // 返回单个元素的字节数；未知元素类型返回 0。
@@ -477,6 +506,7 @@ bool RowLiftBuilder::run(triton::FuncOp fn) {
   // could no longer be rebuilt per half.
   plannedSplitIndices.clear();
   plannedSplitValues.clear();
+  plannedHalfWidths.clear();
   if (!planWideAccumulatorSplits(loop, plannedSplitIndices))
     return false;
   // 新建一个空 block 作为重建目标，先挂到函数体尾部，成功后替换旧 block。
@@ -534,6 +564,13 @@ bool RowLiftBuilder::run(triton::FuncOp fn) {
         validRows = rewriter.create<arith::CmpIOp>(
             op.getLoc(), arith::CmpIPredicate::slt,
             valueMapping.lookup(op.getResult(0)), limit);
+        // 行描述符需要组内首行（作为最外轴的偏移）与行数上界（作为最外轴的
+        // 形状）；两者都是标量，只在运行期网格下存在。
+        // A row descriptor needs the group's first row (as the outermost axis
+        // offset) and the row extent (as the outermost axis shape).  Both are
+        // scalars and only exist for a runtime grid.
+        liftedRowStart = base;
+        liftedRowExtent = extent;
       }
       continue;
     }
@@ -646,6 +683,29 @@ bool RowLiftBuilder::rewrite(Operation *op) {
   if (auto add = dyn_cast<triton::AddPtrOp>(op))
     if (columnTables.contains(add.getResult()))
       return add.getResult().hasOneUse();
+
+  // 步骤 1c：消费「保留成块描述符」的 load 直接在新描述符上重建。这里必须
+  // 早于依赖探测：描述符本身有映射，但 load 不该被当作普通指令克隆，否则
+  // 会退回到指针张量路径并重新生成逐行掩码。
+  // A load that consumes a retained block descriptor is rebuilt on the new
+  // descriptor.  This has to run before the dependence probe: the descriptor is
+  // mapped, but the load must not be cloned generically or the rewrite would fall
+  // back to the pointer-tensor path and regenerate the per-row mask.
+  if (auto load = dyn_cast<triton::LoadOp>(op)) {
+    auto row = rowDescriptors.find(load.getPtr());
+    if (row != rowDescriptors.end())
+      return rewriteRowDescriptorLoad(load, row->second);
+  }
+  // 同理，写回也要落在保留的描述符上：通用路径会把它展开成指针张量并重新
+  // 生成逐行掩码，等于又造回一张 i64 地址表。
+  // A store must land on the retained descriptor for the same reason: the
+  // generic path would expand it into a pointer tensor and regenerate the
+  // per-row mask, which brings the i64 address table back.
+  if (auto store = dyn_cast<triton::StoreOp>(op)) {
+    auto row = rowDescriptors.find(store.getPtr());
+    if (row != rowDescriptors.end())
+      return rewriteRowDescriptorStore(store, row->second);
+  }
 
   // 步骤 2：判断本指令是否与查询行相关。
   //   descriptor —— 操作数是已展开的块指针，必须走描述符访存路径；
@@ -985,7 +1045,7 @@ bool RowLiftBuilder::rewriteLoop(scf::ForOp old) {
   for (auto [index, arg] : llvm::enumerate(old.getInitArgs())) {
     if (llvm::is_contained(splitIndices, static_cast<int64_t>(index))) {
       SplitValue halves;
-      if (!splitInitialValue(arg, halves))
+      if (!ensureRowHalves(arg, halves))
         return false;
       ranges.push_back({loopInit.size(), 2});
       loopInit.push_back(halves.first);
@@ -1483,8 +1543,27 @@ bool RowLiftBuilder::planWideAccumulatorSplits(
     if (!isSplitFriendlyValue(arg, old, sawDot) || !sawDot)
       return false;
     SmallVector<Value> descriptors;
+    DenseSet<Value> island;
     if (!describeSplitDescriptor(arg, width, descriptors, old.getOperation(),
-                                 &plannedSplitValues))
+                                 &island))
+      return false;
+    // 把半宽记在规划阶段：此后生成任何 IR 都可以直接按半宽建类型，不必等
+    // 重写期的 splitValues。同一个值出现在两个岛里时半宽必须一致。
+    const int64_t halfWidth = width / 2;
+    for (Value value : island) {
+      auto [it, inserted] = plannedHalfWidths.try_emplace(value, halfWidth);
+      if (!inserted && it->second != halfWidth)
+        return false;
+      plannedSplitValues.insert(value);
+    }
+    // 进位初值在循环之外，不在岛内，但它同样要按规划的半宽生成两个初值。
+    Value init = old.getInitArgs()[index];
+    auto initType = dyn_cast<RankedTensorType>(init.getType());
+    if (!initType || initType.getShape().back() != 2 * halfWidth)
+      return false;
+    auto [initIt, initInserted] =
+        plannedHalfWidths.try_emplace(init, halfWidth);
+    if (!initInserted && initIt->second != halfWidth)
       return false;
     for (Value descriptor : descriptors)
       splitDescriptors.try_emplace(descriptor, SplitDescriptor{});
@@ -1656,28 +1735,70 @@ static bool collapseAcrossLastDim(Value value, RankedTensorType target) {
   return true;
 }
 
-// 拆进位初值：splat 常量直接生成半宽常量，其余形态退回 reshape + split。
-// Splits an initial value: a splat constant yields a half-width constant directly
-// and anything else falls back to reshape + split.
-bool RowLiftBuilder::splitInitialValue(Value value, SplitValue &halves) {
-  auto tensor = dyn_cast<RankedTensorType>(value.getType());
-  if (!tensor || tensor.getRank() < 2)
+// 取一个已规划拆半值的两个半宽提升值。半宽来自规划阶段登记的 plannedHalfWidths，
+// 因此类型不必依赖重写期的 splitValues；已经登记过两半的值直接复用。
+// Return the two half-width lifted values of a value planned for halving: the
+// half width comes from `plannedHalfWidths`, filled before any IR was generated,
+// and an already registered pair is reused as-is.
+bool RowLiftBuilder::ensureRowHalves(Value value, SplitValue &halves) {
+  if (auto it = splitValues.find(value); it != splitValues.end()) {
+    halves = it->second;
+    return true;
+  }
+  auto plan = plannedHalfWidths.find(value);
+  if (plan == plannedHalfWidths.end())
     return false;
-  auto lifted = getLiftedType(value.getType());
-  int64_t width = lifted.getShape().back();
-  if (width < 2 || width % 2 != 0)
+  auto original = dyn_cast<RankedTensorType>(value.getType());
+  if (!original || original.getRank() < 2)
     return false;
-  SmallVector<int64_t> halfShape(lifted.getShape());
-  halfShape.back() /= 2;
-  auto halfType = RankedTensorType::get(halfShape, lifted.getElementType());
+  // 规划的半宽必须正好是原末维的一半。
+  const int64_t halfWidth = plan->second;
+  if (original.getShape().back() != 2 * halfWidth)
+    return false;
 
-  // 取值在各列相同的初值可以结构折叠成同一个半宽值。
+  // 半宽提升类型：行维 + 原形状，末维换成半宽。
+  SmallVector<int64_t> halfShape{static_cast<int64_t>(
+      candidate.rowsPerProgram)};
+  halfShape.append(original.getShape().begin(), original.getShape().end() - 1);
+  halfShape.push_back(halfWidth);
+  auto halfType = RankedTensorType::get(halfShape, original.getElementType());
+
+  // 取值在各列相同的初值可以结构折叠成同一个半宽值，不产生全宽中间值。
   if (Value half = rebuildHalfOperand(value, halfType)) {
     halves = {half, half};
     return true;
   }
-  // 其余形态没有半宽来源，只能先补行维再 reshape + split。
-  return splitLastDimension(ensureRowDimension(value), halves);
+
+  // 其余形态没有结构化的半宽来源：取已重建的整宽值沿末维拆半，再按需补行维。
+  // 尚未重建的值没有可拆的来源，直接放弃。
+  if (!valueMapping.contains(value))
+    return false;
+  Value full = valueMapping.lookup(value);
+  auto fullType = dyn_cast<RankedTensorType>(full.getType());
+  if (!fullType || fullType.getShape().back() != original.getShape().back())
+    return false;
+  SplitValue raw;
+  if (!splitLastDimension(full, raw))
+    return false;
+  auto rawType = dyn_cast<RankedTensorType>(raw.first.getType());
+  if (!rawType)
+    return false;
+  // 已重建值本身就是提升形态时，拆半结果已经是目标半宽类型。
+  if (raw.first.getType() == halfType) {
+    halves = raw;
+    return true;
+  }
+  // 未提升的整宽值拆半后秩少一维，两半各自在最前面补行维。
+  if (rawType.getRank() + 1 != halfType.getRank())
+    return false;
+  auto lift = [&](Value half) {
+    Value expanded =
+        rewriter.create<triton::ExpandDimsOp>(half.getLoc(), half, 0);
+    return Value(
+        rewriter.create<triton::BroadcastOp>(half.getLoc(), halfType, expanded));
+  };
+  halves = {lift(raw.first), lift(raw.second)};
+  return true;
 }
 
 // 把一个整宽操作数按半宽重建。只有「各列取值相同」的形态（splat 常量、标量
@@ -2149,6 +2270,519 @@ bool canExpandTensorPointer(triton::MakeTensorPtrOp makePtr, bool enabled) {
          llvm::all_of(makePtr.getStrides(), isInteger);
 }
 
+// 证明 `value` 关于行号（原始 pid 结果）是仿射的，返回每行前进的元素数。
+//
+// 只接受「行号乘常量、再与行无关项做加减」这一种仿射形态；任何非线性组合
+// （两项都含行号相乘、除模、动态选择等）都返回 nullopt，调用方据此保留原来的
+// 指针张量路径。行无关叶子必须已经有重建值，否则返回 nullopt，保证后续
+// materializeRowZeroPart 一定能成功，不会留下半成品 IR。
+// Prove that `value` is affine in the row index (the original pid result) and
+// return the per-row element stride.  Only "row index times a constant, added to
+// row-invariant terms" is accepted; any non-linear combination returns nullopt so
+// the caller keeps the pointer-tensor path.  A row-invariant leaf must already
+// have a rebuilt value, otherwise the result is nullopt, which guarantees the
+// later materializeRowZeroPart cannot fail and leave partial IR behind.
+std::optional<int64_t> RowLiftBuilder::analyzeAffineInRow(Value value, Value pid) {
+  if (value == pid)
+    return 1;
+  if (isPidInvariant(value, pid))
+    return valueMapping.contains(value) ? std::optional<int64_t>(0)
+                                        : std::nullopt;
+
+  Operation *op = value.getDefiningOp();
+  if (!op || op->getNumRegions() != 0)
+    return std::nullopt;
+
+  if (auto add = dyn_cast<arith::AddIOp>(op)) {
+    auto lhs = analyzeAffineInRow(add.getLhs(), pid);
+    auto rhs = analyzeAffineInRow(add.getRhs(), pid);
+    if (!lhs || !rhs)
+      return std::nullopt;
+    int64_t sum = 0;
+    if (__builtin_add_overflow(*lhs, *rhs, &sum))
+      return std::nullopt;
+    return sum;
+  }
+  if (auto sub = dyn_cast<arith::SubIOp>(op)) {
+    auto lhs = analyzeAffineInRow(sub.getLhs(), pid);
+    auto rhs = analyzeAffineInRow(sub.getRhs(), pid);
+    if (!lhs || !rhs)
+      return std::nullopt;
+    int64_t diff = 0;
+    if (__builtin_sub_overflow(*lhs, *rhs, &diff))
+      return std::nullopt;
+    return diff;
+  }
+  // 乘法只有「常量 × 仿射项」可分解，常量取自另一侧。
+  if (auto mul = dyn_cast<arith::MulIOp>(op)) {
+    if (auto constant = getConstantIntValue(mul.getRhs())) {
+      auto lhs = analyzeAffineInRow(mul.getLhs(), pid);
+      int64_t product = 0;
+      if (lhs && !__builtin_mul_overflow(*lhs, *constant, &product))
+        return product;
+    }
+    if (auto constant = getConstantIntValue(mul.getLhs())) {
+      auto rhs = analyzeAffineInRow(mul.getRhs(), pid);
+      int64_t product = 0;
+      if (rhs && !__builtin_mul_overflow(*rhs, *constant, &product))
+        return product;
+    }
+    return std::nullopt;
+  }
+  // 位宽扩展保持系数不变；截断会丢位，可能改变行步长，直接拒绝。
+  if (isa<arith::ExtSIOp, arith::ExtUIOp>(op))
+    return analyzeAffineInRow(op->getOperand(0), pid);
+  return std::nullopt;
+}
+
+// 把同一个偏移表达式在「行号取 0」处求值，得到描述符的标量基址偏移。
+// 与 analyzeAffineInRow 接受的结构完全一致，因此调用前必须已证明可分解。
+// Evaluate the same offset expression at row index zero, which yields the
+// descriptor's scalar base offset.  It accepts exactly the structure
+// analyzeAffineInRow proved decomposable, so the caller must have proved it first.
+Value RowLiftBuilder::materializeRowZeroPart(Value value, Value pid) {
+  if (isPidInvariant(value, pid))
+    return getMappedValue(value);
+  if (value == pid) {
+    auto integer = dyn_cast<IntegerType>(value.getType());
+    if (!integer)
+      return Value();
+    return rewriter.create<arith::ConstantOp>(
+        value.getLoc(), rewriter.getIntegerAttr(integer, 0));
+  }
+
+  Operation *op = value.getDefiningOp();
+  if (!op)
+    return Value();
+  auto shift = [&](Value v) -> Value {
+    return materializeRowZeroPart(v, pid);
+  };
+  if (auto add = dyn_cast<arith::AddIOp>(op)) {
+    Value lhs = shift(add.getLhs());
+    Value rhs = shift(add.getRhs());
+    if (!lhs || !rhs)
+      return Value();
+    return rewriter.create<arith::AddIOp>(add.getLoc(), lhs, rhs);
+  }
+  if (auto sub = dyn_cast<arith::SubIOp>(op)) {
+    Value lhs = shift(sub.getLhs());
+    Value rhs = shift(sub.getRhs());
+    if (!lhs || !rhs)
+      return Value();
+    return rewriter.create<arith::SubIOp>(sub.getLoc(), lhs, rhs);
+  }
+  if (auto mul = dyn_cast<arith::MulIOp>(op)) {
+    if (getConstantIntValue(mul.getRhs())) {
+      Value lhs = shift(mul.getLhs());
+      if (!lhs)
+        return Value();
+      auto constant = rewriter.create<arith::ConstantOp>(
+          mul.getLoc(), rewriter.getIntegerAttr(
+                            cast<IntegerType>(mul.getRhs().getType()),
+                            *getConstantIntValue(mul.getRhs())));
+      return rewriter.create<arith::MulIOp>(mul.getLoc(), lhs, constant);
+    }
+    if (getConstantIntValue(mul.getLhs())) {
+      Value rhs = shift(mul.getRhs());
+      if (!rhs)
+        return Value();
+      auto constant = rewriter.create<arith::ConstantOp>(
+          mul.getLoc(), rewriter.getIntegerAttr(
+                            cast<IntegerType>(mul.getLhs().getType()),
+                            *getConstantIntValue(mul.getLhs())));
+      return rewriter.create<arith::MulIOp>(mul.getLoc(), constant, rhs);
+    }
+    return Value();
+  }
+  if (auto ext = dyn_cast<arith::ExtSIOp>(op)) {
+    Value inner = shift(ext.getIn());
+    return inner ? Value(rewriter.create<arith::ExtSIOp>(ext.getLoc(),
+                                                         ext.getType(), inner))
+                 : Value();
+  }
+  if (auto ext = dyn_cast<arith::ExtUIOp>(op)) {
+    Value inner = shift(ext.getIn());
+    return inner ? Value(rewriter.create<arith::ExtUIOp>(ext.getLoc(),
+                                                         ext.getType(), inner))
+                 : Value();
+  }
+  return Value();
+}
+
+// 把查询行相关的块指针重建成「行维在最外层」的块描述符。
+//
+// 原描述符覆盖单个查询行：base = q + off(row)，off 关于行号仿射（每行前进
+// stride 个元素）。提升后一个 program 处理 [rowStart, rowStart+R) 这些行，
+// 因此新描述符是一个秩 +1 的描述符：
+//   base   = q + off(0)          （行号取 0 的标量基址）
+//   shape  = [extent, 原 shape]  （最外轴是总行数，供 boundary check 夹住尾组）
+//   strides= [stride, 原 stride]
+//   offsets= [rowStart, 原 offset]
+//   block  = [R, 原 block]
+// 行有效位因此完全由 boundary check 的零填充承担：尾组里超出 extent 的行落到
+// 形状之外，读回来是 padding 值 0，与原来「逐行掩码 + other=0」的语义一致。
+// 当行步长恰好等于原最外轴的整行跨度、且该轴从 0 开始并被 tile 覆盖时，行维
+// 会与该轴合并成一条轴（见下方 flattenedOuterExtent），得到与手写 kernel 一致
+// 的二维布局。
+// Rebuild a query-row-dependent block pointer with the row dimension as its
+// outermost axis.  The original descriptor covers one query row with
+// `base = q + off(row)`, where `off` is affine in the row index (stride elements
+// per row).  A lifted program owns rows [rowStart, rowStart+R), so the new
+// descriptor has one extra outermost axis as shown above.  Row validity is then
+// carried entirely by the boundary check's zero padding: a row beyond `extent`
+// falls outside the shape and reads back as the padding value 0, matching the
+// previous "per-row mask with other=0" semantics.  When the row stride equals the
+// outer axis' whole span and that axis starts at 0 with the tile covering it,
+// the row dimension merges into that axis (see `flattenedOuterExtent` below),
+// producing the same two-dimensional layout as the hand-written kernel.
+bool RowLiftBuilder::buildRowDescriptor(triton::MakeTensorPtrOp makePtr,
+                                        RowDescriptor &descriptor) {
+  if (!features.rowDescriptor || !candidate.runtimeGrid || !liftedRowStart ||
+      !liftedRowExtent)
+    return false;
+  auto anchor = dyn_cast<triton::GetProgramIdOp>(candidate.anchor);
+  if (!anchor)
+    return false;
+  Value pid = anchor.getResult();
+
+  auto pointerType = dyn_cast<triton::PointerType>(makePtr.getType());
+  if (!pointerType)
+    return false;
+  auto blockType = dyn_cast<RankedTensorType>(pointerType.getPointeeType());
+  // 行维占最外轴，所以原 tile 最多两维（总秩不超过 3）：后端只在秩 ≤ 3 时
+  // 把「描述符 + 边界检查」降成一次 DMA。
+  // The row axis is outermost, so the original tile may have at most two
+  // dimensions (total rank <= 3): the backend lowers descriptor + boundary check
+  // into a single DMA only up to rank three.
+  if (!blockType || blockType.getRank() < 1 || blockType.getRank() > 2)
+    return false;
+  if (llvm::any_of(blockType.getShape(),
+                   [](int64_t extent) { return extent <= 0; }))
+    return false;
+
+  // 基址必须是标量 addptr，且行号只出现在它的偏移里，这样才存在一个可用的
+  // 标量基址。
+  // The base must be a scalar addptr whose offset is the only place the row index
+  // appears; that is what makes a scalar descriptor base available.
+  auto base = makePtr.getBase().getDefiningOp<triton::AddPtrOp>();
+  if (!base || isa<RankedTensorType>(base.getPtr().getType()))
+    return false;
+  if (!isPidInvariant(base.getPtr(), pid) ||
+      !valueMapping.contains(base.getPtr()))
+    return false;
+  std::optional<int64_t> rowStride = analyzeAffineInRow(base.getOffset(), pid);
+  if (!rowStride || *rowStride <= 0)
+    return false;
+
+  // 描述符的形状、步长、偏移必须都与行无关：行号被表达成最外轴的偏移，
+  // 其余索引只描述单个 tile。
+  // The descriptor shape, strides and offsets must all be row-invariant: the row
+  // index is expressed as the outermost offset and the other indices describe one
+  // tile only.
+  for (auto operands : {makePtr.getShape(), makePtr.getStrides(),
+                        makePtr.getOffsets()}) {
+    for (Value v : operands)
+      if (!isPidInvariant(v, pid) || !valueMapping.contains(v))
+        return false;
+  }
+
+  // 只有「无 mask、无 other、零填充」的 load 才能由边界检查承担行有效位；
+  // 无 mask 的 store 由边界检查把写入范围夹到有效行内。其他使用者或其它
+  // 语义一律退回指针张量路径。
+  // Only a load without mask/other and with zero padding can delegate row
+  // validity to the boundary check; a mask-free store gets its written region
+  // clamped to valid rows by the same boundary check.  Any other user or
+  // semantics falls back to the pointer-tensor path.
+  if (makePtr.getResult().use_empty())
+    return false;
+  for (Operation *user : makePtr.getResult().getUsers()) {
+    if (auto load = dyn_cast<triton::LoadOp>(user)) {
+      if (load.getMask() || load.getOther())
+        return false;
+      if (load.getPadding() != triton::PaddingOption::PAD_ZERO)
+        return false;
+      auto loaded = dyn_cast<RankedTensorType>(load.getType());
+      if (!loaded || loaded.getShape() != blockType.getShape())
+        return false;
+      continue;
+    }
+    if (auto store = dyn_cast<triton::StoreOp>(user)) {
+      if (store.getMask())
+        return false;
+      auto stored = dyn_cast<RankedTensorType>(store.getValue().getType());
+      if (!stored || stored.getShape() != blockType.getShape())
+        return false;
+      continue;
+    }
+    return false;
+  }
+
+  // 行步长恰好等于原最外轴的整行跨度（shape[0] × stride[0]）时，行轴可以与该轴
+  // 合并成一条轴：行 r、内层下标 i 的合并坐标就是 r × shape[0] + i。前提是该轴
+  // 的偏移为 0、且 tile 覆盖整个轴，这样有效行的下标一定落在
+  // [0, extent × shape[0]) 内，合并轴上的边界检查只会裁掉越界行，不会误裁有效
+  // 元素。拍平后与手写 kernel 的 [R·G, K] 布局一致，也不再产生 [R, G, K] 的三维
+  // 视图。
+  // When the row stride equals the outer axis' whole span (shape[0] × stride[0])
+  // the row axis can merge into it: row r at inner index i has merged coordinate
+  // r × shape[0] + i.  The axis must start at offset 0 and the tile must cover it
+  // whole, so the indices of a valid row stay inside [0, extent × shape[0]) and
+  // the merged boundary check only trims out-of-range rows instead of valid
+  // elements.  Flattening matches the hand-written kernel's [R·G, K] layout and
+  // stops producing [R, G, K] three-dimensional views.
+  std::optional<int64_t> flattenedOuterExtent;
+  if (blockType.getRank() == 2) {
+    std::optional<int64_t> outerExtent =
+        getConstantIntValue(makePtr.getShape()[0]);
+    std::optional<int64_t> outerStride =
+        getConstantIntValue(makePtr.getStrides()[0]);
+    std::optional<int64_t> outerOffset =
+        getConstantIntValue(makePtr.getOffsets()[0]);
+    if (outerExtent && outerStride && outerOffset && *outerOffset == 0 &&
+        *outerStride > 0 && blockType.getShape()[0] == *outerExtent &&
+        *rowStride == *outerExtent * *outerStride &&
+        candidate.rowsPerProgram * blockType.getShape()[0] <= INT32_MAX)
+      flattenedOuterExtent = *outerExtent;
+  }
+
+  // 所有判据都成立，从这里开始生成 IR。
+  // Every predicate holds; IR is emitted from here on.
+  Location loc = makePtr.getLoc();
+  auto i64Type = rewriter.getI64Type();
+  auto i32Type = rewriter.getI32Type();
+  auto asI64 = [&](Value v) -> Value {
+    if (v.getType().isInteger(64))
+      return v;
+    return isa<IntegerType>(v.getType())
+               ? Value(rewriter.create<arith::ExtSIOp>(loc, i64Type, v))
+               : Value();
+  };
+  auto asI32 = [&](Value v) -> Value {
+    if (v.getType().isInteger(32))
+      return v;
+    return isa<IntegerType>(v.getType())
+               ? Value(rewriter.create<arith::TruncIOp>(loc, i32Type, v))
+               : Value();
+  };
+
+  Value baseOffset = materializeRowZeroPart(base.getOffset(), pid);
+  if (!baseOffset)
+    return false;
+  Value rowStart = asI32(liftedRowStart);
+  if (!rowStart)
+    return false;
+  Value scalarBase = rewriter.create<triton::AddPtrOp>(
+      loc, base.getPtr().getType(), getMappedValue(base.getPtr()),
+      baseOffset);
+
+  // 最外轴：形状是运行期总行数，步长是每行前进的元素数。
+  // Outermost axis: the shape is the runtime row count and the stride is the
+  // number of elements one row advances.
+  Value rowShape =
+      rewriter.create<arith::ExtSIOp>(loc, i64Type, liftedRowExtent);
+  Value rowStep = rewriter.create<arith::ConstantOp>(
+      loc, rewriter.getI64IntegerAttr(*rowStride));
+  SmallVector<Value> shapes;
+  SmallVector<Value> strides;
+  SmallVector<Value> offsets;
+  int64_t firstAxis = 0;
+  if (flattenedOuterExtent) {
+    // 合并轴：上界是 extent × 原最外轴，步长是原最外轴的步长，偏移是行号 ×
+    // 原最外轴（原偏移已证明为 0）。行号按 i32 计算，与描述符的双索引口径一致。
+    // Merged axis: the bound is extent × outer extent, the stride is the outer
+    // axis' stride and the offset is the row index × outer extent (the original
+    // offset is proven zero).  The row arithmetic stays in i32 to match the
+    // descriptor's index width.
+    Value mergedShape = rewriter.create<arith::MulIOp>(
+        loc, rowShape,
+        rewriter.create<arith::ConstantOp>(
+            loc, rewriter.getI64IntegerAttr(*flattenedOuterExtent)));
+    Value mergedStride = asI64(getMappedValue(makePtr.getStrides()[0]));
+    if (!mergedStride)
+      return false;
+    Value rowTimesOuter = rewriter.create<arith::MulIOp>(
+        loc, rowStart,
+        rewriter.create<arith::ConstantOp>(
+            loc, rewriter.getI32IntegerAttr(
+                     static_cast<int32_t>(*flattenedOuterExtent))));
+    shapes.push_back(mergedShape);
+    strides.push_back(mergedStride);
+    offsets.push_back(rowTimesOuter);
+    firstAxis = 1;
+  } else {
+    shapes.push_back(rowShape);
+    strides.push_back(rowStep);
+    offsets.push_back(rowStart);
+  }
+  for (int64_t dim = firstAxis; dim < blockType.getRank(); ++dim) {
+    Value shape = asI64(getMappedValue(makePtr.getShape()[dim]));
+    Value stride = asI64(getMappedValue(makePtr.getStrides()[dim]));
+    Value offset = asI32(getMappedValue(makePtr.getOffsets()[dim]));
+    if (!shape || !stride || !offset)
+      return false;
+    shapes.push_back(shape);
+    strides.push_back(stride);
+    offsets.push_back(offset);
+  }
+
+  SmallVector<int32_t> tileShape;
+  if (flattenedOuterExtent) {
+    tileShape.push_back(
+        static_cast<int32_t>(candidate.rowsPerProgram * blockType.getShape()[0]));
+    tileShape.push_back(static_cast<int32_t>(blockType.getShape()[1]));
+  } else {
+    tileShape.push_back(static_cast<int32_t>(candidate.rowsPerProgram));
+    for (int64_t extent : blockType.getShape())
+      tileShape.push_back(static_cast<int32_t>(extent));
+  }
+  SmallVector<int32_t> order;
+  for (int64_t axis = static_cast<int64_t>(tileShape.size()) - 1; axis >= 0;
+       --axis)
+    order.push_back(static_cast<int32_t>(axis));
+
+  // 该 builder 由 base 的元素类型和前插行维的 tile 形状推出结果类型。
+  // This builder infers the result type from the base's element type and the
+  // row-prepended tile shape.
+  descriptor.pointer =
+      rewriter
+          .create<triton::MakeTensorPtrOp>(loc, scalarBase, shapes, strides,
+                                           offsets, tileShape, order)
+          .getResult();
+  descriptor.tileShape.assign(tileShape.begin(), tileShape.end());
+  descriptor.flattenedOuterExtent = flattenedOuterExtent;
+  return true;
+}
+
+// 用保留的块描述符重建 load：行有效位由最外轴的边界检查承担，因此不再生成
+// 逐行掩码，也不会再把描述符展开成 i64 地址张量。
+// Rebuild a load on the retained block descriptor.  Row validity comes from the
+// outermost axis' boundary check, so no per-row mask is generated and the
+// descriptor is no longer expanded into an i64 address tensor.
+bool RowLiftBuilder::rewriteRowDescriptorLoad(
+    triton::LoadOp load, const RowDescriptor &descriptor) {
+  if (load.getMask() || load.getOther())
+    return false;
+  if (load.getPadding() != triton::PaddingOption::PAD_ZERO)
+    return false;
+  auto pointerType = dyn_cast<triton::PointerType>(descriptor.pointer.getType());
+  auto resultType = pointerType
+                        ? dyn_cast<RankedTensorType>(pointerType.getPointeeType())
+                        : RankedTensorType();
+  if (!resultType ||
+      resultType.getRank() !=
+          static_cast<int64_t>(descriptor.tileShape.size()))
+    return false;
+
+  // 行维（0 号轴）承担行有效位，原 tile 的边界轴整体后移一位。拍平后行维与
+  // 原最外轴合成同一条轴：那条轴的裁剪不再需要（tile 覆盖整轴且偏移为 0），
+  // 其余轴号保持不变。
+  // Axis zero carries row validity and the original boundary axes shift by one.
+  // After flattening the row axis shares its axis with the original outer axis,
+  // whose clipping is no longer needed (the tile covers it whole at offset 0),
+  // and the remaining axes keep their numbers.
+  SmallVector<int32_t> boundary{0};
+  for (int32_t axis : load.getBoundaryCheck()) {
+    if (axis < 0)
+      return false;
+    if (descriptor.flattenedOuterExtent) {
+      if (axis == 0)
+        continue;
+      if (axis >= static_cast<int32_t>(descriptor.tileShape.size()))
+        return false;
+      boundary.push_back(axis);
+      continue;
+    }
+    if (axis + 1 >= static_cast<int32_t>(descriptor.tileShape.size()))
+      return false;
+    boundary.push_back(axis + 1);
+  }
+
+  auto result = rewriter.create<triton::LoadOp>(
+      load.getLoc(), descriptor.pointer, boundary, load.getPadding(),
+      load.getCache(), load.getEvict(), load.getIsVolatile());
+  // 拍平后描述符的 tile 是 [R·原最外轴, 其余]，而下游按 [R, 原最外轴, 其余]
+  // 重建，因此补一次保持元素顺序的 reshape。
+  // The flattened descriptor tile is [R·outer, rest] while downstream values are
+  // rebuilt as [R, outer, rest], so one element-order-preserving reshape is
+  // inserted.
+  Value loaded = result.getResult();
+  if (descriptor.flattenedOuterExtent)
+    loaded = reshape(loaded, getLiftedType(load.getType()).getShape());
+  valueMapping.map(load.getResult(), loaded);
+  return true;
+}
+
+// 用保留的块描述符重建 store：最外轴的边界检查会把写入范围夹到
+// [rowStart, rowStart+R) ∩ [0, extent) 内，越界行既不参与写回也不会越界写，
+// 与原「逐行掩码写回」语义一致。store 没有 padding 概念，边界检查在后端只
+// 收缩被写的子视图（getBoundarySizes + subview），因此不需要额外 where。
+// Rebuild a store on the retained descriptor.  The outermost axis' boundary
+// check clamps the written region to [rowStart, rowStart+R) ∩ [0, extent), so
+// out-of-range rows are neither written nor written out of bounds, matching the
+// previous per-row masked write-back.  A store has no padding concept: the
+// backend only shrinks the destination subview (getBoundarySizes + subview), so
+// no extra tt.where is needed.
+bool RowLiftBuilder::rewriteRowDescriptorStore(
+    triton::StoreOp store, const RowDescriptor &descriptor) {
+  if (store.getMask())
+    return false;
+  auto pointerType = dyn_cast<triton::PointerType>(descriptor.pointer.getType());
+  auto blockType = pointerType
+                       ? dyn_cast<RankedTensorType>(pointerType.getPointeeType())
+                       : RankedTensorType();
+  if (!blockType ||
+      blockType.getRank() !=
+          static_cast<int64_t>(descriptor.tileShape.size()))
+    return false;
+
+  // 写入值必须与描述符 tile 同形。拍平后 tile 是 [R·原最外轴, 其余]，因此把
+  // 已补行维的 [R, 原最外轴, 其余] 按元素顺序折平。
+  // The stored value must match the descriptor tile.  A flattened tile is
+  // [R·outer, rest], so the row-lifted [R, outer, rest] value is folded in
+  // element order.
+  Value value = ensureRowDimension(store.getValue());
+  auto valueType = dyn_cast<RankedTensorType>(value.getType());
+  if (!valueType)
+    return false;
+  if (descriptor.flattenedOuterExtent) {
+    if (valueType.getRank() == 3 &&
+        valueType.getShape()[0] * valueType.getShape()[1] ==
+            descriptor.tileShape[0] &&
+        valueType.getShape()[2] == descriptor.tileShape[1])
+      value = reshape(value, {descriptor.tileShape[0], descriptor.tileShape[1]});
+  }
+  if (cast<RankedTensorType>(value.getType()).getShape() !=
+      blockType.getShape())
+    return false;
+
+  // 行维（0 号轴）承担行有效位，原 tile 的边界轴整体后移一位；拍平后行维与
+  // 原最外轴共用同一条轴，那条轴的裁剪不再需要，其余轴号保持不变。
+  // Axis zero carries row validity and the original boundary axes shift by one;
+  // after flattening the row axis shares the original outer axis, whose clipping
+  // is unnecessary, and the remaining axes keep their numbers.
+  SmallVector<int32_t> boundary{0};
+  for (int32_t axis : store.getBoundaryCheck()) {
+    if (axis < 0)
+      return false;
+    if (descriptor.flattenedOuterExtent) {
+      if (axis == 0)
+        continue;
+      if (axis >= static_cast<int32_t>(descriptor.tileShape.size()))
+        return false;
+      boundary.push_back(axis);
+      continue;
+    }
+    if (axis + 1 >= static_cast<int32_t>(descriptor.tileShape.size()))
+      return false;
+    boundary.push_back(axis + 1);
+  }
+
+  rewriter.create<triton::StoreOp>(store.getLoc(), descriptor.pointer, value,
+                                   Value(), boundary, store.getCache(),
+                                   store.getEvict());
+  return true;
+}
+
 // 把块指针描述符展开成显式 [R]+tile 指针张量，并记录形状与偏移供掩码使用。
 //
 // 展开过程就是按原语义显式计算每个 tile 元素的地址：
@@ -2164,6 +2798,19 @@ bool RowLiftBuilder::rewriteTensorPointer(triton::MakeTensorPtrOp makePtr) {
   auto split = splitDescriptors.find(makePtr.getResult());
   if (split != splitDescriptors.end())
     return rewriteSplitTensorPointer(makePtr, split->second);
+
+  // 先尝试把描述符原样保留成「行维在最外层」的块描述符：这样访存是一次
+  // DMA，不产生 i64 地址向量。证不出行号仿射关系时再退回指针张量展开。
+  // Try to keep the descriptor as a block descriptor whose outermost axis is the
+  // row dimension: the access then becomes a single DMA with no i64 address
+  // vector.  When the row index is not provably affine, fall back to the
+  // pointer-tensor expansion.
+  RowDescriptor rowDescriptor;
+  if (buildRowDescriptor(makePtr, rowDescriptor)) {
+    rowDescriptors[makePtr.getResult()] = rowDescriptor;
+    valueMapping.map(makePtr.getResult(), rowDescriptor.pointer);
+    return true;
+  }
 
   auto pointerType = cast<triton::PointerType>(makePtr.getType());
   auto blockType = dyn_cast<RankedTensorType>(pointerType.getPointeeType());
@@ -2476,13 +3123,22 @@ bool RowLiftBuilder::emitDescriptorLoad(triton::LoadOp load,
   Value other;
   if (mask) {
     if (load.getOther()) {
-      Value lifted = ensureRowDimension(load.getOther());
-      if (lifted.getType() == resultType)
-        other = lifted;
-      else if (getLiftedType(load.getOther().getType()) == resultType)
-        other = broadcastRowValue(lifted, resultType);
-      else
+      // 先按类型判断再生成 IR：拆半路径的结果比提升后的整宽值窄，此时直接按
+      // 半宽折叠，不能先无条件提升出一个全宽临时值。
+      // Decide from the types before emitting anything: on the split path the
+      // result is narrower than the lifted full width, so fold straight to half
+      // width instead of materialising a full-width temporary first.
+      if (getLiftedType(load.getOther().getType()) == resultType) {
+        other = broadcastRowValue(ensureRowDimension(load.getOther()),
+                                  resultType);
+      } else {
         other = rebuildHalfOperand(load.getOther(), resultType);
+        if (!other) {
+          Value lifted = ensureRowDimension(load.getOther());
+          if (lifted.getType() == resultType)
+            other = lifted;
+        }
+      }
       if (!other)
         return false;
     } else {
