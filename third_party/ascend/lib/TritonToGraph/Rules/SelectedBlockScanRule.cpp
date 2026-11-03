@@ -2681,6 +2681,37 @@ static void buildAdditiveBody(IRRewriter &rewriter, Location loc, Type f32,
 // The plan: a privately prepared and verified sandbox plus a commit-only
 // apply().
 
+// ---- On-chip budget gate ----
+//
+// 改写会放大循环体（整表向量读、K/V 每轮无条件载入、扫描 mask），所以量改写后的
+// 沙箱：UB 用 getSafeUBBudget + estimatePeakLiveBytes（规则 B 的口径），L0 用
+// #2841 的 exceedsCubeBudgets；容量为 0 时查询自己关闭。超预算就在线上函数上
+// 报一条 warning 并返回 true，调用方拒绝改写（apply() 仍不可失败）。
+// The rewrite grows the loop body, so the rewritten sandbox is measured with
+// rule B's UB budget and #2841's cube query; zero capacities disable a query.
+// Over budget: warn on the live function and return true.
+static bool budgetOverflow(triton::FuncOp sandboxFunction,
+                           const ResourceSnapshot &resources,
+                           llvm::StringRef form, triton::FuncOp liveFunction) {
+  if (std::optional<uint64_t> safeUB = resources.getSafeUBBudget()) {
+    LiveByteEstimate estimate = estimatePeakLiveBytes(sandboxFunction);
+    if (estimate.known && estimate.peakLiveBytes > *safeUB) {
+      liveFunction.emitWarning()
+          << "selected-block-scan: " << form << " needs "
+          << estimate.peakLiveBytes << " bytes of UB, budget " << *safeUB
+          << "; declining";
+      return true;
+    }
+  }
+  if (exceedsCubeBudgets(sandboxFunction, resources)) {
+    liveFunction.emitWarning()
+        << "selected-block-scan: " << form
+        << " exceeds the L0A/L0B/L0C cube budgets; declining";
+    return true;
+  }
+  return false;
+}
+
 // Tidy the private sandbox before the joint consult, so Rule B judges exactly
 // the body apply() commits. `make_ttir` in backend/compiler.py places
 // add_graph_optimize last, with no canonicalize/CSE after it, so without this
@@ -2800,22 +2831,36 @@ public:
     if (!sandboxCandidate || !sameScanCandidate(*sandboxCandidate, candidate))
       return nullptr;
 
-    IRRewriter rewriter(module.getContext());
-    ScopedDiagnosticHandler diagnostics(
-        module.getContext(), [](Diagnostic &diag) {
-          LLVM_DEBUG(llvm::dbgs() << "selected-block-scan: skipped candidate: "
-                                  << diag << "\n");
-          return success();
-        });
-    if (!buildSelectedBlockScan(rewriter, *sandboxCandidate))
-      return nullptr;
-    // Tidy and verify the private sandbox here so neither a malformed nor an
-    // untidied body reaches the scheduler. The cleanup runs before the joint
-    // consult. `cloned` stays valid: canonicalize/CSE/LICM rewrite operations
-    // inside the function but never erase the tt.func op itself.
-    if (failed(runSandboxStructuralCleanup(*sandbox)))
-      return nullptr;
-    if (failed(verify(*sandbox)))
+    // 沙箱诊断只在这一段被吞掉；预算门要在线上函数上发警告，所以它在作用域外。
+    // Sandbox diagnostics are swallowed only in this scope: the budget gate
+    // warning must reach the user, so it runs after the scope.  Rule B installs
+    // its own handler, so its rewrite stays quiet as before.
+    {
+      IRRewriter rewriter(module.getContext());
+      ScopedDiagnosticHandler diagnostics(
+          module.getContext(), [](Diagnostic &diag) {
+            LLVM_DEBUG(llvm::dbgs()
+                       << "selected-block-scan: skipped candidate: " << diag
+                       << "\n");
+            return success();
+          });
+      if (!buildSelectedBlockScan(rewriter, *sandboxCandidate))
+        return nullptr;
+      // Tidy and verify the private sandbox here so neither a malformed nor an
+      // untidied body reaches the scheduler. The cleanup runs before the joint
+      // consult. `cloned` stays valid: canonicalize/CSE/LICM rewrite operations
+      // inside the function but never erase the tt.func op itself.
+      if (failed(runSandboxStructuralCleanup(*sandbox)))
+        return nullptr;
+      if (failed(verify(*sandbox)))
+        return nullptr;
+    }
+
+    // 规则 A 自己的形态先过预算门，联合形态在最终沙箱上再过一次（规则 B 会放大
+    // tile 与活值集合）。
+    // Rule A's own form passes the gate first; the joint form (rule B widens
+    // the tiles and the live set) is measured again before the commit.
+    if (budgetOverflow(cloned, resources, "rule A's rewrite", function))
       return nullptr;
 
     // 联合决策：A 直接在沙箱里跑 B 的真实实现（QueryRowBatching.h 的
@@ -2849,6 +2894,9 @@ public:
                                 << function.getName() << "\n");
         return nullptr;
       }
+      if (budgetOverflow(cloned, resources, "the joint rule A + rule B rewrite",
+                         function))
+        return nullptr;
     } else {
       LLVM_DEBUG(llvm::dbgs() << "selected-block-scan: force-apply lands rule "
                                  "A without rule B for @"
