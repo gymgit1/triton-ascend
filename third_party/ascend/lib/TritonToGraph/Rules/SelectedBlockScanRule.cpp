@@ -42,6 +42,8 @@
 // signalPassFailure).
 
 #include "TritonToGraph/GraphOptimizationRule.h"
+#include "TritonToGraph/ProgramGridTransform.h"
+#include "TritonToGraph/QueryRowBatching.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -74,18 +76,15 @@ using namespace mlir;
 using namespace triton;
 using namespace cfg;
 
-// Joint Rule A + Rule B decision point:
-//   bool canQueryRowBatch(triton::FuncOp function);
-// Returns true when the query-row batching matcher (Rule B) accepts
-// `function`. It must stay pure (read-only, no diagnostics, no IR mutation)
-// because it is called on the rewritten sandbox.
-namespace mlir {
-namespace triton {
-namespace cfg {
-bool canQueryRowBatch(triton::FuncOp function);
-} // namespace cfg
-} // namespace triton
-} // namespace mlir
+// Joint Rule A + Rule B decision point: Rule A does not consult a read-only
+// matcher any more.  It hands its private sandbox to
+// `cfg::materializeQueryRowBatchingCandidate`, which rewrites Rule B's row
+// lifting in place and verifies the result.  Landing the sandbox therefore
+// means both rewrites are already in it; a failure means neither lands.
+//
+// This replaced the old `cfg::canQueryRowBatch` pure matcher: querying without
+// rewriting left a window where Rule A could commit and Rule B then fail, and
+// it could pick a different row factor than the rewrite would use.
 
 namespace {
 
@@ -105,7 +104,8 @@ static bool isZeroSplatConstant(Value v) {
     if (auto dense = dyn_cast<DenseFPElementsAttr>(def.getValue()))
       return dense.isSplat() && dense.getSplatValue<APFloat>().isZero();
     if (auto denseInt = dyn_cast<DenseIntElementsAttr>(def.getValue()))
-      return denseInt.isSplat() && denseInt.getSplatValue<APInt>().isZero();
+      return denseInt.isSplat() &&
+             denseInt.getSplatValue<APInt>().isZero();
   }
   return false;
 }
@@ -128,12 +128,14 @@ static bool isNegativeInfSplatConstant(Value v) {
       return dense.isSplat() && dense.getSplatValue<APFloat>().isInfinity() &&
              dense.getSplatValue<APFloat>().isNegative();
     if (auto scalar = dyn_cast<FloatAttr>(def.getValue()))
-      return scalar.getValue().isInfinity() && scalar.getValue().isNegative();
+      return scalar.getValue().isInfinity() &&
+             scalar.getValue().isNegative();
   }
   if (auto splat = v.getDefiningOp<triton::SplatOp>()) {
     if (auto def = splat.getSrc().getDefiningOp<arith::ConstantOp>())
       if (auto scalar = dyn_cast<FloatAttr>(def.getValue()))
-        return scalar.getValue().isInfinity() && scalar.getValue().isNegative();
+        return scalar.getValue().isInfinity() &&
+               scalar.getValue().isNegative();
   }
   return false;
 }
@@ -159,8 +161,8 @@ static bool dependsOnImpl(Value v, Value pivot, llvm::DenseSet<Value> &visited,
     return false;
   Operation *op = v.getDefiningOp();
   return op && llvm::any_of(op->getOperands(), [&](Value a) {
-           return dependsOnImpl(a, pivot, visited, depth + 1);
-         });
+    return dependsOnImpl(a, pivot, visited, depth + 1);
+  });
 }
 
 static bool dependsOn(Value v, Value pivot) {
@@ -190,18 +192,6 @@ static bool dependsOnExcludingImpl(Value v, Value pivot, Operation *cut,
 static bool dependsOnExcluding(Value v, Value pivot, Operation *cut) {
   llvm::DenseSet<Value> visited;
   return dependsOnExcludingImpl(v, pivot, cut, visited, 0);
-}
-
-// The query position: axis-0 program id, tolerant of integer width casts.
-// A load-derived value (the varlen dispatch) does not match.
-static bool isProgramIdAxis0(Value v) {
-  if (auto pid = v.getDefiningOp<triton::GetProgramIdOp>())
-    return pid.getAxisAsInt() == 0;
-  if (auto ext = v.getDefiningOp<arith::ExtSIOp>())
-    return isProgramIdAxis0(ext.getIn());
-  if (auto ext = v.getDefiningOp<arith::ExtUIOp>())
-    return isProgramIdAxis0(ext.getIn());
-  return false;
 }
 
 // A splat/expand_dims/broadcast chain down to the pivot.
@@ -335,117 +325,41 @@ static std::optional<int64_t> matchIdxTimesBS(Value offset, Value rawIndex) {
   return factor;
 }
 
-// The [G] vector a 2-D operand broadcasts from, or v itself. `splat` peels a
-// leading tt.splat too; the causal-mask matcher passes false because it matches
-// the splat on its own.
-static Value peelBroadcasts(Value v, bool splat = true) {
-  while (Operation *op = v.getDefiningOp()) {
-    bool peel = isa<triton::ExpandDimsOp, triton::BroadcastOp>(op) ||
-                (splat && isa<triton::SplatOp>(op));
-    if (!peel)
+// The causal query position. It is the axis-0 program id itself, or the
+// program id advanced by a loop-invariant offset: the decode path compares
+// block tokens against `pid + Q_OFFSET`, where Q_OFFSET = TK - TQ is a kernel
+// argument. Returns the SSA value every causal use must share, or a null value
+// when the operand is load-derived (the varlen dispatch) or computed inside the
+// loop (an iteration-dependent row position cannot be a single scan bound).
+static Value matchRowPosition(Value v, Value pid, scf::ForOp loop) {
+  Value stripped = stripIntegerCasts(v);
+  if (stripped == pid)
+    return pid;
+  auto add = stripped.getDefiningOp<arith::AddIOp>();
+  if (!add)
+    return Value();
+  Value lhs = stripIntegerCasts(add.getLhs());
+  Value rhs = stripIntegerCasts(add.getRhs());
+  Value offset;
+  if (lhs == pid)
+    offset = rhs;
+  else if (rhs == pid)
+    offset = lhs;
+  else
+    return Value();
+  if (!isDefinedOutsideLoop(offset, loop) || reachesLoad(offset))
+    return Value();
+  return stripped;
+}
+
+// The [G] vector a 2-D operand broadcasts from, or v itself.
+static Value peelBroadcasts(Value v) {
+  while (Operation *op = v.getDefiningOp())
+    if (isa<triton::SplatOp, triton::ExpandDimsOp, triton::BroadcastOp>(op))
+      v = op->getOperand(0);
+    else
       break;
-    v = op->getOperand(0);
-  }
   return v;
-}
-
-// ---- IR building shorthands ----
-
-static RankedTensorType tensorTy(ArrayRef<int64_t> shape, Type elem) {
-  return RankedTensorType::get(shape, elem);
-}
-
-// A dense splat constant: `value` is the element every lane gets.
-static Value splatConstant(IRRewriter &rewriter, Location loc,
-                           ArrayRef<int64_t> shape, Type elem,
-                           Attribute value) {
-  return rewriter.create<arith::ConstantOp>(
-      loc, DenseElementsAttr::get(tensorTy(shape, elem), value));
-}
-
-// Broadcast a rank-1 row into the rank-2 tile `resultTy`: expand_dims on
-// `axis` inserts the unit dimension, so axis 0 broadcasts a per-token row and
-// axis 1 a per-query-row column.
-static Value broadcastRow(IRRewriter &rewriter, Location loc, Value row,
-                          unsigned axis, RankedTensorType resultTy) {
-  ArrayRef<int64_t> shape = resultTy.getShape();
-  Type elem = cast<RankedTensorType>(row.getType()).getElementType();
-  SmallVector<int64_t, 2> expanded{axis == 0 ? 1 : shape[0],
-                                   axis == 0 ? shape[1] : 1};
-  Value withDim = rewriter.create<triton::ExpandDimsOp>(
-      loc, tensorTy(expanded, elem), row, axis);
-  return rewriter.create<triton::BroadcastOp>(loc, resultTy, withDim);
-}
-
-// Cast the dot's lhs to the width the baseline's lhs had, in the baseline's
-// direction: one rounding, in the same place.
-static Value castLikeDotLhs(IRRewriter &rewriter, Location loc, Value v,
-                            triton::DotOp dot, ArrayRef<int64_t> shape) {
-  Type elem = cast<RankedTensorType>(dot.getA().getType()).getElementType();
-  if (elem == cast<RankedTensorType>(v.getType()).getElementType())
-    return v;
-  Type type = tensorTy(shape, elem);
-  if (isa<arith::ExtFOp>(dot.getA().getDefiningOp()))
-    return rewriter.create<arith::ExtFOp>(loc, type, v);
-  return rewriter.create<arith::TruncFOp>(loc, type, v);
-}
-
-// Split a two-operand op into its operands when exactly one of them is
-// `pivot`: {pivot side, other side}. Comparison direction and operand order
-// are free in this IR, so every hand-written "lhs or rhs" test goes through
-// here instead.
-template <typename OpTy>
-static std::optional<std::pair<Value, Value>> splitAtPivot(Value v,
-                                                           Value pivot) {
-  auto op = v.getDefiningOp<OpTy>();
-  if (!op || op->getNumOperands() != 2)
-    return std::nullopt;
-  if (op->getOperand(0) == pivot && op->getOperand(1) != pivot)
-    return std::make_pair(op->getOperand(0), op->getOperand(1));
-  if (op->getOperand(1) == pivot && op->getOperand(0) != pivot)
-    return std::make_pair(op->getOperand(1), op->getOperand(0));
-  return std::nullopt;
-}
-
-// `pivot < other` or `other > pivot`: the two spellings of one comparison.
-static bool matchLessThan(Value cmpValue, Value pivot, Value &other) {
-  auto cmp = cmpValue.getDefiningOp<arith::CmpIOp>();
-  if (!cmp)
-    return false;
-  auto split = splitAtPivot<arith::CmpIOp>(cmpValue, pivot);
-  if (!split)
-    return false;
-  bool lhsIsPivot = cmp.getLhs() == pivot;
-  arith::CmpIPredicate pred = cmp.getPredicate();
-  if ((lhsIsPivot && pred == arith::CmpIPredicate::slt) ||
-      (!lhsIsPivot && pred == arith::CmpIPredicate::sgt)) {
-    other = split->second;
-    return true;
-  }
-  return false;
-}
-
-// splat(start) + make_range(0, BS): a tile's token start and its token extent,
-// as both the K/V address and the causal mask spell them. `rangeTy` is the
-// make_range result type, for callers that must pin the element width.
-static bool matchBlockTokenRange(Value splatSide, Value rangeSide,
-                                 Value &blockStart, int64_t &extent,
-                                 RankedTensorType *rangeTy = nullptr) {
-  auto splat = splatSide.getDefiningOp<triton::SplatOp>();
-  // The token range is spelled extsi(make_range{0, BS}) in the bwd form; the
-  // builder recomputes the token positions, so the cast chain is not carried.
-  auto range =
-      stripIntegerCasts(rangeSide).getDefiningOp<triton::MakeRangeOp>();
-  if (!splat || !range || range.getStart() != 0 || range.getEnd() <= 0)
-    return false;
-  auto type = dyn_cast<RankedTensorType>(range.getType());
-  if (!type || type.getRank() != 1)
-    return false;
-  blockStart = splat.getOperand();
-  extent = range.getEnd();
-  if (rangeTy)
-    *rangeTy = type;
-  return true;
 }
 
 // ---- Op predicates ----
@@ -485,15 +399,15 @@ static Operation *getReduceCombiner(triton::ReduceOp reduce) {
 // The token-range term is the only guard against reading past the row's token
 // count, so the bound is captured here and reproduced verbatim by the builder.
 struct AddPtrTile {
-  Value base;              // scalar pointer, loop-invariant and load-free
-  Value freeVec;           // [F] integer vector, loop-invariant
-  Value freeBoundRhs;      // [F,1] tensor the free-axis mask compares against
-  Value tokenBound;        // scalar bound of the "tokens < T" mask
-  Value blockStart;        // idx*BS: the value the causal mask also uses
-  Type tokenType;          // width of the token arithmetic (i32 or i64)
-  int64_t tokenStride = 0; // stride of one token along the address
-  int64_t freeExtent = 0;  // F, the tile's free-axis extent
-  int64_t blockSize = 0;   // BS, the tile's token extent
+  Value base;               // scalar pointer, loop-invariant and load-free
+  Value freeVec;            // [F] integer vector, loop-invariant
+  Value freeBoundRhs;       // [F,1] tensor the free-axis mask compares against
+  Value tokenBound;         // scalar bound of the "tokens < T" mask
+  Value blockStart;         // idx*BS: the value the causal mask also uses
+  Type tokenType;           // width of the token arithmetic (i32 or i64)
+  int64_t tokenStride = 0;  // stride of one token along the address
+  int64_t freeExtent = 0;   // F, the tile's free-axis extent
+  int64_t blockSize = 0;    // BS, the tile's token extent
 };
 
 struct AdditiveState {
@@ -516,10 +430,15 @@ struct ScanCandidate {
   // and the tensor mask.
   Value pid;
 
+  // The causal row position: `pid` itself, or `pid + offset` when the kernel
+  // compares against a decode offset (Q_OFFSET = TK - TQ in the production
+  // fwd kernel).  Every causal use of the row position reads this value.
+  Value rowPosition;
+
   // The index-table row base; loop-invariant, i64 pointee in production.
   Value tableBase;
-  int64_t tableLength = 0;   // S, from the i_h*S multiplier of the row base
-  int64_t blockSize = 0;     // BS, the idx multiplier
+  int64_t tableLength = 0;  // S, from the i_h*S multiplier of the row base
+  int64_t blockSize = 0;    // BS, the idx multiplier
   int64_t scanTileWidth = 0; // BN = max(64, BS)
   int64_t blocksPerTile = 0; // R = BN / BS
   Value scanBound;           // the old trip count == NS (constant or opaque)
@@ -549,25 +468,19 @@ struct ScanCandidate {
   // Which rewrite template this candidate gets. Everything outside the
   // template (prologue, weights, tiles, scan bound) is shared.
   bool additive = false;
-  unsigned accArg = 0; // additive: the carried accumulator
-  AddPtrTile kTile;    // additive: the two addptr tile addresses
+  unsigned accArg = 0;       // additive: the carried accumulator
+  triton::DotOp accDot;      // additive: dot(ds, k^T, acc)
+  triton::TransOp transpose; // additive: k^T, order replayed verbatim
+  AddPtrTile kTile;          // additive: the two addptr tile addresses
   AddPtrTile vTile;
-
-  // ---- Matcher scratch: written by one stage, read by a later one. The
-  // builder never reads these. ----
-  unsigned numCarried = 0;
-  triton::LoadOp indexLoad;
-  Value rawIndex;
-  scf::IfOp branch;
-  SmallVector<int64_t, 2> predicateFactors;
-  Value kTokenOffset;
-  Value vTokenOffset;
-  AdditiveState additiveState;
+  Value lseVec;              // additive: [G] f32, loop-invariant
+  Value deltaVec;            // additive: [G] f32, loop-invariant
 };
 
 static bool sameScanCandidate(const ScanCandidate &a, const ScanCandidate &b) {
   return a.additive == b.additive && a.tableLength == b.tableLength &&
-         a.blockSize == b.blockSize && a.scanTileWidth == b.scanTileWidth &&
+         a.blockSize == b.blockSize &&
+         a.scanTileWidth == b.scanTileWidth &&
          a.blocksPerTile == b.blocksPerTile;
 }
 
@@ -579,6 +492,60 @@ static bool sameScanCandidate(const ScanCandidate &a, const ScanCandidate &b) {
 // match by value, and the index multiplier is matched by value so muli/shli
 // both work. Predicate algebra variants such as idx <= i_t/BS instead of
 // idx*BS <= i_t are rejected: they need an equivalence prover, not a matcher.
+
+// The matcher's working state; the stage functions run in field order, so
+// each field is written before it is first read.
+struct ScanMatchContext {
+  triton::FuncOp fn;
+
+  // matchLoopSkeleton.
+  scf::ForOp loop;
+  unsigned numCarried = 0;
+  bool additive = false;
+
+  // matchIndexTable.
+  triton::LoadOp indexLoad;
+  Value tableBase;
+  int64_t tableLength = 0;
+  Value pid;
+  // matchBlockGuard: pid, or pid advanced by a loop-invariant offset.
+  Value rowPosition;
+
+  // matchBlockGuard.
+  Value rawIndex;
+  scf::IfOp branch;
+  SmallVector<int64_t, 2> predicateFactors;
+
+  // matchCarriedState.
+  // Set by whichever classifier matches; the shared anchors below read them.
+
+  triton::DotOp scoreDot;
+  triton::DotOp valueDot;
+  arith::SelectOp maskSelect;
+  unsigned oIdx = 0;
+  unsigned mIdx = 0;
+  unsigned lIdx = 0;
+  AdditiveState additiveState;
+
+  // matchTiles.
+  triton::LoadOp kLoad;
+  triton::LoadOp vLoad;
+  int64_t blockSize = 0;
+  Value kTokenOffset;
+  Value vTokenOffset;
+  unsigned kTokenAxis = 0;
+  unsigned vTokenAxis = 0;
+  triton::MakeTensorPtrOp kPtr;
+  triton::MakeTensorPtrOp vPtr;
+  AddPtrTile kTile;
+  AddPtrTile vTile;
+  Value dynamicBoundResult;
+  Value dynamicBoundInput;
+
+  // matchTileContract.
+  int64_t scanTileWidth = 0;
+  int64_t blocksPerTile = 0;
+};
 
 // The form-specific matchers, called from the shared stages above.
 static bool matchOnlineSoftmaxState(scf::ForOp loop, scf::IfOp branch,
@@ -594,77 +561,83 @@ static bool matchAddPtrTile(triton::LoadOp load, Value rawIndex,
                             scf::ForOp loop, AddPtrTile &tile);
 
 // The loop skeleton and the outside-load budget.
-static bool matchLoopSkeleton(ScanCandidate &c) {
+static bool matchLoopSkeleton(ScanMatchContext &ctx) {
+  triton::FuncOp fn = ctx.fn;
+  scf::ForOp &loop = ctx.loop;
   // Exactly one scf.for, at function-body top level, with all-tensor iter
   // args, lb 0 and step 1. Rule B requires the same shape, and the rewrite
   // assumes no other loop nest: scf.while and scf.parallel are rejected.
   unsigned forOps = 0;
-  c.function.walk([&](scf::ForOp forOp) {
+  fn.walk([&](scf::ForOp forOp) {
     ++forOps;
-    c.loop = forOp;
+    loop = forOp;
   });
-  if (forOps != 1 || !c.loop ||
-      c.loop->getBlock() != &c.function.getBody().front())
+  if (forOps != 1 || !loop || loop->getBlock() != &fn.getBody().front())
     return false;
   bool foreignControlFlow = false;
-  c.function.walk([&](Operation *op) {
+  fn.walk([&](Operation *op) {
     if (isa<scf::WhileOp, scf::ParallelOp>(op))
       foreignControlFlow = true;
   });
   // The carried state is either the online-softmax triple (fwd: o/m/l) or the
   // single additive accumulator (bwd dq); the classifier below decides which.
-  const unsigned numCarried = c.loop.getNumResults();
+  const unsigned numCarried = loop.getNumResults();
   if (foreignControlFlow || (numCarried != 3 && numCarried != 1))
     return false;
   const bool additive = numCarried == 1;
-  for (Value init : c.loop.getInitArgs())
+  for (Value init : loop.getInitArgs())
     if (!isa<RankedTensorType>(init.getType()))
       return false;
-  if (getConstantIntValue(c.loop.getLowerBound()) !=
-          std::optional<int64_t>(0) ||
-      getConstantIntValue(c.loop.getStep()) != std::optional<int64_t>(1))
+  if (getConstantIntValue(loop.getLowerBound()) != std::optional<int64_t>(0) ||
+      getConstantIntValue(loop.getStep()) != std::optional<int64_t>(1))
     return false;
 
   // At most one scalar load outside the loop. The dense production path has
   // zero; the dyn-NS path has exactly one (the block_counts read, which must
   // survive the rewrite); a varlen dispatch has five and is declined.
   unsigned outsideScalarLoads = 0;
-  c.function.walk([&](triton::LoadOp load) {
+  fn.walk([&](triton::LoadOp load) {
     if (!load->getParentOfType<scf::ForOp>() &&
         !isa<RankedTensorType>(load.getType()))
       ++outsideScalarLoads;
   });
   if (outsideScalarLoads > 1)
     return false;
-  c.numCarried = numCarried;
-  c.additive = additive;
+  ctx.numCarried = numCarried;
+  ctx.additive = additive;
   return true;
 }
 
 // The index-table read, the row base and the table length S.
-static bool matchIndexTable(ScanCandidate &c) {
+static bool matchIndexTable(ScanMatchContext &ctx) {
+  triton::FuncOp fn = ctx.fn;
+  scf::ForOp loop = ctx.loop;
+  triton::LoadOp &indexLoad = ctx.indexLoad;
+  Value &tableBase = ctx.tableBase;
+  Value &pid = ctx.pid;
+  int64_t &tableLength = ctx.tableLength;
   // Exactly one scalar load inside the loop, plus exactly two tensor loads
   // (the K/V tiles). The scalar address is the loop-invariant table base
   // advanced by the induction variable; this load is the core of the
   // per-block gather and the one thing the rewrite removes.
   unsigned inLoopLoads = 0;
   unsigned inLoopScalarLoads = 0;
-  c.loop->walk([&](triton::LoadOp load) {
+  loop->walk([&](triton::LoadOp load) {
     ++inLoopLoads;
     if (!isa<RankedTensorType>(load.getType())) {
       ++inLoopScalarLoads;
-      c.indexLoad = load;
+      indexLoad = load;
     }
   });
   if (inLoopLoads != 3 || inLoopScalarLoads != 1)
     return false;
-  auto indexAddPtr = c.indexLoad.getPtr().getDefiningOp<triton::AddPtrOp>();
+  auto indexAddPtr = indexLoad.getPtr().getDefiningOp<triton::AddPtrOp>();
   if (!indexAddPtr)
     return false;
-  c.tableBase = indexAddPtr.getPtr();
+  tableBase = indexAddPtr.getPtr();
   // The table entries must be wide enough for the i32 token arithmetic below;
   // production index tables are i64.
-  auto tablePtrType = dyn_cast<triton::PointerType>(c.tableBase.getType());
+  auto tablePtrType = dyn_cast<triton::PointerType>(tableBase.getType());
   if (!tablePtrType)
     return false;
   auto tableElem = dyn_cast<IntegerType>(tablePtrType.getPointeeType());
@@ -672,16 +645,16 @@ static bool matchIndexTable(ScanCandidate &c) {
     return false;
   // The rewrite merges the per-iteration loads into one vector read, so a
   // masked, "other"-padded or volatile entry load is not this pattern.
-  if (c.indexLoad.getMask() || c.indexLoad.getOther() ||
-      c.indexLoad.getIsVolatile())
+  if (indexLoad.getMask() || indexLoad.getOther() ||
+      indexLoad.getIsVolatile())
     return false;
-  if (!isDefinedOutsideLoop(c.tableBase, c.loop))
+  if (!isDefinedOutsideLoop(tableBase, loop))
     return false;
   // The rewrite reads table[0, S) once and indexes it by the iteration
   // number, so the baseline offset must be exactly the induction variable:
   // an offset a*iv+b would read table[b], table[b+a], ... instead.
-  auto tableOffset =
-      asAffineInIv(indexAddPtr.getOffset(), c.loop.getInductionVar());
+  auto tableOffset = asAffineInIv(indexAddPtr.getOffset(),
+                                  loop.getInductionVar());
   if (!tableOffset || tableOffset->scale != 1 || tableOffset->bias != 0)
     return false;
 
@@ -695,7 +668,7 @@ static bool matchIndexTable(ScanCandidate &c) {
   // value is required by the causal predicate and the tensor mask, so an
   // inconsistent second pid cannot survive.
   SmallVector<Value, 4> axis0Pids;
-  c.function.walk([&](triton::GetProgramIdOp op) {
+  fn.walk([&](triton::GetProgramIdOp op) {
     if (op.getAxisAsInt() == 0)
       axis0Pids.push_back(op.getResult());
   });
@@ -705,18 +678,18 @@ static bool matchIndexTable(ScanCandidate &c) {
   // from none or from more than one (ambiguous: refuse to pick).
   auto uniquePidReaching = [&](Value v) -> std::optional<Value> {
     Value found;
-    for (Value programId : axis0Pids) {
-      if (!dependsOn(v, programId))
+    for (Value pid : axis0Pids) {
+      if (!dependsOn(v, pid))
         continue;
       if (found)
         return std::nullopt;
-      found = programId;
+      found = pid;
     }
     if (!found)
       return std::nullopt; // none reaches: not a query-position dependency
     return found;
   };
-  auto rowAddPtr = c.tableBase.getDefiningOp<triton::AddPtrOp>();
+  auto rowAddPtr = tableBase.getDefiningOp<triton::AddPtrOp>();
   if (!rowAddPtr)
     return false;
   Value rowOffset = rowAddPtr.getOffset();
@@ -730,31 +703,34 @@ static bool matchIndexTable(ScanCandidate &c) {
     // term of the table layout. Ambiguous on either side is refused as well.
     if (lhsPidCarries == rhsPidCarries)
       return false;
-    c.pid = lhsPidCarries ? *lhsPid : *rhsPid;
+    pid = lhsPidCarries ? *lhsPid : *rhsPid;
     slotTerm = lhsPidCarries ? offsetAdd.getRhs() : offsetAdd.getLhs();
   } else if (std::optional<Value> rowPid = uniquePidReaching(rowOffset)) {
-    c.pid = *rowPid;
+    pid = *rowPid;
     slotTerm = Value();
   } else {
     return false;
   }
   if (slotTerm) {
-    auto mul = dyn_cast<arith::MulIOp>(slotTerm.getDefiningOp());
+    // The front end may widen the i_h*S term (extsi(muli(i_h, S))), so peel
+    // the integer width casts before reading the multiplier.
+    auto mul = dyn_cast<arith::MulIOp>(stripIntegerCasts(slotTerm).getDefiningOp());
     if (!mul)
       return false;
-    std::optional<int64_t> multiplier = getConstantIntValue(mul.getRhs());
-    if (!multiplier)
-      multiplier = getConstantIntValue(mul.getLhs());
-    if (!multiplier)
+    std::optional<int64_t> multiplier;
+    if ((multiplier = getConstantIntValue(mul.getRhs())))
+      tableLength = *multiplier;
+    else if ((multiplier = getConstantIntValue(mul.getLhs())))
+      tableLength = *multiplier;
+    else
       return false;
-    c.tableLength = *multiplier;
   } else {
     // No i_h*S term (H == 1 collapses the layout): the table length is only
     // recoverable from a constant trip count.
-    auto trip = getConstantIntValue(c.loop.getUpperBound());
+    auto trip = getConstantIntValue(loop.getUpperBound());
     if (!trip)
       return false;
-    c.tableLength = *trip;
+    tableLength = *trip;
   }
   // S is the STATIC row length of the index table: the host passes
   // block_indices as [i_h, S], so the i_h*S multiplier of the row base IS S.
@@ -768,42 +744,49 @@ static bool matchIndexTable(ScanCandidate &c) {
   // vector read, and the builder clamps NS into [0, S] in its own width
   // before truncation. A constant trip count is the special case NS == S; it
   // is cross-checked below so the two paths cannot disagree.
-  if (c.tableLength <= 0)
+  if (tableLength <= 0)
     return false;
   // S drives a vector read of S table entries, so an unbounded S would
   // materialize an arbitrarily wide tensor read. 4096 is a generous ceiling
   // that still bounds the cost.
-  if (c.tableLength > 4096)
+  if (tableLength > 4096)
     return false;
-  if (auto trip = getConstantIntValue(c.loop.getUpperBound());
-      trip && *trip != c.tableLength)
+  if (auto trip = getConstantIntValue(loop.getUpperBound());
+      trip && *trip != tableLength)
     return false;
   return true;
 }
 
 // The scaled-index guard of the single scf.if.
-static bool matchBlockGuard(ScanCandidate &c) {
-  // The guard is andi(causal, range) over the SCALED index: i_s <= pid_x and
-  // 0 <= i_s. Direction flips and operand order are free; the causal right
-  // operand must be the axis-0 program id itself (a load-derived value there
-  // is the varlen dispatch). Comparisons on the unscaled index do not match.
+static bool matchBlockGuard(ScanMatchContext &ctx) {
+  scf::ForOp loop = ctx.loop;
+  triton::LoadOp indexLoad = ctx.indexLoad;
+  scf::IfOp &branch = ctx.branch;
+  Value &rawIndex = ctx.rawIndex;
+  SmallVector<int64_t, 2> &predicateFactors = ctx.predicateFactors;
+  // The guard is andi(causal, range) over the SCALED index: i_s <= row and
+  // 0 <= i_s. Direction flips and operand order are free; the causal operand
+  // must be the axis-0 program id itself, or the program id advanced by a
+  // loop-invariant offset (the decode Q_OFFSET). A load-derived value there is
+  // the varlen dispatch. Comparisons on the unscaled index do not match.
   unsigned guards = 0;
-  for (Operation &op : c.loop.getBody()->without_terminator())
+  for (Operation &op : loop.getBody()->without_terminator())
     if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
-      c.branch = ifOp;
+      branch = ifOp;
       ++guards;
     }
   if (guards != 1)
     return false;
-  auto predicateAnd = c.branch.getCondition().getDefiningOp<arith::AndIOp>();
+  auto predicateAnd =
+      branch.getCondition().getDefiningOp<arith::AndIOp>();
   if (!predicateAnd)
     return false;
-  c.rawIndex = c.indexLoad.getResult();
+  rawIndex = indexLoad.getResult();
   auto isScaledIndex = [&](Value v) {
-    auto factor = matchIdxTimesBS(v, c.rawIndex);
+    auto factor = matchIdxTimesBS(v, rawIndex);
     if (!factor || *factor <= 0)
       return false;
-    c.predicateFactors.push_back(*factor);
+    predicateFactors.push_back(*factor);
     return true;
   };
   bool causalFound = false;
@@ -815,12 +798,18 @@ static bool matchBlockGuard(ScanCandidate &c) {
     arith::CmpIPredicate pred = cmp.getPredicate();
     Value lhs = cmp.getLhs();
     Value rhs = cmp.getRhs();
-    if ((pred == arith::CmpIPredicate::sle && isScaledIndex(lhs) &&
-         isProgramIdAxis0(rhs)) ||
-        (pred == arith::CmpIPredicate::sge && isProgramIdAxis0(lhs) &&
-         isScaledIndex(rhs))) {
-      causalFound = true;
-      continue;
+    if (pred == arith::CmpIPredicate::sle && isScaledIndex(lhs)) {
+      if (Value position = matchRowPosition(rhs, ctx.pid, loop)) {
+        ctx.rowPosition = position;
+        causalFound = true;
+        continue;
+      }
+    } else if (pred == arith::CmpIPredicate::sge && isScaledIndex(rhs)) {
+      if (Value position = matchRowPosition(lhs, ctx.pid, loop)) {
+        ctx.rowPosition = position;
+        causalFound = true;
+        continue;
+      }
     }
     auto isZero = [](Value v) {
       auto constant = getConstantIntValue(v);
@@ -835,34 +824,50 @@ static bool matchBlockGuard(ScanCandidate &c) {
     }
     return false;
   }
-  return causalFound && rangeFound;
+  if (!causalFound || !rangeFound)
+    return false;
+  return true;
 }
 
-static bool matchIfShape(ScanCandidate &c) {
+static bool matchIfShape(ScanMatchContext &ctx) {
+  scf::ForOp loop = ctx.loop;
+  scf::IfOp branch = ctx.branch;
+  const unsigned numCarried = ctx.numCarried;
   // The else region yields the iter args unchanged, i.e. skipping a block is
   // neutral for the carried state; that is what lets the rewrite replace the
   // branch with a zero weight.
-  if (c.branch.getElseRegion().empty() ||
-      !llvm::hasSingleElement(c.branch.getElseRegion()))
+  if (branch.getElseRegion().empty() ||
+      !llvm::hasSingleElement(branch.getElseRegion()))
     return false;
   auto elseYield =
-      dyn_cast<scf::YieldOp>(c.branch.getElseRegion().front().getTerminator());
-  if (!elseYield || elseYield->getNumOperands() != c.numCarried)
+      dyn_cast<scf::YieldOp>(branch.getElseRegion().front().getTerminator());
+  if (!elseYield || elseYield->getNumOperands() != numCarried)
     return false;
-  for (unsigned i = 0; i < c.numCarried; ++i)
-    if (elseYield->getOperand(i) != c.loop.getRegionIterArgs()[i])
+  for (unsigned i = 0; i < numCarried; ++i)
+    if (elseYield->getOperand(i) != loop.getRegionIterArgs()[i])
       return false;
-  auto latchYield = dyn_cast<scf::YieldOp>(c.loop.getBody()->getTerminator());
-  if (!latchYield || latchYield->getNumOperands() != c.numCarried)
+  auto latchYield = dyn_cast<scf::YieldOp>(loop.getBody()->getTerminator());
+  if (!latchYield || latchYield->getNumOperands() != numCarried)
     return false;
-  for (unsigned i = 0; i < c.numCarried; ++i)
-    if (latchYield->getOperand(i) != c.branch->getResult(i))
+  for (unsigned i = 0; i < numCarried; ++i)
+    if (latchYield->getOperand(i) != branch->getResult(i))
       return false;
   return true;
 }
 
 // The carried-state classifier: fwd (o, m, l) vs bwd (one accumulator).
-static bool matchCarriedState(ScanCandidate &c) {
+static bool matchCarriedState(ScanMatchContext &ctx) {
+  scf::ForOp loop = ctx.loop;
+  scf::IfOp branch = ctx.branch;
+  const unsigned numCarried = ctx.numCarried;
+  const bool additive = ctx.additive;
+  unsigned &oIdx = ctx.oIdx;
+  unsigned &mIdx = ctx.mIdx;
+  unsigned &lIdx = ctx.lIdx;
+  triton::DotOp &scoreDot = ctx.scoreDot;
+  triton::DotOp &valueDot = ctx.valueDot;
+  arith::SelectOp &maskSelect = ctx.maskSelect;
+  AdditiveState &additiveState = ctx.additiveState;
   // The scan template is form-specific, so the shape of the recurrence
   // decides which template the builder emits:
   //   * online softmax (fwd, 3 iter args): (o, m, l), m updated with maxnumf,
@@ -872,130 +877,156 @@ static bool matchCarriedState(ScanCandidate &c) {
   //     through the dot's C operand, no safe_m.
   // A recurrence in neither form is refused rather than half-matched: the two
   // templates are not interchangeable.
-  if (c.branch.getThenRegion().empty() ||
-      !llvm::hasSingleElement(c.branch.getThenRegion()))
+  if (branch.getThenRegion().empty() ||
+      !llvm::hasSingleElement(branch.getThenRegion()))
     return false;
-  Block &thenBlock = c.branch.getThenRegion().front();
+  Block &thenBlock = branch.getThenRegion().front();
   auto thenYield = dyn_cast<scf::YieldOp>(thenBlock.getTerminator());
-  if (!thenYield || thenYield->getNumOperands() != c.numCarried)
+  if (!thenYield || thenYield->getNumOperands() != numCarried)
     return false;
-  if (!c.additive) {
-    if (!matchOnlineSoftmaxState(c.loop, c.branch, thenYield, c.oArg, c.mArg,
-                                 c.lArg, c.scoreDot, c.valueDot, c.maskSelect))
+  if (!additive) {
+    if (!matchOnlineSoftmaxState(loop, branch, thenYield, oIdx,
+                                 mIdx, lIdx, scoreDot, valueDot,
+                                 maskSelect))
       return false;
   } else {
     // The recurrence is read backwards from the dot that accumulates into the
     // carried state.
-    if (!matchAdditiveState(c.loop, c.branch.getThenRegion(),
-                            c.loop.getRegionIterArgs()[0],
-                            thenYield->getOperand(0), c.additiveState))
+    if (!matchAdditiveState(loop, branch.getThenRegion(),
+                            loop.getRegionIterArgs()[0],
+                            thenYield->getOperand(0), additiveState))
       return false;
-    c.scoreDot = c.additiveState.scoreDot;
-    c.valueDot = c.additiveState.valueDot;
-    c.maskSelect = c.additiveState.maskSelect;
+    scoreDot = additiveState.scoreDot;
+    valueDot = additiveState.valueDot;
+    maskSelect = additiveState.maskSelect;
   }
   return true;
 }
 
 // Dot operand dependence and loop invariance.
-static bool matchDotOperands(ScanCandidate &c) {
+static bool matchDotOperands(ScanMatchContext &ctx) {
+  scf::ForOp loop = ctx.loop;
+  triton::LoadOp indexLoad = ctx.indexLoad;
+  Value pid = ctx.pid;
+  triton::DotOp scoreDot = ctx.scoreDot;
+  triton::DotOp valueDot = ctx.valueDot;
   // Every dot lhs is query-row dependent (axis 0), every rhs is not.
   // Dependence through the per-iteration index load does not count: it is
   // exactly what the rewrite removes. Only axis-x dependence is considered.
-  if (!dependsOnExcluding(c.scoreDot.getA(), c.pid, c.indexLoad))
+  if (!dependsOnExcluding(scoreDot.getA(), pid, indexLoad))
     return false;
-  if (dependsOnExcluding(c.scoreDot.getB(), c.pid, c.indexLoad))
+  if (dependsOnExcluding(scoreDot.getB(), pid, indexLoad))
     return false;
-  if (!dependsOnExcluding(c.valueDot.getA(), c.pid, c.indexLoad))
+  if (!dependsOnExcluding(valueDot.getA(), pid, indexLoad))
     return false;
-  if (dependsOnExcluding(c.valueDot.getB(), c.pid, c.indexLoad))
+  if (dependsOnExcluding(valueDot.getB(), pid, indexLoad))
     return false;
   // The score dot's lhs is Q, loaded and scaled outside the loop, so the
   // rewrite can reuse the operand verbatim.
-  return isDefinedOutsideLoop(c.scoreDot.getA(), c.loop);
+  if (!isDefinedOutsideLoop(scoreDot.getA(), loop))
+    return false;
+  return true;
 }
 
 // The K/V tiles, token offsets and address chains.
-static bool matchTiles(ScanCandidate &c) {
+static bool matchTiles(ScanMatchContext &ctx) {
+  scf::ForOp loop = ctx.loop;
+  scf::IfOp branch = ctx.branch;
+  const bool additive = ctx.additive;
+  Value rawIndex = ctx.rawIndex;
+  SmallVector<int64_t, 2> &predicateFactors = ctx.predicateFactors;
+  triton::DotOp scoreDot = ctx.scoreDot;
+  triton::DotOp valueDot = ctx.valueDot;
+  triton::LoadOp &kLoad = ctx.kLoad;
+  triton::LoadOp &vLoad = ctx.vLoad;
+  int64_t &blockSize = ctx.blockSize;
+  Value &kTokenOffset = ctx.kTokenOffset;
+  Value &vTokenOffset = ctx.vTokenOffset;
+  unsigned &kTokenAxis = ctx.kTokenAxis;
+  unsigned &vTokenAxis = ctx.vTokenAxis;
+  triton::MakeTensorPtrOp &kPtr = ctx.kPtr;
+  triton::MakeTensorPtrOp &vPtr = ctx.vPtr;
+  AddPtrTile &kTile = ctx.kTile;
+  AddPtrTile &vTile = ctx.vTile;
+  Value &dynamicBoundResult = ctx.dynamicBoundResult;
+  Value &dynamicBoundInput = ctx.dynamicBoundInput;
   // Both forms read one K tile and one V tile per iteration, addressed from
   // the block index; they differ only in the spelling: the forward kernel
   // uses tt.make_tensor_ptr (the token axis is one of the view's offsets),
   // the bwd kernel two nested tt.addptr's plus an explicit mask.
-  c.kLoad = c.scoreDot.getB().getDefiningOp<triton::LoadOp>();
-  c.vLoad = c.valueDot.getB().getDefiningOp<triton::LoadOp>();
-  if (!c.kLoad || !c.vLoad || c.kLoad == c.vLoad)
+  kLoad = scoreDot.getB().getDefiningOp<triton::LoadOp>();
+  vLoad = valueDot.getB().getDefiningOp<triton::LoadOp>();
+  if (!kLoad || !vLoad || kLoad == vLoad)
     return false;
-  if (c.kLoad->getParentRegion() != &c.branch.getThenRegion() ||
-      c.vLoad->getParentRegion() != &c.branch.getThenRegion())
+  if (kLoad->getParentRegion() != &branch.getThenRegion() ||
+      vLoad->getParentRegion() != &branch.getThenRegion())
     return false;
-  if (c.additive) {
-    // The additive form: no mptr at all. Both tiles are matched from their
-    // two-level addptr chain, their explicit mask and their token-range bound.
-    if (!matchAddPtrTile(c.kLoad, c.rawIndex, c.loop, c.kTile) ||
-        !matchAddPtrTile(c.vLoad, c.rawIndex, c.loop, c.vTile))
-      return false;
-    // Both tiles must cover the same token block and carry the same
-    // token-range mask: the builder rebuilds one bound for both.
-    if (c.kTile.blockSize != c.vTile.blockSize ||
-        c.kTile.tokenBound != c.vTile.tokenBound)
-      return false;
-    c.blockSize = c.kTile.blockSize;
-    c.kTokenOffset = c.kTile.blockStart;
-    c.vTokenOffset = c.vTile.blockStart;
-    // dot(ds[G, BS], k^T[BS, F]) -> acc[G, F]: both tile free axes must be
-    // the accumulator's column count and both dots must produce [G, BS].
-    auto accType = cast<RankedTensorType>(c.loop.getInitArgs()[0].getType());
-    if (accType.getRank() != 2)
-      return false;
-    auto isScoreTile = [&](Type type) {
-      auto ranked = dyn_cast<RankedTensorType>(type);
-      return ranked && ranked.getRank() == 2 &&
-             ranked.getElementType().isF32() &&
-             ranked.getShape()[0] == accType.getShape()[0] &&
-             ranked.getShape()[1] == c.blockSize;
-    };
-    if (!isScoreTile(c.scoreDot.getType()) ||
-        !isScoreTile(c.valueDot.getType()) ||
-        c.kTile.freeExtent != accType.getShape()[1] ||
-        c.vTile.freeExtent != accType.getShape()[1])
-      return false;
-  } else {
+  // The additive form comes in two spellings: the original two-level addptr
+  // chain with an explicit mask (the hand-written dq variant the rule was first
+  // built on), and production nsa_bwd_dq's tt.make_tensor_ptr plus
+  // boundaryCheck. The addptr spelling is tried first; when it does not hold,
+  // the shared mptr path below runs and the additive geometry check after it
+  // covers both spellings.
+  bool useAddPtrTiles = false;
+  int64_t kFreeExtent = 0;
+  int64_t vFreeExtent = 0;
+  if (additive) {
+    AddPtrTile kAddPtrTile;
+    AddPtrTile vAddPtrTile;
+    if (matchAddPtrTile(kLoad, rawIndex, loop, kAddPtrTile) &&
+        matchAddPtrTile(vLoad, rawIndex, loop, vAddPtrTile)) {
+      // Both tiles must cover the same token block and carry the same
+      // token-range mask: the builder rebuilds one bound for both.
+      if (kAddPtrTile.blockSize != vAddPtrTile.blockSize ||
+          kAddPtrTile.tokenBound != vAddPtrTile.tokenBound)
+        return false;
+      kTile = kAddPtrTile;
+      vTile = vAddPtrTile;
+      blockSize = kTile.blockSize;
+      kTokenOffset = kTile.blockStart;
+      vTokenOffset = vTile.blockStart;
+      kFreeExtent = kTile.freeExtent;
+      vFreeExtent = vTile.freeExtent;
+      useAddPtrTiles = true;
+    }
+  }
+  if (!useAddPtrTiles) {
     // The rewrite loads each tile unconditionally, so a per-element mask, an
     // "other" padding value or a volatile qualifier on the tile loads is out
     // of scope.
     auto isPlainLoad = [](triton::LoadOp load) {
       return !load.getMask() && !load.getOther() && !load.getIsVolatile();
     };
-    if (!isPlainLoad(c.kLoad) || !isPlainLoad(c.vLoad))
+    if (!isPlainLoad(kLoad) || !isPlainLoad(vLoad))
       return false;
-    c.kPtr = c.kLoad.getPtr().getDefiningOp<triton::MakeTensorPtrOp>();
-    c.vPtr = c.vLoad.getPtr().getDefiningOp<triton::MakeTensorPtrOp>();
-    if (!c.kPtr || !c.vPtr)
+    kPtr = kLoad.getPtr().getDefiningOp<triton::MakeTensorPtrOp>();
+    vPtr = vLoad.getPtr().getDefiningOp<triton::MakeTensorPtrOp>();
+    if (!kPtr || !vPtr)
       return false;
-    if (!mlir::isa<triton::PointerType>(c.kPtr.getType()) ||
-        !mlir::isa<triton::PointerType>(c.vPtr.getType()))
+    if (!mlir::isa<triton::PointerType>(kPtr.getType()) ||
+        !mlir::isa<triton::PointerType>(vPtr.getType()))
       return false;
     auto identifyTile = [&](triton::MakeTensorPtrOp ptr, unsigned &tokenAxis,
                             Value &tokenOffset) -> bool {
       unsigned found = 0;
       for (unsigned axis = 0; axis < ptr.getOffsets().size(); ++axis) {
         Value offset = ptr.getOffsets()[axis];
-        if (!dependsOn(offset, c.rawIndex))
+        if (!dependsOn(offset, rawIndex))
           continue;
         ++found;
         tokenAxis = axis;
-        auto factor = matchIdxTimesBS(offset, c.rawIndex);
+        auto factor = matchIdxTimesBS(offset, rawIndex);
         if (!factor || *factor <= 0)
           return false;
-        if (c.blockSize && *factor != c.blockSize)
+        if (blockSize && *factor != blockSize)
           return false;
-        c.blockSize = *factor;
+        blockSize = *factor;
         tokenOffset = offset;
       }
       return found == 1;
     };
-    if (!identifyTile(c.kPtr, c.kTokenAxis, c.kTokenOffset) ||
-        !identifyTile(c.vPtr, c.vTokenAxis, c.vTokenOffset))
+    if (!identifyTile(kPtr, kTokenAxis, kTokenOffset) ||
+        !identifyTile(vPtr, vTokenAxis, vTokenOffset))
       return false;
     // The tile extent on the token axis must equal BS. The rewrite pins the
     // tile token extent to BN, so a narrower or wider tile would change how
@@ -1008,14 +1039,14 @@ static bool matchTiles(ScanCandidate &c) {
       if (!blockType)
         return false;
       ArrayRef<int64_t> shape = blockType.getShape();
-      return tokenAxis < shape.size() && shape[tokenAxis] == c.blockSize;
+      return tokenAxis < shape.size() && shape[tokenAxis] == blockSize;
     };
-    if (!hasOneBlockOnTokenAxis(c.kPtr, c.kTokenAxis) ||
-        !hasOneBlockOnTokenAxis(c.vPtr, c.vTokenAxis))
+    if (!hasOneBlockOnTokenAxis(kPtr, kTokenAxis) ||
+        !hasOneBlockOnTokenAxis(vPtr, vTokenAxis))
       return false;
     // mptr offsets are i32, so the token offsets are i32 by construction.
-    if (!c.kTokenOffset || !c.kTokenOffset.getType().isInteger(32) ||
-        !c.vTokenOffset.getType().isInteger(32))
+    if (!kTokenOffset || !kTokenOffset.getType().isInteger(32) ||
+        !vTokenOffset.getType().isInteger(32))
       return false;
     // No load may appear anywhere in the K/V address chains (base, view
     // shape, strides, non-token offsets).
@@ -1023,20 +1054,20 @@ static bool matchTiles(ScanCandidate &c) {
       if (reachesLoad(v))
         return false;
       Operation *def = v.getDefiningOp();
-      if (!def || !c.loop->isAncestor(def))
+      if (!def || !loop->isAncestor(def))
         return true; // defined outside: reused verbatim
       // The only loop-carried address computation is the sign extension of
       // the dynamic K/V bound; it is loop-invariant and re-created outside.
       auto ext = dyn_cast<arith::ExtSIOp>(def);
-      if (!ext || !isDefinedOutsideLoop(ext.getIn(), c.loop))
+      if (!ext || !isDefinedOutsideLoop(ext.getIn(), loop))
         return false;
-      if (c.dynamicBoundResult && c.dynamicBoundResult != ext.getResult())
+      if (dynamicBoundResult && dynamicBoundResult != ext.getResult())
         return false;
-      c.dynamicBoundResult = ext.getResult();
-      c.dynamicBoundInput = ext.getIn();
+      dynamicBoundResult = ext.getResult();
+      dynamicBoundInput = ext.getIn();
       return true;
     };
-    for (triton::MakeTensorPtrOp ptr : {c.kPtr, c.vPtr}) {
+    for (triton::MakeTensorPtrOp ptr : {kPtr, vPtr}) {
       if (!checkAddressOperand(ptr.getBase()))
         return false;
       for (Value v : ptr.getShape())
@@ -1045,7 +1076,7 @@ static bool matchTiles(ScanCandidate &c) {
       for (Value v : ptr.getStrides())
         if (!checkAddressOperand(v))
           return false;
-      unsigned tokenAxis = ptr == c.kPtr ? c.kTokenAxis : c.vTokenAxis;
+      unsigned tokenAxis = ptr == kPtr ? kTokenAxis : vTokenAxis;
       for (unsigned axis = 0; axis < ptr.getOffsets().size(); ++axis) {
         if (axis == tokenAxis)
           continue;
@@ -1054,29 +1085,73 @@ static bool matchTiles(ScanCandidate &c) {
       }
     }
   }
+  // The additive geometry is spelling independent: dot(ds[G, BS], k^T[BS, F])
+  // -> acc[G, F] means both tile free axes are the accumulator's column count
+  // and both dots produce [G, BS].
+  if (additive) {
+    if (!useAddPtrTiles) {
+      // The mptr spelling carries the free extent as the block shape on the
+      // axis that is not the token axis.
+      auto freeExtentOf = [&](triton::MakeTensorPtrOp ptr,
+                              unsigned tokenAxis) -> int64_t {
+        auto ptrType = cast<triton::PointerType>(ptr.getType());
+        auto blockType = cast<RankedTensorType>(ptrType.getPointeeType());
+        return blockType.getShape()[1 - tokenAxis];
+      };
+      kFreeExtent = freeExtentOf(kPtr, kTokenAxis);
+      vFreeExtent = freeExtentOf(vPtr, vTokenAxis);
+    }
+    auto accType = cast<RankedTensorType>(loop.getInitArgs()[0].getType());
+    if (accType.getRank() != 2)
+      return false;
+    auto isScoreTile = [&](Type type) {
+      auto ranked = dyn_cast<RankedTensorType>(type);
+      return ranked && ranked.getRank() == 2 &&
+             ranked.getElementType().isF32() &&
+             ranked.getShape()[0] == accType.getShape()[0] &&
+             ranked.getShape()[1] == blockSize;
+    };
+    if (!isScoreTile(scoreDot.getType()) || !isScoreTile(valueDot.getType()) ||
+        kFreeExtent != accType.getShape()[1] ||
+        vFreeExtent != accType.getShape()[1])
+      return false;
+  }
   // The block predicates must scale the index by the same BS as the tile
   // offsets.
-  for (int64_t factor : c.predicateFactors)
-    if (factor != c.blockSize)
+  for (int64_t factor : predicateFactors)
+    if (factor != blockSize)
       return false;
   return true;
 }
 
 // The tensor-level causal mask.
-static bool matchCausalMask(ScanCandidate &c) {
-  // The neutral-path select's condition broadcasts a token-vs-pid_x
-  // comparison, pid_x on the greater side, and the token side is built from
-  // the scaled index. This pins the third pid_x use to the same SSA value.
-  auto causalCmp = peelBroadcasts(c.maskSelect.getCondition(), /*splat=*/false)
-                       .getDefiningOp<arith::CmpIOp>();
+static bool matchCausalMask(ScanMatchContext &ctx) {
+  arith::SelectOp maskSelect = ctx.maskSelect;
+  Value rowPosition = ctx.rowPosition;
+  Value kTokenOffset = ctx.kTokenOffset;
+  Value vTokenOffset = ctx.vTokenOffset;
+  int64_t blockSize = ctx.blockSize;
+  if (!rowPosition)
+    return false;
+  // The neutral-path select's condition broadcasts a token-vs-row comparison,
+  // the row on the greater side, and the token side is built from the scaled
+  // index. This pins the third row-position use to the same SSA value the
+  // block guard read.
+  Value maskCmp = maskSelect.getCondition();
+  while (Operation *def = maskCmp.getDefiningOp())
+    if (isa<triton::BroadcastOp, triton::ExpandDimsOp>(def))
+      maskCmp = def->getOperand(0);
+    else
+      break;
+  auto causalCmp = maskCmp.getDefiningOp<arith::CmpIOp>();
   if (!causalCmp || !isa<RankedTensorType>(causalCmp.getLhs().getType()))
     return false;
-  // The query-position side is a broadcast of pid_x, possibly widened: the
-  // bwd form compares its tokens against extsi(pid_x) in i64. Peeling the
-  // width casts is not a relaxation of identity: the value must still be
-  // built from the same pid SSA the row base and the block guard use.
+  // The query-position side is a broadcast of the row position, possibly
+  // widened: the bwd form compares its tokens against extsi(pid_x) in i64.
+  // Peeling the width casts is not a relaxation of identity: the value must
+  // still be built from the same SSA the row base and the block guard use.
   auto isPidBroadcast = [&](Value v) {
-    return stripIntegerCasts(peelBroadcasts(v)) == c.pid;
+    return stripIntegerCasts(peelBroadcasts(v)) == rowPosition;
   };
   Value pidSide, tokenSide;
   if (isPidBroadcast(causalCmp.getLhs())) {
@@ -1091,7 +1166,8 @@ static bool matchCausalMask(ScanCandidate &c) {
   {
     arith::CmpIPredicate pred = causalCmp.getPredicate();
     bool pidGreater =
-        (pred == arith::CmpIPredicate::sge && pidSide == causalCmp.getLhs()) ||
+        (pred == arith::CmpIPredicate::sge &&
+         pidSide == causalCmp.getLhs()) ||
         (pred == arith::CmpIPredicate::sle && pidSide == causalCmp.getRhs());
     if (!pidGreater)
       return false;
@@ -1102,79 +1178,139 @@ static bool matchCausalMask(ScanCandidate &c) {
   // shift, a +-1 nudge or a rescaled index would be dropped silently; those
   // spellings are rejected instead of normalized. Only broadcasts above the
   // comparison are peeled.
-  auto tokenAdd =
-      peelBroadcasts(tokenSide, /*splat=*/false).getDefiningOp<arith::AddIOp>();
+  while (Operation *def = tokenSide.getDefiningOp())
+    if (isa<triton::BroadcastOp, triton::ExpandDimsOp>(def))
+      tokenSide = def->getOperand(0);
+    else
+      break;
+  auto tokenAdd = tokenSide.getDefiningOp<arith::AddIOp>();
   if (!tokenAdd)
     return false;
-  for (bool swapped : {false, true}) {
-    Value blockStart;
-    int64_t extent = 0;
-    RankedTensorType rangeTy;
-    if (!matchBlockTokenRange(swapped ? tokenAdd.getRhs() : tokenAdd.getLhs(),
-                              swapped ? tokenAdd.getLhs() : tokenAdd.getRhs(),
-                              blockStart, extent, &rangeTy))
-      continue;
-    if (blockStart != c.kTokenOffset && blockStart != c.vTokenOffset)
-      continue;
-    if (!rangeTy.getElementType().isInteger(32) || extent != c.blockSize)
-      continue;
-    return true;
-  }
-  return false;
+  auto isBlockTokenRange = [&](Value maybeSplat, Value maybeRange) -> bool {
+    auto splat = maybeSplat.getDefiningOp<triton::SplatOp>();
+    // bwd spells the token range as extsi(make_range{0, BS}); the builder
+    // recomputes the token positions, so the cast chain is not carried over.
+    auto range =
+        stripIntegerCasts(maybeRange).getDefiningOp<triton::MakeRangeOp>();
+    if (!splat || !range)
+      return false;
+    Value index = splat.getOperand();
+    if (index != kTokenOffset && index != vTokenOffset)
+      return false;
+    auto rangeType = dyn_cast<RankedTensorType>(Type(range.getType()));
+    if (!rangeType || rangeType.getRank() != 1 ||
+        !rangeType.getElementType().isInteger(32))
+      return false;
+    return rangeType.getShape()[0] == blockSize && range.getStart() == 0 &&
+           range.getEnd() == blockSize;
+  };
+  if (!isBlockTokenRange(tokenAdd.getLhs(), tokenAdd.getRhs()) &&
+      !isBlockTokenRange(tokenAdd.getRhs(), tokenAdd.getLhs()))
+    return false;
+  return true;
 }
 
 // The tile width contract (BS, BN = max(64, BS), R = BN/BS).
-static bool matchTileContract(ScanCandidate &c) {
+static bool matchTileContract(ScanMatchContext &ctx) {
+  int64_t blockSize = ctx.blockSize;
+  int64_t &scanTileWidth = ctx.scanTileWidth;
+  int64_t &blocksPerTile = ctx.blocksPerTile;
   // BS must be a power of two, BN = max(64, BS), and BN % BS == 0: a block
   // number owns BS consecutive tokens. BN comes from IR constants, never a
   // new kernel argument.
-  if (!isPowerOfTwo(c.blockSize))
+  if (!isPowerOfTwo(blockSize))
     return false;
-  c.scanTileWidth = std::max<int64_t>(64, c.blockSize);
-  if (c.scanTileWidth % c.blockSize != 0)
+  scanTileWidth = std::max<int64_t>(64, blockSize);
+  if (scanTileWidth % blockSize != 0)
     return false;
-  c.blocksPerTile = c.scanTileWidth / c.blockSize;
+  blocksPerTile = scanTileWidth / blockSize;
   return true;
 }
 
 // The vocabulary gate over everything inside the gather loop.
-static bool checkVocabulary(ScanCandidate &c) {
+static bool checkVocabulary(ScanMatchContext &ctx) {
+  scf::ForOp loop = ctx.loop;
+  const bool additive = ctx.additive;
   // Everything inside the gather loop must be either rebuilt or safely
   // deletable, so no unrecognized op may carry effects: a store, atomic or
   // call would be silently dropped. tt.trans is only rebuilt by the additive
   // template, so it stays unrecognized for the online-softmax form.
   bool supportedVocabulary = true;
-  c.loop->walk([&](Operation *op) {
+  loop->walk([&](Operation *op) {
     if (isa<scf::ForOp, scf::IfOp, scf::YieldOp>(op))
       return;
     if (isa<triton::AddPtrOp, triton::LoadOp, triton::MakeTensorPtrOp,
             triton::DotOp, triton::MakeRangeOp, triton::SplatOp,
             triton::ExpandDimsOp, triton::BroadcastOp, triton::ReduceOp,
-            triton::ReduceReturnOp>(op))
+            triton::ReduceReturnOp, triton::AssertOp>(op))
       return;
-    if (c.additive && isa<triton::TransOp>(op))
+    if (additive && isa<triton::TransOp>(op))
       return;
     StringRef ns = op->getName().getDialectNamespace();
     if (ns == "arith" || ns == "math")
       return;
     supportedVocabulary = false;
   });
-  return supportedVocabulary;
+  if (!supportedVocabulary)
+    return false;
+  return true;
 }
 
-// Run every stage in order; a false from any stage declines the match. The
-// stages fill the candidate in place, so a matched candidate is the plan's
-// description of the rewrite.
+// Run every stage in order, then assemble the candidate; a false from any
+// stage declines the match.
 static std::optional<ScanCandidate> matchSelectedBlockScan(triton::FuncOp fn) {
+  ScanMatchContext ctx;
+  ctx.fn = fn;
+  auto check = [&](const char *stage, bool ok) {
+    LLVM_DEBUG(if (!ok) llvm::dbgs()
+                   << "selected-block-scan: stage " << stage << " declined\n");
+    return ok;
+  };
+  if (!check("skeleton", matchLoopSkeleton(ctx)) ||
+      !check("index-table", matchIndexTable(ctx)) ||
+      !check("block-guard", matchBlockGuard(ctx)) ||
+      !check("if-shape", matchIfShape(ctx)) ||
+      !check("carried-state", matchCarriedState(ctx)) ||
+      !check("dot-operands", matchDotOperands(ctx)) ||
+      !check("tiles", matchTiles(ctx)) ||
+      !check("causal-mask", matchCausalMask(ctx)) ||
+      !check("tile-contract", matchTileContract(ctx)) ||
+      !check("vocabulary", checkVocabulary(ctx)))
+    return std::nullopt;
+
   ScanCandidate candidate;
   candidate.function = fn;
-  if (!matchLoopSkeleton(candidate) || !matchIndexTable(candidate) ||
-      !matchBlockGuard(candidate) || !matchIfShape(candidate) ||
-      !matchCarriedState(candidate) || !matchDotOperands(candidate) ||
-      !matchTiles(candidate) || !matchCausalMask(candidate) ||
-      !matchTileContract(candidate) || !checkVocabulary(candidate))
-    return std::nullopt;
-  candidate.scanBound = candidate.loop.getUpperBound();
+  candidate.loop = ctx.loop;
+  candidate.pid = ctx.pid;
+  candidate.rowPosition = ctx.rowPosition ? ctx.rowPosition : ctx.pid;
+  candidate.tableBase = ctx.tableBase;
+  candidate.tableLength = ctx.tableLength;
+  candidate.blockSize = ctx.blockSize;
+  candidate.scanTileWidth = ctx.scanTileWidth;
+  candidate.blocksPerTile = ctx.blocksPerTile;
+  candidate.scanBound = ctx.loop.getUpperBound();
+  candidate.kPtr = ctx.kPtr;
+  candidate.vPtr = ctx.vPtr;
+  candidate.kLoad = ctx.kLoad;
+  candidate.vLoad = ctx.vLoad;
+  candidate.kTokenAxis = ctx.kTokenAxis;
+  candidate.vTokenAxis = ctx.vTokenAxis;
+  candidate.dynamicBoundResult = ctx.dynamicBoundResult;
+  candidate.dynamicBoundInput = ctx.dynamicBoundInput;
+  candidate.scoreDot = ctx.scoreDot;
+  candidate.valueDot = ctx.valueDot;
+  candidate.maskSelect = ctx.maskSelect;
+  candidate.oArg = ctx.oIdx;
+  candidate.mArg = ctx.mIdx;
+  candidate.lArg = ctx.lIdx;
+  candidate.additive = ctx.additive;
+  candidate.accArg = 0;
+  candidate.accDot = ctx.additiveState.accDot;
+  candidate.transpose = ctx.additiveState.transpose;
+  candidate.kTile = ctx.kTile;
+  candidate.vTile = ctx.vTile;
+  candidate.lseVec = ctx.additiveState.lseVec;
+  candidate.deltaVec = ctx.additiveState.deltaVec;
   return candidate;
 }
 
@@ -1238,16 +1374,28 @@ static bool matchOnlineSoftmaxState(scf::ForOp loop, scf::IfOp branch,
   auto lUpdate = lNew.getDefiningOp<arith::AddFOp>();
   if (!lUpdate)
     return false;
-  // The l-carrying term is mul(l, alpha); the other addend is sum(p).
-  auto scaled = splitAtPivot<arith::MulFOp>(lUpdate.getLhs(), lArg);
-  Value lSum = lUpdate.getRhs();
-  if (!scaled) {
-    scaled = splitAtPivot<arith::MulFOp>(lUpdate.getRhs(), lArg);
-    lSum = lUpdate.getLhs();
-  }
-  if (!scaled)
+  Value lSum;
+  auto mulWithOperand = [](Value v, Value operand, Value &other) {
+    auto mul = v.getDefiningOp<arith::MulFOp>();
+    if (!mul)
+      return false;
+    if (mul.getLhs() == operand) {
+      other = mul.getRhs();
+      return true;
+    }
+    if (mul.getRhs() == operand) {
+      other = mul.getLhs();
+      return true;
+    }
     return false;
-  Value alpha = scaled->second;
+  };
+  Value alpha;
+  if (mulWithOperand(lUpdate.getLhs(), lArg, alpha))
+    lSum = lUpdate.getRhs();
+  else if (mulWithOperand(lUpdate.getRhs(), lArg, alpha))
+    lSum = lUpdate.getLhs();
+  else
+    return false;
   auto alphaExp = alpha.getDefiningOp<math::ExpOp>();
   if (!alphaExp)
     return false;
@@ -1282,8 +1430,11 @@ static bool matchOnlineSoftmaxState(scf::ForOp loop, scf::IfOp branch,
         lhsCast->getOperand(0) != pExp)
       return false;
   }
-  auto scaledO = splitAtPivot<arith::MulFOp>(valueDot.getC(), oArg);
-  if (!scaledO || !isBroadcastOf(scaledO->second, alpha))
+  auto oScale = valueDot.getC().getDefiningOp<arith::MulFOp>();
+  if (!oScale)
+    return false;
+  if (!((oScale.getLhs() == oArg && isBroadcastOf(oScale.getRhs(), alpha)) ||
+        (oScale.getRhs() == oArg && isBroadcastOf(oScale.getLhs(), alpha))))
     return false;
   return true;
 }
@@ -1439,25 +1590,27 @@ static bool matchAddPtrTile(triton::LoadOp load, Value rawIndex,
   auto tokenAdd = tokens.getDefiningOp<arith::AddIOp>();
   if (!tokenAdd)
     return false;
-  // The block start must be the same idx*BS product the block guard scales by,
-  // and the tile's token extent must equal that factor.
-  bool rangeFound = false;
-  for (bool swapped : {false, true}) {
-    Value blockStart;
-    int64_t extent = 0;
-    if (!matchBlockTokenRange(swapped ? tokenAdd.getRhs() : tokenAdd.getLhs(),
-                              swapped ? tokenAdd.getLhs() : tokenAdd.getRhs(),
-                              blockStart, extent))
-      continue;
-    auto factor = matchIdxTimesBS(blockStart, rawIndex);
-    if (!factor || *factor <= 0 || *factor != extent)
-      continue;
-    tile.blockStart = blockStart;
-    tile.blockSize = extent;
-    rangeFound = true;
-    break;
-  }
-  if (!rangeFound)
+  auto isBlockTokenRange = [&](Value maybeSplat, Value maybeRange) {
+    auto splat = maybeSplat.getDefiningOp<triton::SplatOp>();
+    if (!splat)
+      return false;
+    auto factor = matchIdxTimesBS(splat.getOperand(), rawIndex);
+    if (!factor || *factor <= 0)
+      return false;
+    auto range =
+        stripIntegerCasts(maybeRange).getDefiningOp<triton::MakeRangeOp>();
+    if (!range)
+      return false;
+    auto rangeType = dyn_cast<RankedTensorType>(range.getType());
+    if (!rangeType || rangeType.getRank() != 1 || range.getStart() != 0 ||
+        range.getEnd() != *factor)
+      return false;
+    tile.blockStart = splat.getOperand();
+    tile.blockSize = *factor;
+    return true;
+  };
+  if (!isBlockTokenRange(tokenAdd.getLhs(), tokenAdd.getRhs()) &&
+      !isBlockTokenRange(tokenAdd.getRhs(), tokenAdd.getLhs()))
     return false;
   if (block.getShape()[1] != tile.blockSize)
     return false;
@@ -1492,14 +1645,13 @@ static bool matchAddPtrTile(triton::LoadOp load, Value rawIndex,
   auto maskAnd = load.getMask().getDefiningOp<arith::AndIOp>();
   if (!maskAnd)
     return false;
-  // Each mask factor is broadcast from one row; a non-broadcast side is not
-  // this pattern.
-  auto maskRowOf = [](Value v) {
-    auto bc = v.getDefiningOp<triton::BroadcastOp>();
-    return bc ? bc.getSrc() : Value();
+  auto peelBroadcast = [](Value v) -> Value {
+    if (auto bc = v.getDefiningOp<triton::BroadcastOp>())
+      return bc.getSrc();
+    return Value();
   };
-  Value maskLhs = maskRowOf(maskAnd.getLhs());
-  Value maskRhs = maskRowOf(maskAnd.getRhs());
+  Value maskLhs = peelBroadcast(maskAnd.getLhs());
+  Value maskRhs = peelBroadcast(maskAnd.getRhs());
   if (!maskLhs || !maskRhs)
     return false;
   bool lhsIsToken = dependsOn(maskLhs, tile.blockStart);
@@ -1516,7 +1668,13 @@ static bool matchAddPtrTile(triton::LoadOp load, Value rawIndex,
   if (!tokenCmp)
     return false;
   Value boundSide;
-  if (!matchLessThan(tokenCmp, tokens, boundSide))
+  if (tokenCmp.getLhs() == tokens &&
+      tokenCmp.getPredicate() == arith::CmpIPredicate::slt)
+    boundSide = tokenCmp.getRhs();
+  else if (tokenCmp.getRhs() == tokens &&
+           tokenCmp.getPredicate() == arith::CmpIPredicate::sgt)
+    boundSide = tokenCmp.getLhs();
+  else
     return false;
   auto boundSplat = boundSide.getDefiningOp<triton::SplatOp>();
   if (!boundSplat || !isDefinedOutsideLoop(boundSplat.getSrc(), loop) ||
@@ -1528,7 +1686,13 @@ static bool matchAddPtrTile(triton::LoadOp load, Value rawIndex,
   auto freeCmp = freeMask.getDefiningOp<arith::CmpIOp>();
   if (!freeCmp)
     return false;
-  if (!matchLessThan(freeCmp, freeExpanded.getResult(), tile.freeBoundRhs))
+  if (freeCmp.getLhs() == freeExpanded.getResult() &&
+      freeCmp.getPredicate() == arith::CmpIPredicate::slt)
+    tile.freeBoundRhs = freeCmp.getRhs();
+  else if (freeCmp.getRhs() == freeExpanded.getResult() &&
+           freeCmp.getPredicate() == arith::CmpIPredicate::sgt)
+    tile.freeBoundRhs = freeCmp.getLhs();
+  else
     return false;
   return isDefinedOutsideLoop(tile.freeBoundRhs, loop) &&
          !reachesLoad(tile.freeBoundRhs);
@@ -1552,14 +1716,15 @@ template <typename CombineOp>
 static Value buildReduce(IRRewriter &rewriter, Location loc, Value input,
                          int32_t axis) {
   auto tensor = cast<RankedTensorType>(input.getType());
-  auto reduce = rewriter.create<triton::ReduceOp>(loc, ValueRange{input},
-                                                  static_cast<int>(axis));
+  auto reduce = rewriter.create<triton::ReduceOp>(
+      loc, ValueRange{input}, static_cast<int>(axis));
   Block &combine = reduce.getCombineOp().emplaceBlock();
   combine.addArguments({tensor.getElementType(), tensor.getElementType()},
                        {loc, loc});
   rewriter.setInsertionPointToStart(&combine);
-  Value combined = rewriter.create<CombineOp>(loc, combine.getArgument(0),
-                                              combine.getArgument(1));
+  Value combined =
+      rewriter.create<CombineOp>(loc, combine.getArgument(0),
+                                 combine.getArgument(1));
   rewriter.create<triton::ReduceReturnOp>(loc, ValueRange{combined});
   rewriter.setInsertionPointAfter(reduce.getOperation());
   return reduce->getResult(0);
@@ -1571,9 +1736,9 @@ static Value buildReduce(IRRewriter &rewriter, Location loc, Value input,
 static Value buildDot(IRRewriter &rewriter, Location loc, Type resultType,
                       Value a, Value b, Value c, Operation *original) {
   SmallVector<Value> operands{a, b, c};
-  Operation *dot =
-      rewriter.create(loc, original->getName().getIdentifier(), operands,
-                      TypeRange{resultType}, original->getAttrs());
+  Operation *dot = rewriter.create(loc, original->getName().getIdentifier(),
+                                   operands, TypeRange{resultType},
+                                   original->getAttrs());
   return dot->getResult(0);
 }
 
@@ -1583,6 +1748,8 @@ static Value buildDot(IRRewriter &rewriter, Location loc, Type resultType,
 // to divsi(pid_x + BN, BN). Only the way the templates consume these values
 // differs.
 struct ScanPrologue {
+  Value starts;         // [S] i32, ids * BS
+  Value slotValid;      // [S] i1, offs < NS
   Value startsRow;      // [1, S] i32
   Value slotRow;        // [1, S] i1
   Value tokensRange;    // [BN] i32, [0, BN)
@@ -1596,24 +1763,22 @@ struct ScanPrologue {
   Value c0, c1, cBN;    // i32 constants of the new loop
 };
 
-// `G` is the carried state's row count, the only shape the candidate does not
-// carry: the scan tile and the table length are its other two.
-static bool buildScanPrologue(IRRewriter &rewriter, ScanCandidate &candidate,
+static bool buildScanPrologue(IRRewriter &rewriter,
+                              ScanCandidate &candidate, Type i32, Type i64,
+                              Type f32, int64_t S, int64_t BS, int64_t BN,
                               int64_t G, ScanPrologue &prologue) {
   Location loc = candidate.loop.getLoc();
-  Type i32 = rewriter.getI32Type();
-  Type i64 = rewriter.getI64Type();
-  Type f32 = rewriter.getF32Type();
-  const int64_t S = candidate.tableLength;
-  const int64_t BS = candidate.blockSize;
-  const int64_t BN = candidate.scanTileWidth;
-  Value offs =
-      rewriter.create<triton::MakeRangeOp>(loc, tensorTy({S}, i32), 0, S);
-  Type tablePtrTensor = tensorTy({S}, candidate.tableBase.getType());
-  Value tablePtrs = rewriter.create<triton::SplatOp>(loc, tablePtrTensor,
-                                                     candidate.tableBase);
-  Value tablePtrVec =
-      rewriter.create<triton::AddPtrOp>(loc, tablePtrTensor, tablePtrs, offs);
+  auto tensorTy = [](ArrayRef<int64_t> shape, Type elem) {
+    return RankedTensorType::get(shape, elem);
+  };
+  Value offs = rewriter.create<triton::MakeRangeOp>(loc, tensorTy({S}, i32),
+                                                    0, S);
+  Type tablePtrTensor =
+      tensorTy({S}, candidate.tableBase.getType());
+  Value tablePtrs = rewriter.create<triton::SplatOp>(
+      loc, tablePtrTensor, candidate.tableBase);
+  Value tablePtrVec = rewriter.create<triton::AddPtrOp>(
+      loc, tablePtrTensor, tablePtrs, offs);
   Value ids = rewriter.create<triton::LoadOp>(
       loc, tablePtrVec, triton::CacheModifier::NONE,
       triton::EvictionPolicy::NORMAL, false);
@@ -1622,7 +1787,8 @@ static bool buildScanPrologue(IRRewriter &rewriter, ScanCandidate &candidate,
     idsI32 = rewriter.create<arith::TruncIOp>(loc, tensorTy({S}, i32), ids);
 
   // starts = ids * BS, the vectorized old i_s.
-  Value bsConstant = rewriter.create<arith::ConstantIntOp>(loc, BS, 32);
+  Value bsConstant =
+      rewriter.create<arith::ConstantIntOp>(loc, BS, 32);
   Value bsSplat =
       rewriter.create<triton::SplatOp>(loc, tensorTy({S}, i32), bsConstant);
   Value starts = rewriter.create<arith::MulIOp>(loc, idsI32, bsSplat);
@@ -1661,40 +1827,75 @@ static bool buildScanPrologue(IRRewriter &rewriter, ScanCandidate &candidate,
 
   // ---- Scan bound: cdiv(i_t + 1, BN) folded to divsi(pid_x + BN, BN), i32
   // regardless of the old iv's width. ----
-  prologue.c0 = rewriter.create<arith::ConstantIntOp>(loc, 0, 32);
-  prologue.c1 = rewriter.create<arith::ConstantIntOp>(loc, 1, 32);
-  prologue.cBN = rewriter.create<arith::ConstantIntOp>(loc, BN, 32);
-  prologue.scanUpperBound = rewriter.create<arith::DivSIOp>(
-      loc, rewriter.create<arith::AddIOp>(loc, candidate.pid, prologue.cBN),
-      prologue.cBN);
+  // The bound and the causal mask are keyed by the causal row position, which
+  // is pid_x or pid_x advanced by the decode offset (Q_OFFSET).
+  Value rowPosition =
+      candidate.rowPosition ? candidate.rowPosition : candidate.pid;
+  if (rowPosition.getType() != i32) {
+    unsigned width = rowPosition.getType().getIntOrFloatBitWidth();
+    if (width > 32)
+      rowPosition = rewriter.create<arith::TruncIOp>(loc, i32, rowPosition);
+    else if (width < 32)
+      rowPosition = rewriter.create<arith::ExtSIOp>(loc, i32, rowPosition);
+    else
+      return false;
+  }
+  Value c0 = rewriter.create<arith::ConstantIntOp>(loc, 0, 32);
+  Value c1 = rewriter.create<arith::ConstantIntOp>(loc, 1, 32);
+  Value cBN = rewriter.create<arith::ConstantIntOp>(loc, BN, 32);
+  Value scanUpperBound = rewriter.create<arith::DivSIOp>(
+      loc, rewriter.create<arith::AddIOp>(loc, rowPosition, cBN), cBN);
 
   // Re-create the K/V dynamic bound outside the loop, unfolded.
-  prologue.bound64 = candidate.dynamicBoundResult;
+  Value bound64 = candidate.dynamicBoundResult;
   if (candidate.dynamicBoundInput)
-    prologue.bound64 =
-        rewriter.create<arith::ExtSIOp>(loc, i64, candidate.dynamicBoundInput);
+    bound64 = rewriter.create<arith::ExtSIOp>(loc, i64,
+                                              candidate.dynamicBoundInput);
+  auto mapAddressOperand = [&](Value v) -> Value {
+    return v == candidate.dynamicBoundResult ? bound64 : v;
+  };
+
   // Loop-invariant rows of the weight matrix (hoisted ahead of the loop).
-  prologue.startsRow = rewriter.create<triton::ExpandDimsOp>(
+  Value startsRow = rewriter.create<triton::ExpandDimsOp>(
       loc, tensorTy({1, S}, i32), starts, 0);
-  prologue.slotRow = rewriter.create<triton::ExpandDimsOp>(
+  Value slotRow = rewriter.create<triton::ExpandDimsOp>(
       loc, tensorTy({1, S}, rewriter.getI1Type()), slotValid, 0);
-  prologue.tokensRange =
+  Value tokensRange =
       rewriter.create<triton::MakeRangeOp>(loc, tensorTy({BN}, i32), 0, BN);
-  prologue.pidRow =
-      rewriter.create<triton::SplatOp>(loc, tensorTy({BN}, i32), candidate.pid);
+  Value pidRow =
+      rewriter.create<triton::SplatOp>(loc, tensorTy({BN}, i32), rowPosition);
 
   // Fresh neutral constants; later canonicalization/CSE folds them into the
   // surviving ones. Keeping them fresh makes the builder independent of the
   // original constants' shapes when BN != BS.
-  prologue.zeroTokens =
-      splatConstant(rewriter, loc, {BN}, f32, rewriter.getFloatAttr(f32, 0.0));
-  prologue.zeroRows =
-      splatConstant(rewriter, loc, {G}, f32, rewriter.getFloatAttr(f32, 0.0));
-  prologue.negInfRows = splatConstant(
-      rewriter, loc, {G}, f32,
-      rewriter.getFloatAttr(f32, APFloat::getInf(APFloat::IEEEsingle(), true)));
+  Value zeroTokens = rewriter.create<arith::ConstantOp>(
+      loc, DenseElementsAttr::get(tensorTy({BN}, f32),
+                                  rewriter.getFloatAttr(f32, 0.0)));
+  Value zeroRows = rewriter.create<arith::ConstantOp>(
+      loc, DenseElementsAttr::get(tensorTy({G}, f32),
+                                  rewriter.getFloatAttr(f32, 0.0)));
+  Value negInfRows = rewriter.create<arith::ConstantOp>(
+      loc,
+      DenseElementsAttr::get(
+          tensorTy({G}, f32),
+          rewriter.getFloatAttr(
+              f32, APFloat::getInf(APFloat::IEEEsingle(), true))));
 
+  prologue.starts = starts;
+  prologue.slotValid = slotValid;
+  prologue.startsRow = startsRow;
+  prologue.slotRow = slotRow;
+  prologue.tokensRange = tokensRange;
+  prologue.pidRow = pidRow;
   prologue.bsConstant = bsConstant;
+  prologue.zeroTokens = zeroTokens;
+  prologue.zeroRows = zeroRows;
+  prologue.negInfRows = negInfRows;
+  prologue.scanUpperBound = scanUpperBound;
+  prologue.bound64 = bound64;
+  prologue.c0 = c0;
+  prologue.c1 = c1;
+  prologue.cBN = cBN;
   return true;
 }
 
@@ -1712,15 +1913,13 @@ struct ScanWeights {
 };
 
 static ScanWeights buildScanWeights(IRRewriter &rewriter, Location loc,
-                                    const ScanCandidate &candidate, Value iv,
-                                    Value tokenStart,
+                                    Type i32, Type f32, int64_t S,
+                                    int64_t BS, int64_t BN, int64_t R,
+                                    Value iv, Value tokenStart,
                                     const ScanPrologue &prologue) {
-  Type i32 = rewriter.getI32Type();
-  Type f32 = rewriter.getF32Type();
-  const int64_t S = candidate.tableLength;
-  const int64_t BS = candidate.blockSize;
-  const int64_t BN = candidate.scanTileWidth;
-  const int64_t R = candidate.blocksPerTile;
+  auto tensorTy = [](ArrayRef<int64_t> shape, Type elem) {
+    return RankedTensorType::get(shape, elem);
+  };
   Value startsRow = prologue.startsRow;
   Value slotRow = prologue.slotRow;
   Value bsConstant = prologue.bsConstant;
@@ -1732,8 +1931,8 @@ static ScanWeights buildScanWeights(IRRewriter &rewriter, Location loc,
   if (R == 1) {
     Value blockStartRow = rewriter.create<triton::SplatOp>(
         loc, tensorTy({1, S}, i32), tokenStart);
-    matchesEq = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
-                                               startsRow, blockStartRow);
+    matchesEq = rewriter.create<arith::CmpIOp>(
+        loc, arith::CmpIPredicate::eq, startsRow, blockStartRow);
   } else {
     Value cR = rewriter.create<arith::ConstantIntOp>(loc, R, 32);
     Value blocksBase = rewriter.create<arith::MulIOp>(loc, iv, cR);
@@ -1750,22 +1949,22 @@ static ScanWeights buildScanWeights(IRRewriter &rewriter, Location loc,
         loc, tensorTy({R, S}, i32),
         rewriter.create<triton::ExpandDimsOp>(loc, tensorTy({R, 1}, i32),
                                               blockStarts, 1));
-    matchesEq = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
-                                               startsMatrix, blockMatrix);
+    matchesEq = rewriter.create<arith::CmpIOp>(
+        loc, arith::CmpIPredicate::eq, startsMatrix, blockMatrix);
     slotMatrix = rewriter.create<triton::BroadcastOp>(
         loc, tensorTy({R, S}, rewriter.getI1Type()), slotRow);
   }
   Value matches = rewriter.create<arith::AndIOp>(loc, matchesEq, slotMatrix);
   SmallVector<int64_t> matrixShape{R, S};
-  Value countsI =
-      rewriter.create<arith::ExtUIOp>(loc, tensorTy(matrixShape, i32), matches);
+  Value countsI = rewriter.create<arith::ExtUIOp>(
+      loc, tensorTy(matrixShape, i32), matches);
   Value counts = buildReduce<arith::AddIOp>(rewriter, loc, countsI, 1);
-  Value countsF =
-      rewriter.create<arith::SIToFPOp>(loc, tensorTy({R}, f32), counts);
+  Value countsF = rewriter.create<arith::SIToFPOp>(
+      loc, tensorTy({R}, f32), counts);
   Value tokenCounts2D = rewriter.create<triton::BroadcastOp>(
       loc, tensorTy({R, BS}, f32),
-      rewriter.create<triton::ExpandDimsOp>(loc, tensorTy({R, 1}, f32), countsF,
-                                            1));
+      rewriter.create<triton::ExpandDimsOp>(loc, tensorTy({R, 1}, f32),
+                                            countsF, 1));
   Value tokenCounts = rewriter.create<triton::ReshapeOp>(
       loc, tensorTy({BN}, f32), tokenCounts2D, false);
 
@@ -1775,14 +1974,15 @@ static ScanWeights buildScanWeights(IRRewriter &rewriter, Location loc,
   // entirely. The token positions are recomputed as token_start + [0, BN), so
   // the matched causal offset must be exactly zero.
   Value tokens = rewriter.create<arith::AddIOp>(
-      loc,
-      rewriter.create<triton::SplatOp>(loc, tensorTy({BN}, i32), tokenStart),
+      loc, rewriter.create<triton::SplatOp>(loc, tensorTy({BN}, i32),
+                                            tokenStart),
       tokensRange);
   Value validWeight = rewriter.create<arith::CmpFOp>(
       loc, arith::CmpFPredicate::OGT, tokenCounts, zeroTokens);
   Value validCausal = rewriter.create<arith::CmpIOp>(
       loc, arith::CmpIPredicate::sle, tokens, pidRow);
-  Value valid = rewriter.create<arith::AndIOp>(loc, validWeight, validCausal);
+  Value valid =
+      rewriter.create<arith::AndIOp>(loc, validWeight, validCausal);
 
   return ScanWeights{tokenCounts, tokens, valid};
 }
@@ -1791,8 +1991,9 @@ static ScanWeights buildScanWeights(IRRewriter &rewriter, Location loc,
 static scf::ForOp buildScanLoop(IRRewriter &rewriter, Location loc,
                                 const ScanPrologue &prologue,
                                 const SmallVector<Value> &inits) {
-  auto scan = rewriter.create<scf::ForOp>(
-      loc, prologue.c0, prologue.scanUpperBound, prologue.c1, inits);
+  auto scan = rewriter.create<scf::ForOp>(loc, prologue.c0,
+                                          prologue.scanUpperBound,
+                                          prologue.c1, inits);
   if (!scan.getBody()->empty())
     rewriter.eraseOp(scan.getBody()->getTerminator());
   rewriter.setInsertionPointToStart(scan.getBody());
@@ -1805,11 +2006,15 @@ struct ScanScores {
   Value scores;     // [G, BN] f32, dot(q, k, 0)
 };
 
-static ScanScores buildScores(IRRewriter &rewriter, Location loc, int64_t G,
-                              int64_t BN, Value bK, triton::DotOp scoreDot) {
-  Type f32 = rewriter.getF32Type();
-  Value zeroScores = splatConstant(rewriter, loc, {G, BN}, f32,
-                                   rewriter.getFloatAttr(f32, 0.0));
+static ScanScores buildScores(IRRewriter &rewriter, Location loc, Type f32,
+                              int64_t G, int64_t BN, Value bK,
+                              triton::DotOp scoreDot) {
+  auto tensorTy = [&](ArrayRef<int64_t> shape, Type elem) {
+    return RankedTensorType::get(shape, elem);
+  };
+  Value zeroScores = rewriter.create<arith::ConstantOp>(
+      loc, DenseElementsAttr::get(tensorTy({G, BN}, f32),
+                                  rewriter.getFloatAttr(f32, 0.0)));
   Value scores = buildDot(rewriter, loc, tensorTy({G, BN}, f32),
                           scoreDot.getA(), bK, zeroScores, scoreDot);
   return ScanScores{zeroScores, scores};
@@ -1873,7 +2078,8 @@ static bool buildSelectedBlockScan(IRRewriter &rewriter,
   rewriter.setInsertionPoint(oldLoop);
 
   ScanPrologue prologue;
-  if (!buildScanPrologue(rewriter, candidate, G, prologue))
+  if (!buildScanPrologue(rewriter, candidate, i32, i64, f32, S, BS, BN, G,
+                         prologue))
     return false;
 
   scf::ForOp scan = buildScanLoop(rewriter, loc, prologue, inits);
@@ -1889,28 +2095,32 @@ static bool buildSelectedBlockScan(IRRewriter &rewriter,
   // ---- K/V tiles. The two templates read the same two tiles per
   // iteration; only the addressing differs. ----
   Value bK, bV;
-  if (!additive) {
-    buildMakeTensorPtrTile(rewriter, loc, candidate, BN, tokenStart, prologue,
-                           bK, bV);
+  if (!additive || candidate.kPtr) {
+    // The online-softmax form always reads through make_tensor_ptr; the
+    // additive form does too when the baseline spelled the tiles that way
+    // (production nsa_bwd_dq), and only the addptr spelling needs the rebuilt
+    // two-level chain below.
+    buildMakeTensorPtrTile(rewriter, loc, candidate, BN, tokenStart,
+                           prologue, bK, bV);
   }
 
-  ScanWeights weights =
-      buildScanWeights(rewriter, loc, candidate, iv, tokenStart, prologue);
+  ScanWeights weights = buildScanWeights(rewriter, loc, i32, f32, S, BS, BN,
+                                         R, iv, tokenStart, prologue);
   Value tokenCounts = weights.tokenCounts;
   Value tokens = weights.tokens;
   Value valid = weights.valid;
 
-  if (additive) {
-    // Additive tiles: the baseline's own two-level addptr at the scan tile's
-    // token start, with the token-range mask preserved.
-    bK = buildAddPtrTileLoad(rewriter, loc, candidate.kTile, candidate.kLoad,
-                             tokens);
-    bV = buildAddPtrTileLoad(rewriter, loc, candidate.vTile, candidate.vLoad,
-                             tokens);
+  if (additive && !candidate.kPtr) {
+    // Additive tiles, addptr spelling: the baseline's own two-level addptr at
+    // the scan tile's token start, with the token-range mask preserved.
+    bK = buildAddPtrTileLoad(rewriter, loc, candidate.kTile,
+                             candidate.kLoad, tokens);
+    bV = buildAddPtrTileLoad(rewriter, loc, candidate.vTile,
+                             candidate.vLoad, tokens);
   }
 
-  ScanScores scanScores =
-      buildScores(rewriter, loc, G, BN, bK, candidate.scoreDot);
+  ScanScores scanScores = buildScores(rewriter, loc, f32, G, BN, bK,
+                                      candidate.scoreDot);
   if (additive) {
     buildAdditiveBody(rewriter, loc, f32, candidate, scan, G, BN,
                       scanScores.scores, scanScores.zeroScores, valid,
@@ -1998,36 +2208,50 @@ static void buildOnlineSoftmaxBody(IRRewriter &rewriter, Location loc, Type f32,
                                    BlockArgument oArg, BlockArgument mArg,
                                    BlockArgument lArg, Type oType,
                                    const ScanPrologue &prologue) {
-  Value maskMatrix = broadcastRow(rewriter, loc, valid, 0,
-                                  tensorTy({G, BN}, rewriter.getI1Type()));
-  Value negInfScores = splatConstant(
-      rewriter, loc, {G, BN}, f32,
-      rewriter.getFloatAttr(f32, APFloat::getInf(APFloat::IEEEsingle(), true)));
-  Value maskedScores =
-      rewriter.create<arith::SelectOp>(loc, maskMatrix, scores, negInfScores);
+  auto tensorTy = [&](ArrayRef<int64_t> shape, Type elem) {
+    return RankedTensorType::get(shape, elem);
+  };
+  Value maskRow = rewriter.create<triton::ExpandDimsOp>(
+      loc, tensorTy({1, BN}, rewriter.getI1Type()), valid, 0);
+  Value maskMatrix = rewriter.create<triton::BroadcastOp>(
+      loc, tensorTy({G, BN}, rewriter.getI1Type()), maskRow);
+  Value negInfScores = rewriter.create<arith::ConstantOp>(
+      loc,
+      DenseElementsAttr::get(
+          tensorTy({G, BN}, f32),
+          rewriter.getFloatAttr(
+              f32, APFloat::getInf(APFloat::IEEEsingle(), true))));
+  Value maskedScores = rewriter.create<arith::SelectOp>(
+      loc, maskMatrix, scores, negInfScores);
 
   // Online softmax with the safe_m guard. The guard replaces the baseline's
   // scf.if: a fully masked tile with m == -inf would otherwise compute
   // exp(-inf - -inf) = NaN and permanently poison o and l.
-  Value tileMax = buildReduce<arith::MaxNumFOp>(rewriter, loc, maskedScores, 1);
+  Value tileMax =
+      buildReduce<arith::MaxNumFOp>(rewriter, loc, maskedScores, 1);
   Value mNew = rewriter.create<arith::MaxNumFOp>(loc, mArg, tileMax);
   Value needsGuard = rewriter.create<arith::CmpFOp>(
       loc, arith::CmpFPredicate::OEQ, mNew, prologue.negInfRows);
   Value safeM = rewriter.create<arith::SelectOp>(loc, needsGuard,
-                                                 prologue.zeroRows, mNew);
+                                                 prologue.zeroRows,
+                                                 mNew);
   // Hard constraint 1: safe_m subtracts from BOTH the rescale factor and
   // the scores. Yielding the TRUE max keeps the epilogue's lse identical.
   Value rescale = rewriter.create<math::ExpOp>(
       loc, rewriter.create<arith::SubFOp>(loc, mArg, safeM));
-  Value safeMatrix =
-      broadcastRow(rewriter, loc, safeM, 1, tensorTy({G, BN}, f32));
+  Value safeMatrix = rewriter.create<triton::BroadcastOp>(
+      loc, tensorTy({G, BN}, f32),
+      rewriter.create<triton::ExpandDimsOp>(loc, tensorTy({G, 1}, f32), safeM,
+                                            1));
   Value pExp = rewriter.create<math::ExpOp>(
       loc, rewriter.create<arith::SubFOp>(loc, maskedScores, safeMatrix));
   // Hard constraint 2: the weight multiplies b_p, in f32, before the bf16
   // truncation: never the -inf mask (-inf * 0 = NaN) and never after the
   // cast (truncf(p*w) != truncf(p)*w).
-  Value weightMatrix =
-      broadcastRow(rewriter, loc, tokenCounts, 0, tensorTy({G, BN}, f32));
+  Value weightMatrix = rewriter.create<triton::BroadcastOp>(
+      loc, tensorTy({G, BN}, f32),
+      rewriter.create<triton::ExpandDimsOp>(loc, tensorTy({1, BN}, f32),
+                                            tokenCounts, 0));
   Value pWeighted = rewriter.create<arith::MulFOp>(loc, pExp, weightMatrix);
 
   // l = l * rescale + sum(p)
@@ -2036,13 +2260,26 @@ static void buildOnlineSoftmaxBody(IRRewriter &rewriter, Location loc, Type f32,
   Value lNew = rewriter.create<arith::AddFOp>(loc, lScaled, pSum);
 
   // o = o * rescale + dot(p, V)
-  Value rescaleMatrix =
-      broadcastRow(rewriter, loc, rescale, 1, cast<RankedTensorType>(oType));
+  Value rescaleMatrix = rewriter.create<triton::BroadcastOp>(
+      loc, oType,
+      rewriter.create<triton::ExpandDimsOp>(loc, tensorTy({G, 1}, f32),
+                                            rescale, 1));
   Value oScaled = rewriter.create<arith::MulFOp>(loc, oArg, rescaleMatrix);
-  Value valueLhs =
-      castLikeDotLhs(rewriter, loc, pWeighted, candidate.valueDot, {G, BN});
-  Value oNew =
-      buildDot(rewriter, loc, oType, valueLhs, bV, oScaled, candidate.valueDot);
+  Type valueLhsElem =
+      cast<RankedTensorType>(candidate.valueDot.getA().getType())
+          .getElementType();
+  Value valueLhs = pWeighted;
+  if (valueLhsElem != f32) {
+    Type valueLhsType = tensorTy({G, BN}, valueLhsElem);
+    if (isa<arith::ExtFOp>(candidate.valueDot.getA().getDefiningOp()))
+      valueLhs =
+          rewriter.create<arith::ExtFOp>(loc, valueLhsType, pWeighted);
+    else
+      valueLhs =
+          rewriter.create<arith::TruncFOp>(loc, valueLhsType, pWeighted);
+  }
+  Value oNew = buildDot(rewriter, loc, oType, valueLhs, bV, oScaled,
+                        candidate.valueDot);
 
   rewriter.setInsertionPointToEnd(scan.getBody());
   SmallVector<Value> yielded{Value(), Value(), Value()};
@@ -2071,6 +2308,9 @@ static Value buildAddPtrTileLoad(IRRewriter &rewriter, Location loc,
   Type baseType = tile.base.getType();
   Type elemType = cast<triton::PointerType>(baseType).getPointeeType();
   Type i1 = rewriter.getI1Type();
+  auto tensorTy = [](ArrayRef<int64_t> shape, Type elem) {
+    return RankedTensorType::get(shape, elem);
+  };
 
   // Preserve the addressing width of the baseline: the bwd form does its
   // token arithmetic in the index table's width while the free axis stays
@@ -2088,17 +2328,19 @@ static Value buildAddPtrTileLoad(IRRewriter &rewriter, Location loc,
   Value freeOff =
       rewriter.create<triton::ExpandDimsOp>(loc, freeOne, tile.freeVec, 1);
   Value innerPtr = rewriter.create<triton::AddPtrOp>(
-      loc, ptrOne, rewriter.create<triton::SplatOp>(loc, ptrOne, tile.base),
-      freeOff);
+      loc, ptrOne,
+      rewriter.create<triton::SplatOp>(loc, ptrOne, tile.base), freeOff);
   Value tokenOff = rewriter.create<arith::MulIOp>(
       loc, rewriter.create<triton::ExpandDimsOp>(loc, intOne, tokens, 0),
-      splatConstant(rewriter, loc, {1, BN}, intType,
-                    rewriter.getIntegerAttr(intType, tile.tokenStride)));
+      rewriter.create<arith::ConstantOp>(
+          loc, DenseElementsAttr::get(
+                   intOne,
+                   rewriter.getIntegerAttr(intType, tile.tokenStride))));
   Value tilePtr = rewriter.create<triton::AddPtrOp>(
       loc, ptrType,
       rewriter.create<triton::BroadcastOp>(loc, ptrType, innerPtr),
-      rewriter.create<triton::BroadcastOp>(loc, tensorTy({F, BN}, intType),
-                                           tokenOff));
+      rewriter.create<triton::BroadcastOp>(
+          loc, tensorTy({F, BN}, intType), tokenOff));
 
   // mask = (free < F) & (tokens < T), with the bound captured by the
   // matcher: the token term is the baseline's own range guard, not a
@@ -2113,14 +2355,15 @@ static Value buildAddPtrTileLoad(IRRewriter &rewriter, Location loc,
       loc, rewriter.create<triton::BroadcastOp>(loc, maskType, freeBound),
       rewriter.create<triton::BroadcastOp>(
           loc, maskType,
-          rewriter.create<triton::ExpandDimsOp>(loc, tensorTy({1, BN}, i1),
-                                                tokenMask, 0)));
+          rewriter.create<triton::ExpandDimsOp>(
+              loc, tensorTy({1, BN}, i1), tokenMask, 0)));
   // other = 0, the baseline's padding value for masked-off elements.
   auto valueType = tensorTy({F, BN}, elemType);
   Attribute zero = rewriter.getFloatAttr(elemType, 0.0);
   if (elemType.isIntOrIndex())
     zero = rewriter.getIntegerAttr(elemType, 0);
-  Value other = splatConstant(rewriter, loc, {F, BN}, elemType, zero);
+  Value other = rewriter.create<arith::ConstantOp>(
+      loc, DenseElementsAttr::get(valueType, zero));
   return rewriter.create<triton::LoadOp>(
       loc, tilePtr, mask, other, original.getCache(), original.getEvict(),
       original.getIsVolatile());
@@ -2134,6 +2377,9 @@ static void buildAdditiveBody(IRRewriter &rewriter, Location loc, Type f32,
                               Value zeroScores, Value valid, Value tokenCounts,
                               Value bK, Value bV, BlockArgument accArg,
                               Type stateType) {
+  auto tensorTy = [&](ArrayRef<int64_t> shape, Type elem) {
+    return RankedTensorType::get(shape, elem);
+  };
   // Additive state update (bwd dq). The carried state is a single accumulator
   // with neutral 0 and no rescale, so a tile contributes through the dot's C
   // operand.
@@ -2143,46 +2389,63 @@ static void buildAdditiveBody(IRRewriter &rewriter, Location loc, Type f32,
   // the zero weight first would turn it into inf * 0 = NaN and poison the
   // whole dq row. Selecting to 0 first keeps every invalid lane an exact
   // zero. This is why the forward template's ordering must not be copied.
-  Value lseMatrix = broadcastRow(rewriter, loc, candidate.additiveState.lseVec,
-                                 1, tensorTy({G, BN}, f32));
+  Value lseMatrix = rewriter.create<triton::BroadcastOp>(
+      loc, tensorTy({G, BN}, f32),
+      rewriter.create<triton::ExpandDimsOp>(loc, tensorTy({G, 1}, f32),
+                                            candidate.lseVec, 1));
   Value pExp = rewriter.create<math::ExpOp>(
       loc, rewriter.create<arith::SubFOp>(loc, scores, lseMatrix));
-  Value validMatrix = broadcastRow(rewriter, loc, valid, 0,
-                                   tensorTy({G, BN}, rewriter.getI1Type()));
+  Value validRow = rewriter.create<triton::ExpandDimsOp>(
+      loc, tensorTy({1, BN}, rewriter.getI1Type()), valid, 0);
+  Value validMatrix = rewriter.create<triton::BroadcastOp>(
+      loc, tensorTy({G, BN}, rewriter.getI1Type()), validRow);
   Value pMasked =
       rewriter.create<arith::SelectOp>(loc, validMatrix, pExp, zeroScores);
-  Value weightMatrix =
-      broadcastRow(rewriter, loc, tokenCounts, 0, tensorTy({G, BN}, f32));
-  Value pWeighted = rewriter.create<arith::MulFOp>(loc, pMasked, weightMatrix);
+  Value weightMatrix = rewriter.create<triton::BroadcastOp>(
+      loc, tensorTy({G, BN}, f32),
+      rewriter.create<triton::ExpandDimsOp>(loc, tensorTy({1, BN}, f32),
+                                            tokenCounts, 0));
+  Value pWeighted =
+      rewriter.create<arith::MulFOp>(loc, pMasked, weightMatrix);
 
   // dp = dot(dO, v): a fresh matmul, not an accumulation into state.
-  Value dp =
-      buildDot(rewriter, loc, tensorTy({G, BN}, f32), candidate.valueDot.getA(),
-               bV, zeroScores, candidate.valueDot);
-  Value deltaMatrix =
-      broadcastRow(rewriter, loc, candidate.additiveState.deltaVec, 1,
-                   tensorTy({G, BN}, f32));
+  Value dp = buildDot(rewriter, loc, tensorTy({G, BN}, f32),
+                      candidate.valueDot.getA(), bV, zeroScores,
+                      candidate.valueDot);
+  Value deltaMatrix = rewriter.create<triton::BroadcastOp>(
+      loc, tensorTy({G, BN}, f32),
+      rewriter.create<triton::ExpandDimsOp>(loc, tensorTy({G, 1}, f32),
+                                            candidate.deltaVec, 1));
   Value ds = rewriter.create<arith::MulFOp>(
-      loc, pWeighted, rewriter.create<arith::SubFOp>(loc, dp, deltaMatrix));
+      loc, pWeighted,
+      rewriter.create<arith::SubFOp>(loc, dp, deltaMatrix));
 
   // ds enters the accumulation dot in its input type; the baseline
   // truncates in the same place (one rounding of p*w*(dp-delta)).
-  Value dsCast = castLikeDotLhs(rewriter, loc, ds,
-                                candidate.additiveState.accDot, {G, BN});
+  Type dsElem = cast<RankedTensorType>(candidate.accDot.getA().getType())
+                    .getElementType();
+  Value dsCast = ds;
+  if (dsElem != f32) {
+    Type dsType = tensorTy({G, BN}, dsElem);
+    if (isa<arith::ExtFOp>(candidate.accDot.getA().getDefiningOp()))
+      dsCast = rewriter.create<arith::ExtFOp>(loc, dsType, ds);
+    else
+      dsCast = rewriter.create<arith::TruncFOp>(loc, dsType, ds);
+  }
 
   // k^T with the baseline's own order: the position of the token axis is
   // semantic, so a hard-coded [1, 0] would transpose the wrong axis for an
   // equivalent spelling.
   auto kTileType = cast<RankedTensorType>(bK.getType());
   SmallVector<int64_t> transShape;
-  for (int32_t axis : candidate.additiveState.transpose.getOrder())
+  for (int32_t axis : candidate.transpose.getOrder())
     transShape.push_back(kTileType.getShape()[axis]);
   Value kT = rewriter.create<triton::TransOp>(
-      loc, RankedTensorType::get(transShape, kTileType.getElementType()), bK,
-      candidate.additiveState.transpose.getOrder());
+      loc, RankedTensorType::get(transShape, kTileType.getElementType()),
+      bK, candidate.transpose.getOrder());
 
   Value accNew = buildDot(rewriter, loc, stateType, dsCast, kT, accArg,
-                          candidate.additiveState.accDot);
+                          candidate.accDot);
   rewriter.setInsertionPointToEnd(scan.getBody());
   rewriter.create<scf::YieldOp>(loc, accNew);
 }
@@ -2211,7 +2474,10 @@ static LogicalResult runSandboxStructuralCleanup(ModuleOp sandbox) {
 class SelectedBlockScanPlan final : public RewritePlan {
   ScanCandidate candidate;
   unsigned epoch;
-  // The accepted sandbox: what canQueryRowBatch() accepted, committed as is.
+  // 已接受并自行验证过的沙箱：里面既有规则 A 的扫描重建，也可能已有规则 B
+  // 的行提升与启动契约。
+  // The accepted sandbox: it already carries Rule A's scan rebuild and, when the
+  // joint gate ran, Rule B's row lifting and launch contract.
   OwningOpRef<ModuleOp> prepared;
 
   SelectedBlockScanPlan(ScanCandidate candidate, unsigned epoch,
@@ -2250,12 +2516,34 @@ public:
   }
 
   LogicalResult apply(IRRewriter &rewriter) override {
-    // Commit only: the verified sandbox body replaces the function body. This
-    // cannot fail, which is the contract the shared driver relies on. No
-    // module attribute is added or removed, and no cleanup runs here.
+    // 沙箱已经通过 verify；这里只做提交。运行期网格时规则 B 会追加隐藏的
+    // extent 参数，因此必须连函数签名一起换，不能只 takeBody。
+    // Commit only: the sandbox is already verified.  A runtime grid makes Rule B
+    // append hidden extent arguments, so the function signature has to travel
+    // with the body instead of a plain takeBody.
     static_cast<void>(rewriter);
     auto replacement = cast<triton::FuncOp>(&prepared->getBody()->front());
+    ModuleOp preparedModule = *prepared;
+    ModuleOp module = candidate.function->getParentOfType<ModuleOp>();
+    if (!module)
+      return failure();
+
+    if (preparedModule->hasAttr(kProgramGridTransformsAttr)) {
+      if (failed(commitProgramGridFunctionFromSandbox(candidate.function,
+                                                      replacement)))
+        return failure();
+      module->setAttr(kProgramGridTransformsAttr,
+                      preparedModule->getAttr(kProgramGridTransformsAttr));
+      return success();
+    }
+
     candidate.function.getBody().takeBody(replacement.getBody());
+    for (StringLiteral name :
+         {StringLiteral("hacc.coalesce_factor"),
+          StringLiteral("hacc.coalesce_axis"),
+          StringLiteral("hacc.coalesce_grid_ceil_div")})
+      if (preparedModule->hasAttr(name))
+        module->setAttr(name, preparedModule->getAttr(name));
     return success();
   }
 
@@ -2263,7 +2551,8 @@ public:
   // unsupported rewrite must leave the input and its diagnostics untouched;
   // declining returns nullptr and never fails apply().
   static std::unique_ptr<SelectedBlockScanPlan>
-  create(const ScanCandidate &candidate, unsigned epoch, bool forceApply) {
+  create(const ScanCandidate &candidate, unsigned epoch, bool forceApply,
+         bool queryRowBatchingEnabled, const ResourceSnapshot &resources) {
     // The tablegen accessors used below are not const-qualified in this tree,
     // so work on a local mutable copy of the function.
     triton::FuncOp function = candidate.function;
@@ -2289,8 +2578,9 @@ public:
     IRRewriter rewriter(module.getContext());
     ScopedDiagnosticHandler diagnostics(
         module.getContext(), [](Diagnostic &diag) {
-          LLVM_DEBUG(llvm::dbgs() << "selected-block-scan: skipped candidate: "
-                                  << diag << "\n");
+          LLVM_DEBUG(llvm::dbgs()
+                     << "selected-block-scan: skipped candidate: " << diag
+                     << "\n");
           return success();
         });
     if (!buildSelectedBlockScan(rewriter, *sandboxCandidate))
@@ -2304,21 +2594,29 @@ public:
     if (failed(verify(*sandbox)))
       return nullptr;
 
-    // Joint decision: the rewrite lands only when Rule B accepts the
-    // rewritten sandbox. `canQueryRowBatch` is a pure matcher, so a decline
-    // leaves the real IR byte-identical and produces no diagnostic. A plain
-    // bool is enough: the accepted sandbox IS the body apply() commits. The
-    // force-apply escape hatch short-circuits ONLY this consult, never the
-    // structural match, cleanup or verification above.
+    // 联合决策：只有规则 B 的规则位也打开时，才允许 A 在沙箱里连带完成 B 的
+    // 行提升。materialize 就地重写并 verify，失败即整个计划作废；成功则沙箱
+    // 里已经有 B 的改写与启动契约，apply() 只需把沙箱提交回去。
+    // Joint decision: Rule A may only run Rule B's row lifting when Rule B's bit
+    // is opted in as well.  `materialize...` rewrites and verifies in place, so a
+    // failure discards the whole plan, and success means the sandbox already
+    // carries both rewrites and the launch contract.
     if (!forceApply) {
-      if (!canQueryRowBatch(cloned)) {
+      if (!queryRowBatchingEnabled) {
+        LLVM_DEBUG(llvm::dbgs() << "selected-block-scan: rule B bit is off, "
+                                   "declining @"
+                                << function.getName() << "\n");
+        return nullptr;
+      }
+      if (failed(materializeQueryRowBatchingCandidate(*sandbox, cloned,
+                                                      resources))) {
         LLVM_DEBUG(llvm::dbgs() << "selected-block-scan: joint query-row "
-                                   "batching gate declined @"
+                                   "batching materialization declined @"
                                 << function.getName() << "\n");
         return nullptr;
       }
       LLVM_DEBUG(llvm::dbgs() << "selected-block-scan: joint query-row "
-                                 "batching gate accepted @"
+                                 "batching materialized @"
                               << function.getName() << "\n");
     } else {
       LLVM_DEBUG(llvm::dbgs() << "selected-block-scan: force-apply bypasses "
@@ -2333,17 +2631,21 @@ public:
 
 class SelectedBlockScanRule final : public GraphOptimizationRule {
   bool forceApply;
+  bool queryRowBatchingEnabled;
 
 public:
   explicit SelectedBlockScanRule(const SelectedBlockScanRuleOptions &options)
-      : forceApply(options.forceApply) {}
+      : forceApply(options.forceApply),
+        queryRowBatchingEnabled(options.queryRowBatchingEnabled) {}
 
   GraphOptimizationRuleId getId() const override {
     return GraphOptimizationRuleId::SelectedBlockScan;
   }
 
+  // 规则 A 需要 L0 预算快照，转交给规则 B 的 materialize 使用。
+  // Rule A forwards the L0 budget snapshot to Rule B's materialize entry.
   AnalysisRequirement getAnalysisRequirements() const override {
-    return AnalysisRequirement::None;
+    return AnalysisRequirement::ResourceCost;
   }
 
   LogicalResult findCandidates(
@@ -2356,14 +2658,16 @@ public:
     if (!candidate)
       return success();
 
-    LLVM_DEBUG(llvm::dbgs() << "selected-block-scan: matched gather loop in @"
-                            << candidate->function.getName()
-                            << " (BS=" << candidate->blockSize
-                            << " BN=" << candidate->scanTileWidth
-                            << " S=" << candidate->tableLength << ")\n");
+    LLVM_DEBUG(llvm::dbgs()
+               << "selected-block-scan: matched gather loop in @"
+               << candidate->function.getName()
+               << " (BS=" << candidate->blockSize
+               << " BN=" << candidate->scanTileWidth
+               << " S=" << candidate->tableLength << ")\n");
 
     if (auto plan = SelectedBlockScanPlan::create(
-            *candidate, context.getEpoch(), forceApply))
+            *candidate, context.getEpoch(), forceApply, queryRowBatchingEnabled,
+            context.getResourceCostAnalysis().getResourceSnapshot()))
       plans.push_back(std::move(plan));
     return success();
   }
