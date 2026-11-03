@@ -77,10 +77,12 @@ using namespace triton;
 using namespace cfg;
 
 // Joint Rule A + Rule B decision point: Rule A does not consult a read-only
-// matcher any more.  It hands its private sandbox to
-// `cfg::materializeQueryRowBatchingCandidate`, which rewrites Rule B's row
-// lifting in place and verifies the result.  Landing the sandbox therefore
-// means both rewrites are already in it; a failure means neither lands.
+// matcher.  It hands its private sandbox to the one Rule B entry declared in
+// QueryRowBatching.h, `cfg::materializeQueryRowBatchingCandidate`, which
+// rewrites Rule B's row lifting in place and verifies the result.  Landing the
+// sandbox therefore means both rewrites are already in it; a failure means
+// neither lands.  There is no separate enable flag: Rule B's own implementation
+// is the gate, so the scheduled path and this path cannot diverge.
 //
 // This replaced the old `cfg::canQueryRowBatch` pure matcher: querying without
 // rewriting left a window where Rule A could commit and Rule B then fail, and
@@ -104,8 +106,7 @@ static bool isZeroSplatConstant(Value v) {
     if (auto dense = dyn_cast<DenseFPElementsAttr>(def.getValue()))
       return dense.isSplat() && dense.getSplatValue<APFloat>().isZero();
     if (auto denseInt = dyn_cast<DenseIntElementsAttr>(def.getValue()))
-      return denseInt.isSplat() &&
-             denseInt.getSplatValue<APInt>().isZero();
+      return denseInt.isSplat() && denseInt.getSplatValue<APInt>().isZero();
   }
   return false;
 }
@@ -128,14 +129,12 @@ static bool isNegativeInfSplatConstant(Value v) {
       return dense.isSplat() && dense.getSplatValue<APFloat>().isInfinity() &&
              dense.getSplatValue<APFloat>().isNegative();
     if (auto scalar = dyn_cast<FloatAttr>(def.getValue()))
-      return scalar.getValue().isInfinity() &&
-             scalar.getValue().isNegative();
+      return scalar.getValue().isInfinity() && scalar.getValue().isNegative();
   }
   if (auto splat = v.getDefiningOp<triton::SplatOp>()) {
     if (auto def = splat.getSrc().getDefiningOp<arith::ConstantOp>())
       if (auto scalar = dyn_cast<FloatAttr>(def.getValue()))
-        return scalar.getValue().isInfinity() &&
-               scalar.getValue().isNegative();
+        return scalar.getValue().isInfinity() && scalar.getValue().isNegative();
   }
   return false;
 }
@@ -161,8 +160,8 @@ static bool dependsOnImpl(Value v, Value pivot, llvm::DenseSet<Value> &visited,
     return false;
   Operation *op = v.getDefiningOp();
   return op && llvm::any_of(op->getOperands(), [&](Value a) {
-    return dependsOnImpl(a, pivot, visited, depth + 1);
-  });
+           return dependsOnImpl(a, pivot, visited, depth + 1);
+         });
 }
 
 static bool dependsOn(Value v, Value pivot) {
@@ -192,6 +191,38 @@ static bool dependsOnExcludingImpl(Value v, Value pivot, Operation *cut,
 static bool dependsOnExcluding(Value v, Value pivot, Operation *cut) {
   llvm::DenseSet<Value> visited;
   return dependsOnExcludingImpl(v, pivot, cut, visited, 0);
+}
+
+// Dependence with the index load cut out AND every loop-invariant scalar load
+// treated as an opaque per-program constant. That is the varlen spelling: the
+// in-sequence row position and the sequence bases are read before the loop, so
+// every value "depends" on the program id only through those load addresses.
+static bool dependsOnExcludingOpaqueImpl(Value v, Value pivot, Operation *cut,
+                                         scf::ForOp loop,
+                                         llvm::DenseSet<Value> &visited,
+                                         unsigned depth) {
+  if (v == pivot)
+    return true;
+  if (depth > kMaxDependenceDepth)
+    return true; // too deep: assume dependence
+  Operation *op = v.getDefiningOp();
+  if (!op || op == cut)
+    return false;
+  if (isa<triton::LoadOp>(op) && !loop->isAncestor(op) &&
+      !isa<RankedTensorType>(v.getType()))
+    return false; // loop-invariant scalar load: a per-program constant
+  if (!visited.insert(v).second)
+    return false;
+  return llvm::any_of(op->getOperands(), [&](Value a) {
+    return dependsOnExcludingOpaqueImpl(a, pivot, cut, loop, visited,
+                                        depth + 1);
+  });
+}
+
+static bool dependsOnExcludingOpaque(Value v, Value pivot, Operation *cut,
+                                     scf::ForOp loop) {
+  llvm::DenseSet<Value> visited;
+  return dependsOnExcludingOpaqueImpl(v, pivot, cut, loop, visited, 0);
 }
 
 // A splat/expand_dims/broadcast chain down to the pivot.
@@ -233,6 +264,32 @@ static bool reachesLoad(Value v) {
 static bool isDefinedOutsideLoop(Value v, scf::ForOp loop) {
   Operation *op = v.getDefiningOp();
   return !op || !loop->isAncestor(op);
+}
+
+// True when the value's defining chain crosses a load that is executed *inside*
+// the loop. Loads defined outside the loop are per-program constants (the
+// varlen dispatch reads token_indices_q / cu_seqlens before the loop) and are
+// allowed.
+static bool reachesLoopInteriorLoadImpl(Value v, scf::ForOp loop,
+                                        llvm::DenseSet<Value> &visited,
+                                        unsigned depth) {
+  if (depth > kMaxDependenceDepth)
+    return true; // too deep: assume it reaches a load
+  Operation *op = v.getDefiningOp();
+  if (!op)
+    return false;
+  if (isa<triton::LoadOp>(op))
+    return loop->isAncestor(op);
+  if (!visited.insert(v).second)
+    return false;
+  return llvm::any_of(op->getOperands(), [&](Value a) {
+    return reachesLoopInteriorLoadImpl(a, loop, visited, depth + 1);
+  });
+}
+
+static bool reachesLoopInteriorLoad(Value v, scf::ForOp loop) {
+  llvm::DenseSet<Value> visited;
+  return reachesLoopInteriorLoadImpl(v, loop, visited, 0);
 }
 
 // ---- Spelling and shape recognition ----
@@ -336,18 +393,33 @@ static Value matchRowPosition(Value v, Value pid, scf::ForOp loop) {
   if (stripped == pid)
     return pid;
   auto add = stripped.getDefiningOp<arith::AddIOp>();
-  if (!add)
-    return Value();
-  Value lhs = stripIntegerCasts(add.getLhs());
-  Value rhs = stripIntegerCasts(add.getRhs());
-  Value offset;
-  if (lhs == pid)
-    offset = rhs;
-  else if (rhs == pid)
-    offset = lhs;
-  else
-    return Value();
-  if (!isDefinedOutsideLoop(offset, loop) || reachesLoad(offset))
+  if (add) {
+    Value lhs = stripIntegerCasts(add.getLhs());
+    Value rhs = stripIntegerCasts(add.getRhs());
+    Value offset;
+    if (lhs == pid)
+      offset = rhs;
+    else if (rhs == pid)
+      offset = lhs;
+    if (offset) {
+      // The offset may itself be load-derived as long as it is loop-invariant:
+      // the varlen dispatch derives Q_OFFSET = TK - TQ from the cu_seqlens
+      // loads before the loop, and the rewrite only needs ONE loop-invariant
+      // scalar shared by the causal mask, the table row base and the scan
+      // bound.
+      if (!isDefinedOutsideLoop(offset, loop))
+        return Value();
+      return stripped;
+    }
+  }
+  // The varlen dispatch never advances the program id: the in-sequence query
+  // position is a *loaded* value (token_indices_q), so the row position is an
+  // arbitrary loop-invariant integer scalar rather than pid (+offset). Accept
+  // it; the three-way identity checks (block guard, table row base, causal
+  // mask) still require the very same SSA value in all three uses, and the
+  // builder's bound is that value, so the scan cannot drift from the guard.
+  if (!isa<IntegerType>(stripped.getType()) ||
+      !isDefinedOutsideLoop(stripped, loop))
     return Value();
   return stripped;
 }
@@ -399,15 +471,15 @@ static Operation *getReduceCombiner(triton::ReduceOp reduce) {
 // The token-range term is the only guard against reading past the row's token
 // count, so the bound is captured here and reproduced verbatim by the builder.
 struct AddPtrTile {
-  Value base;               // scalar pointer, loop-invariant and load-free
-  Value freeVec;            // [F] integer vector, loop-invariant
-  Value freeBoundRhs;       // [F,1] tensor the free-axis mask compares against
-  Value tokenBound;         // scalar bound of the "tokens < T" mask
-  Value blockStart;         // idx*BS: the value the causal mask also uses
-  Type tokenType;           // width of the token arithmetic (i32 or i64)
-  int64_t tokenStride = 0;  // stride of one token along the address
-  int64_t freeExtent = 0;   // F, the tile's free-axis extent
-  int64_t blockSize = 0;    // BS, the tile's token extent
+  Value base;              // scalar pointer, loop-invariant and load-free
+  Value freeVec;           // [F] integer vector, loop-invariant
+  Value freeBoundRhs;      // [F,1] tensor the free-axis mask compares against
+  Value tokenBound;        // scalar bound of the "tokens < T" mask
+  Value blockStart;        // idx*BS: the value the causal mask also uses
+  Type tokenType;          // width of the token arithmetic (i32 or i64)
+  int64_t tokenStride = 0; // stride of one token along the address
+  int64_t freeExtent = 0;  // F, the tile's free-axis extent
+  int64_t blockSize = 0;   // BS, the tile's token extent
 };
 
 struct AdditiveState {
@@ -435,10 +507,14 @@ struct ScanCandidate {
   // fwd kernel).  Every causal use of the row position reads this value.
   Value rowPosition;
 
-  // The index-table row base; loop-invariant, i64 pointee in production.
+  // The index-table row base; loop-invariant, i64 pointee in production.  Null
+  // when the front end folded the row advance into the in-loop offset: then the
+  // rewrite rebuilds the row base from tableRoot + tableRowOffset.
   Value tableBase;
-  int64_t tableLength = 0;  // S, from the i_h*S multiplier of the row base
-  int64_t blockSize = 0;    // BS, the idx multiplier
+  Value tableRoot;           // the pointer the row base is offset from
+  Value tableRowOffset;      // loop-invariant query/token offset of the row
+  int64_t tableLength = 0;   // S, from the i_h*S multiplier of the row base
+  int64_t blockSize = 0;     // BS, the idx multiplier
   int64_t scanTileWidth = 0; // BN = max(64, BS)
   int64_t blocksPerTile = 0; // R = BN / BS
   Value scanBound;           // the old trip count == NS (constant or opaque)
@@ -473,14 +549,13 @@ struct ScanCandidate {
   triton::TransOp transpose; // additive: k^T, order replayed verbatim
   AddPtrTile kTile;          // additive: the two addptr tile addresses
   AddPtrTile vTile;
-  Value lseVec;              // additive: [G] f32, loop-invariant
-  Value deltaVec;            // additive: [G] f32, loop-invariant
+  Value lseVec;   // additive: [G] f32, loop-invariant
+  Value deltaVec; // additive: [G] f32, loop-invariant
 };
 
 static bool sameScanCandidate(const ScanCandidate &a, const ScanCandidate &b) {
   return a.additive == b.additive && a.tableLength == b.tableLength &&
-         a.blockSize == b.blockSize &&
-         a.scanTileWidth == b.scanTileWidth &&
+         a.blockSize == b.blockSize && a.scanTileWidth == b.scanTileWidth &&
          a.blocksPerTile == b.blocksPerTile;
 }
 
@@ -505,7 +580,13 @@ struct ScanMatchContext {
 
   // matchIndexTable.
   triton::LoadOp indexLoad;
+  // The row base of the index table.  Null when the front end folded the row
+  // advance into the in-loop offset (spelling (b) below); in that case only the
+  // root pointer and the loop-invariant row offset exist as SSA values and the
+  // builder re-creates the row base from them.
   Value tableBase;
+  Value tableRoot;
+  Value tableRowOffset;
   int64_t tableLength = 0;
   Value pid;
   // matchBlockGuard: pid, or pid advanced by a loop-invariant offset.
@@ -592,16 +673,24 @@ static bool matchLoopSkeleton(ScanMatchContext &ctx) {
       getConstantIntValue(loop.getStep()) != std::optional<int64_t>(1))
     return false;
 
-  // At most one scalar load outside the loop. The dense production path has
-  // zero; the dyn-NS path has exactly one (the block_counts read, which must
-  // survive the rewrite); a varlen dispatch has five and is declined.
+  // Scalar loads outside the loop: the dense production path has zero (or one,
+  // for the dyn-NS block_counts read, which must survive the rewrite); a varlen
+  // dispatch has six (2 token_indices_q + 2 cu_seqlens_q + 2 cu_seqlens_k).
+  // Both combine in the production varlen dispatch -- varlen AND block_counts
+  // -- where block_counts adds one more: the budget must be the varlen prefix
+  // plus that read (7), otherwise the whole varlen+block_counts path is
+  // rejected here before matchIndexTable ever runs.  They are all
+  // loop-invariant and the rewrite keeps them untouched -- the loop-interior
+  // scalar-load budget is enforced separately by matchIndexTable, so this gate
+  // is only a cheap upper bound.
+  constexpr unsigned kMaxOutsideScalarLoads = 7;
   unsigned outsideScalarLoads = 0;
   fn.walk([&](triton::LoadOp load) {
     if (!load->getParentOfType<scf::ForOp>() &&
         !isa<RankedTensorType>(load.getType()))
       ++outsideScalarLoads;
   });
-  if (outsideScalarLoads > 1)
+  if (outsideScalarLoads > kMaxOutsideScalarLoads)
     return false;
   ctx.numCarried = numCarried;
   ctx.additive = additive;
@@ -609,6 +698,23 @@ static bool matchLoopSkeleton(ScanMatchContext &ctx) {
 }
 
 // The index-table read, the row base and the table length S.
+//
+// True when the function still computes a head index `i_bh % H` with H > 1. The
+// remainder survives constant folding exactly when the divisor is greater than
+// one, so its absence is the layout's own statement that H == 1 -- the fact
+// matchIndexTable relies on when the i_h*S addend of the row base is missing.
+static bool hasHeadSplittingRemainder(triton::FuncOp fn) {
+  bool found = false;
+  fn.walk([&](Operation *op) {
+    if (found || !isa<arith::RemUIOp, arith::RemSIOp>(op))
+      return;
+    if (std::optional<int64_t> divisor = getConstantIntValue(op->getOperand(1));
+        divisor && *divisor > 1)
+      found = true;
+  });
+  return found;
+}
+
 static bool matchIndexTable(ScanMatchContext &ctx) {
   triton::FuncOp fn = ctx.fn;
   scf::ForOp loop = ctx.loop;
@@ -634,10 +740,47 @@ static bool matchIndexTable(ScanMatchContext &ctx) {
   auto indexAddPtr = indexLoad.getPtr().getDefiningOp<triton::AddPtrOp>();
   if (!indexAddPtr)
     return false;
-  tableBase = indexAddPtr.getPtr();
+  // Resolve the (table root, row offset, per-iteration advance) triple.  Two
+  // spellings of the same address occur in production and differ only in
+  // whether the loop-invariant row advance kept its own addptr:
+  //   (a) tt.addptr %rowBase, %iv, with %rowBase = tt.addptr %root, %rowOff
+  //       -- dense fwd/bwd; the front end hoisting the row advance out of the
+  //       loop keeps it a separate SSA value.
+  //   (b) tt.addptr %root, (arith.addi %rowOff, %iv)
+  //       -- bwd dq's dyn-NS path (i64 induction variable): the row offset is
+  //       folded into the in-loop address, so there is NO row-base addptr.
+  // Accepting only (a) made the block_counts production path of the bwd dq
+  // kernel unmatchable even though the address is the same.  Spelling (b) has
+  // no row-base SSA value, so the rewrite re-creates it from the root and that
+  // offset (see buildScanPrologue).
+  Value outerBase = indexAddPtr.getPtr();
+  Value advance = indexAddPtr.getOffset();
+  Value rowBase;   // null only for spelling (b)
+  Value rowOffset; // loop-invariant query/token offset of the table row
+  if (auto outerAddPtr = outerBase.getDefiningOp<triton::AddPtrOp>()) {
+    rowBase = outerBase;
+    ctx.tableRoot = outerAddPtr.getPtr();
+    rowOffset = outerAddPtr.getOffset();
+  } else if (auto offsetAdd = advance.getDefiningOp<arith::AddIOp>()) {
+    Value induction = loop.getInductionVar();
+    auto lhs = asAffineInIv(offsetAdd.getLhs(), induction);
+    auto rhs = asAffineInIv(offsetAdd.getRhs(), induction);
+    const bool lhsIsIv = lhs && lhs->scale == 1 && lhs->bias == 0;
+    const bool rhsIsIv = rhs && rhs->scale == 1 && rhs->bias == 0;
+    // Exactly one addend is the induction variable itself and the other is the
+    // loop-invariant row offset; two iv-dependent addends are not this pattern.
+    if (lhsIsIv == rhsIsIv)
+      return false;
+    rowOffset = lhsIsIv ? offsetAdd.getRhs() : offsetAdd.getLhs();
+    advance = lhsIsIv ? offsetAdd.getLhs() : offsetAdd.getRhs();
+    ctx.tableRoot = outerBase;
+  } else {
+    return false; // a flat table read has no row base to anchor the rewrite
+  }
+  ctx.tableRowOffset = rowOffset;
   // The table entries must be wide enough for the i32 token arithmetic below;
   // production index tables are i64.
-  auto tablePtrType = dyn_cast<triton::PointerType>(tableBase.getType());
+  auto tablePtrType = dyn_cast<triton::PointerType>(ctx.tableRoot.getType());
   if (!tablePtrType)
     return false;
   auto tableElem = dyn_cast<IntegerType>(tablePtrType.getPointeeType());
@@ -645,18 +788,18 @@ static bool matchIndexTable(ScanMatchContext &ctx) {
     return false;
   // The rewrite merges the per-iteration loads into one vector read, so a
   // masked, "other"-padded or volatile entry load is not this pattern.
-  if (indexLoad.getMask() || indexLoad.getOther() ||
-      indexLoad.getIsVolatile())
+  if (indexLoad.getMask() || indexLoad.getOther() || indexLoad.getIsVolatile())
     return false;
-  if (!isDefinedOutsideLoop(tableBase, loop))
+  if (!isDefinedOutsideLoop(ctx.tableRoot, loop) ||
+      !isDefinedOutsideLoop(rowOffset, loop))
     return false;
   // The rewrite reads table[0, S) once and indexes it by the iteration
-  // number, so the baseline offset must be exactly the induction variable:
+  // number, so the baseline advance must be exactly the induction variable:
   // an offset a*iv+b would read table[b], table[b+a], ... instead.
-  auto tableOffset = asAffineInIv(indexAddPtr.getOffset(),
-                                  loop.getInductionVar());
+  auto tableOffset = asAffineInIv(advance, loop.getInductionVar());
   if (!tableOffset || tableOffset->scale != 1 || tableOffset->bias != 0)
     return false;
+  tableBase = rowBase;
 
   // The row base is addptr(root, P + i_h*S), where P carries the query
   // position and S is the table length. S cannot be read off a bare constant
@@ -689,10 +832,8 @@ static bool matchIndexTable(ScanMatchContext &ctx) {
       return std::nullopt; // none reaches: not a query-position dependency
     return found;
   };
-  auto rowAddPtr = tableBase.getDefiningOp<triton::AddPtrOp>();
-  if (!rowAddPtr)
-    return false;
-  Value rowOffset = rowAddPtr.getOffset();
+  // rowOffset was resolved above for both spellings of the address; it is the
+  // loop-invariant offset of this row inside block_indices.
   Value slotTerm;
   if (auto offsetAdd = rowOffset.getDefiningOp<arith::AddIOp>()) {
     std::optional<Value> lhsPid = uniquePidReaching(offsetAdd.getLhs());
@@ -714,7 +855,8 @@ static bool matchIndexTable(ScanMatchContext &ctx) {
   if (slotTerm) {
     // The front end may widen the i_h*S term (extsi(muli(i_h, S))), so peel
     // the integer width casts before reading the multiplier.
-    auto mul = dyn_cast<arith::MulIOp>(stripIntegerCasts(slotTerm).getDefiningOp());
+    auto mul =
+        dyn_cast<arith::MulIOp>(stripIntegerCasts(slotTerm).getDefiningOp());
     if (!mul)
       return false;
     std::optional<int64_t> multiplier;
@@ -725,12 +867,39 @@ static bool matchIndexTable(ScanMatchContext &ctx) {
     else
       return false;
   } else {
-    // No i_h*S term (H == 1 collapses the layout): the table length is only
-    // recoverable from a constant trip count.
-    auto trip = getConstantIntValue(loop.getUpperBound());
-    if (!trip)
-      return false;
-    tableLength = *trip;
+    // No i_h*S addend.  The front end spells the row base as
+    //     ((bos + i_t) * H * S) + i_h * S
+    // and the slot addend folds away exactly when H == 1 (i_h = i_bh % H
+    // becomes 0), in which case the row stride H*S IS the table length S, so
+    // the constant multiplier of the pid-carrying term can stand in for it.
+    //
+    // That reading is only sound under H == 1: with H > 1 the very same
+    // constant is H*S, and a vector read of that width would run past the row
+    // into the next head's (or past the end of block_indices).  The layout
+    // states H itself -- the kernel derives the head index as `i_bh % H`, and
+    // that remainder survives constant folding exactly when H > 1 -- so:
+    //   * constant trip count: keep the old anchor, S = trip (no assumption
+    //     about H at all, and it is cross-checked against the multiplier term
+    //     below when one exists);
+    //   * dynamic trip count: read S off the multiplier, but only when the
+    //     function carries no head split, i.e. H == 1.
+    if (auto trip = getConstantIntValue(loop.getUpperBound())) {
+      tableLength = *trip;
+    } else {
+      if (hasHeadSplittingRemainder(fn))
+        return false;
+      auto mul =
+          dyn_cast<arith::MulIOp>(stripIntegerCasts(rowOffset).getDefiningOp());
+      if (!mul)
+        return false;
+      std::optional<int64_t> multiplier;
+      if ((multiplier = getConstantIntValue(mul.getRhs())))
+        tableLength = *multiplier;
+      else if ((multiplier = getConstantIntValue(mul.getLhs())))
+        tableLength = *multiplier;
+      else
+        return false;
+    }
   }
   // S is the STATIC row length of the index table: the host passes
   // block_indices as [i_h, S], so the i_h*S multiplier of the row base IS S.
@@ -777,8 +946,7 @@ static bool matchBlockGuard(ScanMatchContext &ctx) {
     }
   if (guards != 1)
     return false;
-  auto predicateAnd =
-      branch.getCondition().getDefiningOp<arith::AndIOp>();
+  auto predicateAnd = branch.getCondition().getDefiningOp<arith::AndIOp>();
   if (!predicateAnd)
     return false;
   rawIndex = indexLoad.getResult();
@@ -885,9 +1053,8 @@ static bool matchCarriedState(ScanMatchContext &ctx) {
   if (!thenYield || thenYield->getNumOperands() != numCarried)
     return false;
   if (!additive) {
-    if (!matchOnlineSoftmaxState(loop, branch, thenYield, oIdx,
-                                 mIdx, lIdx, scoreDot, valueDot,
-                                 maskSelect))
+    if (!matchOnlineSoftmaxState(loop, branch, thenYield, oIdx, mIdx, lIdx,
+                                 scoreDot, valueDot, maskSelect))
       return false;
   } else {
     // The recurrence is read backwards from the dot that accumulates into the
@@ -913,13 +1080,29 @@ static bool matchDotOperands(ScanMatchContext &ctx) {
   // Every dot lhs is query-row dependent (axis 0), every rhs is not.
   // Dependence through the per-iteration index load does not count: it is
   // exactly what the rewrite removes. Only axis-x dependence is considered.
-  if (!dependsOnExcluding(scoreDot.getA(), pid, indexLoad))
+  //
+  // The varlen dispatch loads the in-sequence row position (token_indices_q),
+  // so every value depends on the program id only through loop-invariant loads
+  // and the lhs/rhs split degenerates. There the two "lhs must depend"
+  // assertions are dropped and the loads are treated as per-program constants;
+  // the causal identity check (matchCausalMask) still pins rowPosition to the
+  // same SSA value used by the block guard and the scan bound, and the rhs
+  // "must not depend" assertions still hold (the K/V tiles' pid dependence is,
+  // again, only through those opaque loads).
+  const bool rowFromLoad = ctx.rowPosition && reachesLoad(ctx.rowPosition);
+  auto depends = [&](Value v) {
+    return rowFromLoad ? dependsOnExcludingOpaque(v, pid, indexLoad, loop)
+                       : dependsOnExcluding(v, pid, indexLoad);
+  };
+  if (!rowFromLoad) {
+    if (!depends(scoreDot.getA()))
+      return false;
+    if (!depends(valueDot.getA()))
+      return false;
+  }
+  if (depends(scoreDot.getB()))
     return false;
-  if (dependsOnExcluding(scoreDot.getB(), pid, indexLoad))
-    return false;
-  if (!dependsOnExcluding(valueDot.getA(), pid, indexLoad))
-    return false;
-  if (dependsOnExcluding(valueDot.getB(), pid, indexLoad))
+  if (depends(valueDot.getB()))
     return false;
   // The score dot's lhs is Q, loaded and scaled outside the loop, so the
   // rewrite can reuse the operand verbatim.
@@ -1048,14 +1231,16 @@ static bool matchTiles(ScanMatchContext &ctx) {
     if (!kTokenOffset || !kTokenOffset.getType().isInteger(32) ||
         !vTokenOffset.getType().isInteger(32))
       return false;
-    // No load may appear anywhere in the K/V address chains (base, view
-    // shape, strides, non-token offsets).
+    // No load may feed a *loop-interior* address expression. A loop-invariant
+    // operand may be load-derived: the varlen dispatch folds the sequence base
+    // (bos_k) into the K/V pointer before the loop, and the rewrite reuses that
+    // value verbatim.
     auto checkAddressOperand = [&](Value v) -> bool {
-      if (reachesLoad(v))
-        return false;
       Operation *def = v.getDefiningOp();
       if (!def || !loop->isAncestor(def))
-        return true; // defined outside: reused verbatim
+        return true; // defined outside: reused verbatim, even if load-derived
+      if (reachesLoopInteriorLoad(v, loop))
+        return false;
       // The only loop-carried address computation is the sign extension of
       // the dynamic K/V bound; it is loop-invariant and re-created outside.
       auto ext = dyn_cast<arith::ExtSIOp>(def);
@@ -1166,8 +1351,7 @@ static bool matchCausalMask(ScanMatchContext &ctx) {
   {
     arith::CmpIPredicate pred = causalCmp.getPredicate();
     bool pidGreater =
-        (pred == arith::CmpIPredicate::sge &&
-         pidSide == causalCmp.getLhs()) ||
+        (pred == arith::CmpIPredicate::sge && pidSide == causalCmp.getLhs()) ||
         (pred == arith::CmpIPredicate::sle && pidSide == causalCmp.getRhs());
     if (!pidGreater)
       return false;
@@ -1263,7 +1447,7 @@ static std::optional<ScanCandidate> matchSelectedBlockScan(triton::FuncOp fn) {
   ctx.fn = fn;
   auto check = [&](const char *stage, bool ok) {
     LLVM_DEBUG(if (!ok) llvm::dbgs()
-                   << "selected-block-scan: stage " << stage << " declined\n");
+               << "selected-block-scan: stage " << stage << " declined\n");
     return ok;
   };
   if (!check("skeleton", matchLoopSkeleton(ctx)) ||
@@ -1284,6 +1468,8 @@ static std::optional<ScanCandidate> matchSelectedBlockScan(triton::FuncOp fn) {
   candidate.pid = ctx.pid;
   candidate.rowPosition = ctx.rowPosition ? ctx.rowPosition : ctx.pid;
   candidate.tableBase = ctx.tableBase;
+  candidate.tableRoot = ctx.tableRoot;
+  candidate.tableRowOffset = ctx.tableRowOffset;
   candidate.tableLength = ctx.tableLength;
   candidate.blockSize = ctx.blockSize;
   candidate.scanTileWidth = ctx.scanTileWidth;
@@ -1716,15 +1902,14 @@ template <typename CombineOp>
 static Value buildReduce(IRRewriter &rewriter, Location loc, Value input,
                          int32_t axis) {
   auto tensor = cast<RankedTensorType>(input.getType());
-  auto reduce = rewriter.create<triton::ReduceOp>(
-      loc, ValueRange{input}, static_cast<int>(axis));
+  auto reduce = rewriter.create<triton::ReduceOp>(loc, ValueRange{input},
+                                                  static_cast<int>(axis));
   Block &combine = reduce.getCombineOp().emplaceBlock();
   combine.addArguments({tensor.getElementType(), tensor.getElementType()},
                        {loc, loc});
   rewriter.setInsertionPointToStart(&combine);
-  Value combined =
-      rewriter.create<CombineOp>(loc, combine.getArgument(0),
-                                 combine.getArgument(1));
+  Value combined = rewriter.create<CombineOp>(loc, combine.getArgument(0),
+                                              combine.getArgument(1));
   rewriter.create<triton::ReduceReturnOp>(loc, ValueRange{combined});
   rewriter.setInsertionPointAfter(reduce.getOperation());
   return reduce->getResult(0);
@@ -1736,9 +1921,9 @@ static Value buildReduce(IRRewriter &rewriter, Location loc, Value input,
 static Value buildDot(IRRewriter &rewriter, Location loc, Type resultType,
                       Value a, Value b, Value c, Operation *original) {
   SmallVector<Value> operands{a, b, c};
-  Operation *dot = rewriter.create(loc, original->getName().getIdentifier(),
-                                   operands, TypeRange{resultType},
-                                   original->getAttrs());
+  Operation *dot =
+      rewriter.create(loc, original->getName().getIdentifier(), operands,
+                      TypeRange{resultType}, original->getAttrs());
   return dot->getResult(0);
 }
 
@@ -1748,49 +1933,70 @@ static Value buildDot(IRRewriter &rewriter, Location loc, Type resultType,
 // to divsi(pid_x + BN, BN). Only the way the templates consume these values
 // differs.
 struct ScanPrologue {
-  Value starts;         // [S] i32, ids * BS
-  Value slotValid;      // [S] i1, offs < NS
-  Value startsRow;      // [1, S] i32
-  Value slotRow;        // [1, S] i1
-  Value tokensRange;    // [BN] i32, [0, BN)
-  Value pidRow;         // [BN] i32, splat(pid_x)
-  Value bsConstant;     // i32 BS
-  Value zeroTokens;     // [BN] f32 zero
-  Value zeroRows;       // [G] f32 zero, used only by the fwd template
-  Value negInfRows;     // [G] f32 -inf, used only by the fwd template
-  Value scanUpperBound; // i32, the new trip count
-  Value bound64;        // i64 K/V dynamic bound (online-softmax only)
-  Value c0, c1, cBN;    // i32 constants of the new loop
+  int64_t tableWidth = 0; // TW = next_pow2(S), the padded slot axis
+  Value starts;           // [TW] i32, ids * BS
+  Value slotValid;        // [TW] i1, offs < NS
+  Value startsRow;        // [1, TW] i32
+  Value slotRow;          // [1, TW] i1
+  Value tokensRange;      // [BN] i32, [0, BN)
+  Value pidRow;           // [BN] i32, splat(pid_x)
+  Value bsConstant;       // i32 BS
+  Value zeroTokens;       // [BN] f32 zero
+  Value zeroRows;         // [G] f32 zero, used only by the fwd template
+  Value negInfRows;       // [G] f32 -inf, used only by the fwd template
+  Value scanUpperBound;   // i32, the new trip count
+  Value bound64;          // i64 K/V dynamic bound (online-softmax only)
+  Value c0, c1, cBN;      // i32 constants of the new loop
 };
 
-static bool buildScanPrologue(IRRewriter &rewriter,
-                              ScanCandidate &candidate, Type i32, Type i64,
-                              Type f32, int64_t S, int64_t BS, int64_t BN,
-                              int64_t G, ScanPrologue &prologue) {
+static bool buildScanPrologue(IRRewriter &rewriter, ScanCandidate &candidate,
+                              Type i32, Type i64, Type f32, int64_t S,
+                              int64_t BS, int64_t BN, int64_t G,
+                              ScanPrologue &prologue) {
   Location loc = candidate.loop.getLoc();
   auto tensorTy = [](ArrayRef<int64_t> shape, Type elem) {
     return RankedTensorType::get(shape, elem);
   };
-  Value offs = rewriter.create<triton::MakeRangeOp>(loc, tensorTy({S}, i32),
-                                                    0, S);
-  Type tablePtrTensor =
-      tensorTy({S}, candidate.tableBase.getType());
-  Value tablePtrs = rewriter.create<triton::SplatOp>(
-      loc, tablePtrTensor, candidate.tableBase);
-  Value tablePtrVec = rewriter.create<triton::AddPtrOp>(
-      loc, tablePtrTensor, tablePtrs, offs);
+  // The slot axis is padded to TW = next_pow2(S): `tt.make_range` is specified
+  // for power-of-two extents (triton/language/core.py: "end: Must be a power of
+  // two"), while S is just block_indices.shape[-1] and may be any positive
+  // integer.  Padded lanes read a *clamped, in-row* slot (so the read never
+  // leaves the table row) and are neutralized by slot_valid below; therefore no
+  // masked load and no "other" padding value is needed.
+  int64_t TW = 1;
+  while (TW < S)
+    TW <<= 1;
+  prologue.tableWidth = TW;
+  Value offs =
+      rewriter.create<triton::MakeRangeOp>(loc, tensorTy({TW}, i32), 0, TW);
+  Value lastSlot = rewriter.create<arith::ConstantIntOp>(loc, S - 1, 32);
+  Value lastSlotSplat =
+      rewriter.create<triton::SplatOp>(loc, tensorTy({TW}, i32), lastSlot);
+  Value slotIdx = rewriter.create<arith::MinSIOp>(loc, offs, lastSlotSplat);
+  // Spelling (b) of the index address (tt.addptr %root, (addi %rowOff, %iv))
+  // has no row-base addptr to reuse: build it here, next to the vectorized read
+  // that consumes it and outside the loop, so its dominance is the prologue's.
+  Value tableBase = candidate.tableBase;
+  if (!tableBase)
+    tableBase = rewriter.create<triton::AddPtrOp>(
+        loc, candidate.tableRoot.getType(), candidate.tableRoot,
+        candidate.tableRowOffset);
+  Type tablePtrTensor = tensorTy({TW}, tableBase.getType());
+  Value tablePtrs =
+      rewriter.create<triton::SplatOp>(loc, tablePtrTensor, tableBase);
+  Value tablePtrVec = rewriter.create<triton::AddPtrOp>(loc, tablePtrTensor,
+                                                        tablePtrs, slotIdx);
   Value ids = rewriter.create<triton::LoadOp>(
       loc, tablePtrVec, triton::CacheModifier::NONE,
       triton::EvictionPolicy::NORMAL, false);
   Value idsI32 = ids;
   if (cast<RankedTensorType>(ids.getType()).getElementType() != i32)
-    idsI32 = rewriter.create<arith::TruncIOp>(loc, tensorTy({S}, i32), ids);
+    idsI32 = rewriter.create<arith::TruncIOp>(loc, tensorTy({TW}, i32), ids);
 
   // starts = ids * BS, the vectorized old i_s.
-  Value bsConstant =
-      rewriter.create<arith::ConstantIntOp>(loc, BS, 32);
+  Value bsConstant = rewriter.create<arith::ConstantIntOp>(loc, BS, 32);
   Value bsSplat =
-      rewriter.create<triton::SplatOp>(loc, tensorTy({S}, i32), bsConstant);
+      rewriter.create<triton::SplatOp>(loc, tensorTy({TW}, i32), bsConstant);
   Value starts = rewriter.create<arith::MulIOp>(loc, idsI32, bsSplat);
 
   // slot_valid = offs < NS. The old trip count IS NS; when it is a
@@ -1821,7 +2027,7 @@ static bool buildScanPrologue(IRRewriter &rewriter,
                 : rewriter.create<arith::TruncIOp>(loc, i32, nsClamped);
   }
   Value nsSplat =
-      rewriter.create<triton::SplatOp>(loc, tensorTy({S}, i32), nsI32);
+      rewriter.create<triton::SplatOp>(loc, tensorTy({TW}, i32), nsI32);
   Value slotValid = rewriter.create<arith::CmpIOp>(
       loc, arith::CmpIPredicate::slt, offs, nsSplat);
 
@@ -1849,17 +2055,17 @@ static bool buildScanPrologue(IRRewriter &rewriter,
   // Re-create the K/V dynamic bound outside the loop, unfolded.
   Value bound64 = candidate.dynamicBoundResult;
   if (candidate.dynamicBoundInput)
-    bound64 = rewriter.create<arith::ExtSIOp>(loc, i64,
-                                              candidate.dynamicBoundInput);
+    bound64 =
+        rewriter.create<arith::ExtSIOp>(loc, i64, candidate.dynamicBoundInput);
   auto mapAddressOperand = [&](Value v) -> Value {
     return v == candidate.dynamicBoundResult ? bound64 : v;
   };
 
   // Loop-invariant rows of the weight matrix (hoisted ahead of the loop).
   Value startsRow = rewriter.create<triton::ExpandDimsOp>(
-      loc, tensorTy({1, S}, i32), starts, 0);
+      loc, tensorTy({1, TW}, i32), starts, 0);
   Value slotRow = rewriter.create<triton::ExpandDimsOp>(
-      loc, tensorTy({1, S}, rewriter.getI1Type()), slotValid, 0);
+      loc, tensorTy({1, TW}, rewriter.getI1Type()), slotValid, 0);
   Value tokensRange =
       rewriter.create<triton::MakeRangeOp>(loc, tensorTy({BN}, i32), 0, BN);
   Value pidRow =
@@ -1875,11 +2081,10 @@ static bool buildScanPrologue(IRRewriter &rewriter,
       loc, DenseElementsAttr::get(tensorTy({G}, f32),
                                   rewriter.getFloatAttr(f32, 0.0)));
   Value negInfRows = rewriter.create<arith::ConstantOp>(
-      loc,
-      DenseElementsAttr::get(
-          tensorTy({G}, f32),
-          rewriter.getFloatAttr(
-              f32, APFloat::getInf(APFloat::IEEEsingle(), true))));
+      loc, DenseElementsAttr::get(
+               tensorTy({G}, f32),
+               rewriter.getFloatAttr(
+                   f32, APFloat::getInf(APFloat::IEEEsingle(), true))));
 
   prologue.starts = starts;
   prologue.slotValid = slotValid;
@@ -1913,9 +2118,9 @@ struct ScanWeights {
 };
 
 static ScanWeights buildScanWeights(IRRewriter &rewriter, Location loc,
-                                    Type i32, Type f32, int64_t S,
-                                    int64_t BS, int64_t BN, int64_t R,
-                                    Value iv, Value tokenStart,
+                                    Type i32, Type f32, int64_t TW, int64_t BS,
+                                    int64_t BN, int64_t R, Value iv,
+                                    Value tokenStart, Value tokenBound,
                                     const ScanPrologue &prologue) {
   auto tensorTy = [](ArrayRef<int64_t> shape, Type elem) {
     return RankedTensorType::get(shape, elem);
@@ -1930,9 +2135,9 @@ static ScanWeights buildScanWeights(IRRewriter &rewriter, Location loc,
   Value slotMatrix = slotRow;
   if (R == 1) {
     Value blockStartRow = rewriter.create<triton::SplatOp>(
-        loc, tensorTy({1, S}, i32), tokenStart);
-    matchesEq = rewriter.create<arith::CmpIOp>(
-        loc, arith::CmpIPredicate::eq, startsRow, blockStartRow);
+        loc, tensorTy({1, TW}, i32), tokenStart);
+    matchesEq = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
+                                               startsRow, blockStartRow);
   } else {
     Value cR = rewriter.create<arith::ConstantIntOp>(loc, R, 32);
     Value blocksBase = rewriter.create<arith::MulIOp>(loc, iv, cR);
@@ -1944,27 +2149,27 @@ static ScanWeights buildScanWeights(IRRewriter &rewriter, Location loc,
         loc, blocks,
         rewriter.create<triton::SplatOp>(loc, tensorTy({R}, i32), bsConstant));
     Value startsMatrix = rewriter.create<triton::BroadcastOp>(
-        loc, tensorTy({R, S}, i32), startsRow);
+        loc, tensorTy({R, TW}, i32), startsRow);
     Value blockMatrix = rewriter.create<triton::BroadcastOp>(
-        loc, tensorTy({R, S}, i32),
+        loc, tensorTy({R, TW}, i32),
         rewriter.create<triton::ExpandDimsOp>(loc, tensorTy({R, 1}, i32),
                                               blockStarts, 1));
-    matchesEq = rewriter.create<arith::CmpIOp>(
-        loc, arith::CmpIPredicate::eq, startsMatrix, blockMatrix);
+    matchesEq = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
+                                               startsMatrix, blockMatrix);
     slotMatrix = rewriter.create<triton::BroadcastOp>(
-        loc, tensorTy({R, S}, rewriter.getI1Type()), slotRow);
+        loc, tensorTy({R, TW}, rewriter.getI1Type()), slotRow);
   }
   Value matches = rewriter.create<arith::AndIOp>(loc, matchesEq, slotMatrix);
-  SmallVector<int64_t> matrixShape{R, S};
-  Value countsI = rewriter.create<arith::ExtUIOp>(
-      loc, tensorTy(matrixShape, i32), matches);
+  SmallVector<int64_t> matrixShape{R, TW};
+  Value countsI =
+      rewriter.create<arith::ExtUIOp>(loc, tensorTy(matrixShape, i32), matches);
   Value counts = buildReduce<arith::AddIOp>(rewriter, loc, countsI, 1);
-  Value countsF = rewriter.create<arith::SIToFPOp>(
-      loc, tensorTy({R}, f32), counts);
+  Value countsF =
+      rewriter.create<arith::SIToFPOp>(loc, tensorTy({R}, f32), counts);
   Value tokenCounts2D = rewriter.create<triton::BroadcastOp>(
       loc, tensorTy({R, BS}, f32),
-      rewriter.create<triton::ExpandDimsOp>(loc, tensorTy({R, 1}, f32),
-                                            countsF, 1));
+      rewriter.create<triton::ExpandDimsOp>(loc, tensorTy({R, 1}, f32), countsF,
+                                            1));
   Value tokenCounts = rewriter.create<triton::ReshapeOp>(
       loc, tensorTy({BN}, f32), tokenCounts2D, false);
 
@@ -1974,15 +2179,34 @@ static ScanWeights buildScanWeights(IRRewriter &rewriter, Location loc,
   // entirely. The token positions are recomputed as token_start + [0, BN), so
   // the matched causal offset must be exactly zero.
   Value tokens = rewriter.create<arith::AddIOp>(
-      loc, rewriter.create<triton::SplatOp>(loc, tensorTy({BN}, i32),
-                                            tokenStart),
+      loc,
+      rewriter.create<triton::SplatOp>(loc, tensorTy({BN}, i32), tokenStart),
       tokensRange);
   Value validWeight = rewriter.create<arith::CmpFOp>(
       loc, arith::CmpFPredicate::OGT, tokenCounts, zeroTokens);
   Value validCausal = rewriter.create<arith::CmpIOp>(
       loc, arith::CmpIPredicate::sle, tokens, pidRow);
-  Value valid =
-      rewriter.create<arith::AndIOp>(loc, validWeight, validCausal);
+  Value valid = rewriter.create<arith::AndIOp>(loc, validWeight, validCausal);
+  // tokens < TK: redundant while the causal term is present (the row position
+  // is at most TK - 1, so zero-padded K/V past the sequence end is already
+  // masked), but it keeps the tile from accumulating padding if a future
+  // variant weakens the causal mask. Only emitted when the K/V view carries a
+  // dynamic bound.
+  if (tokenBound) {
+    Value bound = tokenBound;
+    if (bound.getType() != i32) {
+      unsigned width = bound.getType().getIntOrFloatBitWidth();
+      bound =
+          width > 32
+              ? rewriter.create<arith::TruncIOp>(loc, i32, bound).getResult()
+              : rewriter.create<arith::ExtSIOp>(loc, i32, bound).getResult();
+    }
+    Value boundSplat =
+        rewriter.create<triton::SplatOp>(loc, tensorTy({BN}, i32), bound);
+    Value validTokenBound = rewriter.create<arith::CmpIOp>(
+        loc, arith::CmpIPredicate::slt, tokens, boundSplat);
+    valid = rewriter.create<arith::AndIOp>(loc, valid, validTokenBound);
+  }
 
   return ScanWeights{tokenCounts, tokens, valid};
 }
@@ -1991,9 +2215,8 @@ static ScanWeights buildScanWeights(IRRewriter &rewriter, Location loc,
 static scf::ForOp buildScanLoop(IRRewriter &rewriter, Location loc,
                                 const ScanPrologue &prologue,
                                 const SmallVector<Value> &inits) {
-  auto scan = rewriter.create<scf::ForOp>(loc, prologue.c0,
-                                          prologue.scanUpperBound,
-                                          prologue.c1, inits);
+  auto scan = rewriter.create<scf::ForOp>(
+      loc, prologue.c0, prologue.scanUpperBound, prologue.c1, inits);
   if (!scan.getBody()->empty())
     rewriter.eraseOp(scan.getBody()->getTerminator());
   rewriter.setInsertionPointToStart(scan.getBody());
@@ -2100,12 +2323,13 @@ static bool buildSelectedBlockScan(IRRewriter &rewriter,
     // additive form does too when the baseline spelled the tiles that way
     // (production nsa_bwd_dq), and only the addptr spelling needs the rebuilt
     // two-level chain below.
-    buildMakeTensorPtrTile(rewriter, loc, candidate, BN, tokenStart,
-                           prologue, bK, bV);
+    buildMakeTensorPtrTile(rewriter, loc, candidate, BN, tokenStart, prologue,
+                           bK, bV);
   }
 
-  ScanWeights weights = buildScanWeights(rewriter, loc, i32, f32, S, BS, BN,
-                                         R, iv, tokenStart, prologue);
+  ScanWeights weights =
+      buildScanWeights(rewriter, loc, i32, f32, prologue.tableWidth, BS, BN, R,
+                       iv, tokenStart, candidate.dynamicBoundInput, prologue);
   Value tokenCounts = weights.tokenCounts;
   Value tokens = weights.tokens;
   Value valid = weights.valid;
@@ -2113,14 +2337,14 @@ static bool buildSelectedBlockScan(IRRewriter &rewriter,
   if (additive && !candidate.kPtr) {
     // Additive tiles, addptr spelling: the baseline's own two-level addptr at
     // the scan tile's token start, with the token-range mask preserved.
-    bK = buildAddPtrTileLoad(rewriter, loc, candidate.kTile,
-                             candidate.kLoad, tokens);
-    bV = buildAddPtrTileLoad(rewriter, loc, candidate.vTile,
-                             candidate.vLoad, tokens);
+    bK = buildAddPtrTileLoad(rewriter, loc, candidate.kTile, candidate.kLoad,
+                             tokens);
+    bV = buildAddPtrTileLoad(rewriter, loc, candidate.vTile, candidate.vLoad,
+                             tokens);
   }
 
-  ScanScores scanScores = buildScores(rewriter, loc, f32, G, BN, bK,
-                                      candidate.scoreDot);
+  ScanScores scanScores =
+      buildScores(rewriter, loc, f32, G, BN, bK, candidate.scoreDot);
   if (additive) {
     buildAdditiveBody(rewriter, loc, f32, candidate, scan, G, BN,
                       scanScores.scores, scanScores.zeroScores, valid,
@@ -2216,25 +2440,22 @@ static void buildOnlineSoftmaxBody(IRRewriter &rewriter, Location loc, Type f32,
   Value maskMatrix = rewriter.create<triton::BroadcastOp>(
       loc, tensorTy({G, BN}, rewriter.getI1Type()), maskRow);
   Value negInfScores = rewriter.create<arith::ConstantOp>(
-      loc,
-      DenseElementsAttr::get(
-          tensorTy({G, BN}, f32),
-          rewriter.getFloatAttr(
-              f32, APFloat::getInf(APFloat::IEEEsingle(), true))));
-  Value maskedScores = rewriter.create<arith::SelectOp>(
-      loc, maskMatrix, scores, negInfScores);
+      loc, DenseElementsAttr::get(
+               tensorTy({G, BN}, f32),
+               rewriter.getFloatAttr(
+                   f32, APFloat::getInf(APFloat::IEEEsingle(), true))));
+  Value maskedScores =
+      rewriter.create<arith::SelectOp>(loc, maskMatrix, scores, negInfScores);
 
   // Online softmax with the safe_m guard. The guard replaces the baseline's
   // scf.if: a fully masked tile with m == -inf would otherwise compute
   // exp(-inf - -inf) = NaN and permanently poison o and l.
-  Value tileMax =
-      buildReduce<arith::MaxNumFOp>(rewriter, loc, maskedScores, 1);
+  Value tileMax = buildReduce<arith::MaxNumFOp>(rewriter, loc, maskedScores, 1);
   Value mNew = rewriter.create<arith::MaxNumFOp>(loc, mArg, tileMax);
   Value needsGuard = rewriter.create<arith::CmpFOp>(
       loc, arith::CmpFPredicate::OEQ, mNew, prologue.negInfRows);
   Value safeM = rewriter.create<arith::SelectOp>(loc, needsGuard,
-                                                 prologue.zeroRows,
-                                                 mNew);
+                                                 prologue.zeroRows, mNew);
   // Hard constraint 1: safe_m subtracts from BOTH the rescale factor and
   // the scores. Yielding the TRUE max keeps the epilogue's lse identical.
   Value rescale = rewriter.create<math::ExpOp>(
@@ -2262,8 +2483,8 @@ static void buildOnlineSoftmaxBody(IRRewriter &rewriter, Location loc, Type f32,
   // o = o * rescale + dot(p, V)
   Value rescaleMatrix = rewriter.create<triton::BroadcastOp>(
       loc, oType,
-      rewriter.create<triton::ExpandDimsOp>(loc, tensorTy({G, 1}, f32),
-                                            rescale, 1));
+      rewriter.create<triton::ExpandDimsOp>(loc, tensorTy({G, 1}, f32), rescale,
+                                            1));
   Value oScaled = rewriter.create<arith::MulFOp>(loc, oArg, rescaleMatrix);
   Type valueLhsElem =
       cast<RankedTensorType>(candidate.valueDot.getA().getType())
@@ -2272,14 +2493,12 @@ static void buildOnlineSoftmaxBody(IRRewriter &rewriter, Location loc, Type f32,
   if (valueLhsElem != f32) {
     Type valueLhsType = tensorTy({G, BN}, valueLhsElem);
     if (isa<arith::ExtFOp>(candidate.valueDot.getA().getDefiningOp()))
-      valueLhs =
-          rewriter.create<arith::ExtFOp>(loc, valueLhsType, pWeighted);
+      valueLhs = rewriter.create<arith::ExtFOp>(loc, valueLhsType, pWeighted);
     else
-      valueLhs =
-          rewriter.create<arith::TruncFOp>(loc, valueLhsType, pWeighted);
+      valueLhs = rewriter.create<arith::TruncFOp>(loc, valueLhsType, pWeighted);
   }
-  Value oNew = buildDot(rewriter, loc, oType, valueLhs, bV, oScaled,
-                        candidate.valueDot);
+  Value oNew =
+      buildDot(rewriter, loc, oType, valueLhs, bV, oScaled, candidate.valueDot);
 
   rewriter.setInsertionPointToEnd(scan.getBody());
   SmallVector<Value> yielded{Value(), Value(), Value()};
@@ -2328,19 +2547,18 @@ static Value buildAddPtrTileLoad(IRRewriter &rewriter, Location loc,
   Value freeOff =
       rewriter.create<triton::ExpandDimsOp>(loc, freeOne, tile.freeVec, 1);
   Value innerPtr = rewriter.create<triton::AddPtrOp>(
-      loc, ptrOne,
-      rewriter.create<triton::SplatOp>(loc, ptrOne, tile.base), freeOff);
+      loc, ptrOne, rewriter.create<triton::SplatOp>(loc, ptrOne, tile.base),
+      freeOff);
   Value tokenOff = rewriter.create<arith::MulIOp>(
       loc, rewriter.create<triton::ExpandDimsOp>(loc, intOne, tokens, 0),
       rewriter.create<arith::ConstantOp>(
-          loc, DenseElementsAttr::get(
-                   intOne,
-                   rewriter.getIntegerAttr(intType, tile.tokenStride))));
+          loc, DenseElementsAttr::get(intOne, rewriter.getIntegerAttr(
+                                                  intType, tile.tokenStride))));
   Value tilePtr = rewriter.create<triton::AddPtrOp>(
       loc, ptrType,
       rewriter.create<triton::BroadcastOp>(loc, ptrType, innerPtr),
-      rewriter.create<triton::BroadcastOp>(
-          loc, tensorTy({F, BN}, intType), tokenOff));
+      rewriter.create<triton::BroadcastOp>(loc, tensorTy({F, BN}, intType),
+                                           tokenOff));
 
   // mask = (free < F) & (tokens < T), with the bound captured by the
   // matcher: the token term is the baseline's own range guard, not a
@@ -2355,8 +2573,8 @@ static Value buildAddPtrTileLoad(IRRewriter &rewriter, Location loc,
       loc, rewriter.create<triton::BroadcastOp>(loc, maskType, freeBound),
       rewriter.create<triton::BroadcastOp>(
           loc, maskType,
-          rewriter.create<triton::ExpandDimsOp>(
-              loc, tensorTy({1, BN}, i1), tokenMask, 0)));
+          rewriter.create<triton::ExpandDimsOp>(loc, tensorTy({1, BN}, i1),
+                                                tokenMask, 0)));
   // other = 0, the baseline's padding value for masked-off elements.
   auto valueType = tensorTy({F, BN}, elemType);
   Attribute zero = rewriter.getFloatAttr(elemType, 0.0);
@@ -2405,20 +2623,18 @@ static void buildAdditiveBody(IRRewriter &rewriter, Location loc, Type f32,
       loc, tensorTy({G, BN}, f32),
       rewriter.create<triton::ExpandDimsOp>(loc, tensorTy({1, BN}, f32),
                                             tokenCounts, 0));
-  Value pWeighted =
-      rewriter.create<arith::MulFOp>(loc, pMasked, weightMatrix);
+  Value pWeighted = rewriter.create<arith::MulFOp>(loc, pMasked, weightMatrix);
 
   // dp = dot(dO, v): a fresh matmul, not an accumulation into state.
-  Value dp = buildDot(rewriter, loc, tensorTy({G, BN}, f32),
-                      candidate.valueDot.getA(), bV, zeroScores,
-                      candidate.valueDot);
+  Value dp =
+      buildDot(rewriter, loc, tensorTy({G, BN}, f32), candidate.valueDot.getA(),
+               bV, zeroScores, candidate.valueDot);
   Value deltaMatrix = rewriter.create<triton::BroadcastOp>(
       loc, tensorTy({G, BN}, f32),
       rewriter.create<triton::ExpandDimsOp>(loc, tensorTy({G, 1}, f32),
                                             candidate.deltaVec, 1));
   Value ds = rewriter.create<arith::MulFOp>(
-      loc, pWeighted,
-      rewriter.create<arith::SubFOp>(loc, dp, deltaMatrix));
+      loc, pWeighted, rewriter.create<arith::SubFOp>(loc, dp, deltaMatrix));
 
   // ds enters the accumulation dot in its input type; the baseline
   // truncates in the same place (one rounding of p*w*(dp-delta)).
@@ -2441,11 +2657,11 @@ static void buildAdditiveBody(IRRewriter &rewriter, Location loc, Type f32,
   for (int32_t axis : candidate.transpose.getOrder())
     transShape.push_back(kTileType.getShape()[axis]);
   Value kT = rewriter.create<triton::TransOp>(
-      loc, RankedTensorType::get(transShape, kTileType.getElementType()),
-      bK, candidate.transpose.getOrder());
+      loc, RankedTensorType::get(transShape, kTileType.getElementType()), bK,
+      candidate.transpose.getOrder());
 
-  Value accNew = buildDot(rewriter, loc, stateType, dsCast, kT, accArg,
-                          candidate.accDot);
+  Value accNew =
+      buildDot(rewriter, loc, stateType, dsCast, kT, accArg, candidate.accDot);
   rewriter.setInsertionPointToEnd(scan.getBody());
   rewriter.create<scf::YieldOp>(loc, accNew);
 }
@@ -2476,8 +2692,8 @@ class SelectedBlockScanPlan final : public RewritePlan {
   unsigned epoch;
   // 已接受并自行验证过的沙箱：里面既有规则 A 的扫描重建，也可能已有规则 B
   // 的行提升与启动契约。
-  // The accepted sandbox: it already carries Rule A's scan rebuild and, when the
-  // joint gate ran, Rule B's row lifting and launch contract.
+  // The accepted sandbox: it already carries Rule A's scan rebuild and, when
+  // the joint gate ran, Rule B's row lifting and launch contract.
   OwningOpRef<ModuleOp> prepared;
 
   SelectedBlockScanPlan(ScanCandidate candidate, unsigned epoch,
@@ -2518,8 +2734,8 @@ public:
   LogicalResult apply(IRRewriter &rewriter) override {
     // 沙箱已经通过 verify；这里只做提交。运行期网格时规则 B 会追加隐藏的
     // extent 参数，因此必须连函数签名一起换，不能只 takeBody。
-    // Commit only: the sandbox is already verified.  A runtime grid makes Rule B
-    // append hidden extent arguments, so the function signature has to travel
+    // Commit only: the sandbox is already verified.  A runtime grid makes Rule
+    // B append hidden extent arguments, so the function signature has to travel
     // with the body instead of a plain takeBody.
     static_cast<void>(rewriter);
     auto replacement = cast<triton::FuncOp>(&prepared->getBody()->front());
@@ -2538,10 +2754,9 @@ public:
     }
 
     candidate.function.getBody().takeBody(replacement.getBody());
-    for (StringLiteral name :
-         {StringLiteral("hacc.coalesce_factor"),
-          StringLiteral("hacc.coalesce_axis"),
-          StringLiteral("hacc.coalesce_grid_ceil_div")})
+    for (StringLiteral name : {StringLiteral("hacc.coalesce_factor"),
+                               StringLiteral("hacc.coalesce_axis"),
+                               StringLiteral("hacc.coalesce_grid_ceil_div")})
       if (preparedModule->hasAttr(name))
         module->setAttr(name, preparedModule->getAttr(name));
     return success();
@@ -2552,7 +2767,7 @@ public:
   // declining returns nullptr and never fails apply().
   static std::unique_ptr<SelectedBlockScanPlan>
   create(const ScanCandidate &candidate, unsigned epoch, bool forceApply,
-         bool queryRowBatchingEnabled, const ResourceSnapshot &resources) {
+         const ResourceSnapshot &resources) {
     // The tablegen accessors used below are not const-qualified in this tree,
     // so work on a local mutable copy of the function.
     triton::FuncOp function = candidate.function;
@@ -2561,7 +2776,7 @@ public:
       return nullptr;
 
     OwningOpRef<ModuleOp> sandbox(ModuleOp::create(function.getLoc()));
-    // The sandbox must carry the module attributes: canQueryRowBatch reads
+    // The sandbox must carry the module attributes: Rule B's matcher reads
     // module-level gates, and a sandbox without them would decline forever.
     sandbox->getOperation()->setAttrs(module->getAttrs());
 
@@ -2578,9 +2793,8 @@ public:
     IRRewriter rewriter(module.getContext());
     ScopedDiagnosticHandler diagnostics(
         module.getContext(), [](Diagnostic &diag) {
-          LLVM_DEBUG(llvm::dbgs()
-                     << "selected-block-scan: skipped candidate: " << diag
-                     << "\n");
+          LLVM_DEBUG(llvm::dbgs() << "selected-block-scan: skipped candidate: "
+                                  << diag << "\n");
           return success();
         });
     if (!buildSelectedBlockScan(rewriter, *sandboxCandidate))
@@ -2594,20 +2808,17 @@ public:
     if (failed(verify(*sandbox)))
       return nullptr;
 
-    // 联合决策：只有规则 B 的规则位也打开时，才允许 A 在沙箱里连带完成 B 的
-    // 行提升。materialize 就地重写并 verify，失败即整个计划作废；成功则沙箱
-    // 里已经有 B 的改写与启动契约，apply() 只需把沙箱提交回去。
-    // Joint decision: Rule A may only run Rule B's row lifting when Rule B's bit
-    // is opted in as well.  `materialize...` rewrites and verifies in place, so a
-    // failure discards the whole plan, and success means the sandbox already
-    // carries both rewrites and the launch contract.
+    // 联合决策：A 直接在沙箱里跑 B 的真实实现（QueryRowBatching.h 的
+    // materialize 入口），B 收不收就是唯一的开关，没有额外要同步的规则位。
+    // materialize 就地重写并 verify，失败即整个计划作废；成功则沙箱里已经有
+    // B 的改写与启动契约，apply() 只需把沙箱提交回去。
+    // Joint decision: Rule A runs Rule B's real implementation inside its own
+    // sandbox (the QueryRowBatching.h materialize entry).  B's accept/reject is
+    // the only gate; there is no rule bit to keep in sync here.  materialize
+    // rewrites and verifies in place, so a failure discards the whole plan, and
+    // success means the sandbox already carries both rewrites and the launch
+    // contract.
     if (!forceApply) {
-      if (!queryRowBatchingEnabled) {
-        LLVM_DEBUG(llvm::dbgs() << "selected-block-scan: rule B bit is off, "
-                                   "declining @"
-                                << function.getName() << "\n");
-        return nullptr;
-      }
       if (failed(materializeQueryRowBatchingCandidate(*sandbox, cloned,
                                                       resources))) {
         LLVM_DEBUG(llvm::dbgs() << "selected-block-scan: joint query-row "
@@ -2618,10 +2829,38 @@ public:
       LLVM_DEBUG(llvm::dbgs() << "selected-block-scan: joint query-row "
                                  "batching materialized @"
                               << function.getName() << "\n");
+      // Rule B rewrote the sandbox after Rule A's cleanup+verify, so re-run the
+      // same hygiene on the joint result before it can be committed.  A failure
+      // declines the plan (never fails apply()), matching the rule's contract.
+      if (failed(runSandboxStructuralCleanup(*sandbox)) ||
+          failed(verify(*sandbox))) {
+        LLVM_DEBUG(llvm::dbgs() << "selected-block-scan: joint rewrite failed "
+                                   "post-batching verification @"
+                                << function.getName() << "\n");
+        return nullptr;
+      }
     } else {
-      LLVM_DEBUG(llvm::dbgs() << "selected-block-scan: force-apply bypasses "
-                                 "the joint gate for @"
+      LLVM_DEBUG(llvm::dbgs() << "selected-block-scan: force-apply lands rule "
+                                 "A without rule B for @"
                               << function.getName() << "\n");
+    }
+
+    // Launch-contract mutual exclusion.  A joint rewrite may either hand the
+    // grid to the launcher (hacc.program_grid_transforms / hacc.coalesce_*) or
+    // decode a flat program id inside the kernel (tt.get_num_programs) -- never
+    // both: the launcher would divide the grid while the kernel still assumes
+    // the original one, silently computing a fraction of the queries.
+    {
+      bool hasGridContract = (*sandbox)->hasAttr(kProgramGridTransformsAttr) ||
+                             (*sandbox)->hasAttr("hacc.coalesce_factor");
+      bool readsProgramCount = false;
+      cloned.walk([&](triton::GetNumProgramsOp) { readsProgramCount = true; });
+      if (hasGridContract && readsProgramCount) {
+        LLVM_DEBUG(llvm::dbgs() << "selected-block-scan: grid contract and "
+                                   "flat program-id decoding must not coexist @"
+                                << function.getName() << "\n");
+        return nullptr;
+      }
     }
 
     return std::unique_ptr<SelectedBlockScanPlan>(
@@ -2631,12 +2870,10 @@ public:
 
 class SelectedBlockScanRule final : public GraphOptimizationRule {
   bool forceApply;
-  bool queryRowBatchingEnabled;
 
 public:
   explicit SelectedBlockScanRule(const SelectedBlockScanRuleOptions &options)
-      : forceApply(options.forceApply),
-        queryRowBatchingEnabled(options.queryRowBatchingEnabled) {}
+      : forceApply(options.forceApply) {}
 
   GraphOptimizationRuleId getId() const override {
     return GraphOptimizationRuleId::SelectedBlockScan;
@@ -2658,15 +2895,14 @@ public:
     if (!candidate)
       return success();
 
-    LLVM_DEBUG(llvm::dbgs()
-               << "selected-block-scan: matched gather loop in @"
-               << candidate->function.getName()
-               << " (BS=" << candidate->blockSize
-               << " BN=" << candidate->scanTileWidth
-               << " S=" << candidate->tableLength << ")\n");
+    LLVM_DEBUG(llvm::dbgs() << "selected-block-scan: matched gather loop in @"
+                            << candidate->function.getName()
+                            << " (BS=" << candidate->blockSize
+                            << " BN=" << candidate->scanTileWidth
+                            << " S=" << candidate->tableLength << ")\n");
 
     if (auto plan = SelectedBlockScanPlan::create(
-            *candidate, context.getEpoch(), forceApply, queryRowBatchingEnabled,
+            *candidate, context.getEpoch(), forceApply,
             context.getResourceCostAnalysis().getResourceSnapshot()))
       plans.push_back(std::move(plan));
     return success();

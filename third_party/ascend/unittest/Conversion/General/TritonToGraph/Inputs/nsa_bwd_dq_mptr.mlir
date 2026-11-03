@@ -118,4 +118,3 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
     tt.return
   }
 }
-

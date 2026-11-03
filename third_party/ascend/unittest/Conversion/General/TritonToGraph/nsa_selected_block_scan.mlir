@@ -76,16 +76,20 @@
 // RUN: triton-opt %t -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.twice
 // RUN: diff %t %t.twice
 
-// --- default OFF: the joint gate must close --------------------------------
-// No escape hatch => Rule B's stub matcher declines while the plan is being
-// built => no plan => the IR must be byte-identical to the rule-off run.  That is
-// the "default off is safe" proof: with the bit offered but the joint gate
-// closed, nothing may change.
+// --- Rule A has no separate Rule B gate ------------------------------------
+// Rule A always runs Rule B's real implementation (the QueryRowBatching.h
+// materialize entry) inside its own sandbox and lets Rule B decide, so bit
+// 65536 alone must produce exactly the same IR as 65536|131072: the 131072 bit
+// only decides whether Rule B is ALSO scheduled as a standalone rule, where it
+// finds nothing left to lift.  (Rule A is default-on now: bits 16/17 join the
+// default mask, 199679 = 3071|65536|131072, see
+// nsa_selected_block_scan_attribution.mlir for the baseline-vs-default split.)
+// RUN: triton-opt %S/Inputs/nsa_fwd_const_ns.mlir -graph-optimize='rule-mask=196608' -canonicalize -cse -o %t.joint
 // RUN: triton-opt %S/Inputs/nsa_fwd_const_ns.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o %t.gated
-// RUN: diff %t.control %t.gated
-// ... and identical to "no graph-optimize pass at all":
-// RUN: triton-opt %S/Inputs/nsa_fwd_const_ns.mlir -canonicalize -cse -o %t.bare
-// RUN: diff %t.bare %t.gated
+// RUN: diff %t.joint %t.gated
+// ... and the joint rewrite must still differ from the rule-off run, so that
+// equality cannot pass vacuously:
+// RUN: not diff %t.control %t.gated
 
 // --- D. D3 accepted: runtime trip count from block_counts is REWRITTEN -------
 // Decision D3 (settled 2026-10-31): v0 accepts a trip count that comes from a
@@ -367,3 +371,171 @@
 // 正向 15：唯一的 dq store 仍是 addptr tile 上的 masked store（16x128）
 // BWDREW: tt.store %{{.*}}, %{{.*}}, %{{.*}} : tensor<16x128x!tt.ptr<bf16>>
 // BWDREW: tt.return
+
+// ---------- varlen: Rule A recognizes the dispatch (VARLENREW) ---------------
+// (2026-11-03) The varlen dispatch keeps the SAME scan skeleton: the block-index
+// table is still one row per query, read once; only the row position and the
+// K/V base move from "program id" to "loop-invariant scalar load"
+// (token_indices_q / cu_seqlens). Rule A accepts that spelling now, so with the
+// escape hatch open the rewrite must land on the real varlen IR too.
+// The joint gate is what keeps it OFF in production (Rule B declines varlen, and
+// A alone would trade O(NS) block reads for an O(TK) token scan); that side is
+// asserted in nsa_selected_block_scan_negative.mlir, section (a).
+//
+// RUN: triton-opt %S/Inputs/nsa_fwd_varlen.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.varlenrew
+// RUN: FileCheck %s --check-prefix=VARLENREW < %t.varlenrew
+
+// VARLENREW-LABEL: tt.func public @parallel_nsa_fwd_kernel(
+// 1. the index table is read ONCE as a vector, with the varlen prefix loads kept
+// VARLENREW: tt.load %{{.*}} : tensor<16x!tt.ptr<i64>>
+// 2. slot_valid = offs < NS over the padded slot axis (tensor<16xi32>)
+// VARLENREW: arith.cmpi slt, %{{.*}}, %{{.*}} : tensor<16xi32>
+// 3. the scan bound is cdiv(row_position + BN, BN) with a runtime row position
+// VARLENREW: %[[BND:.*]] = arith.divsi %{{.*}}, %c64_i32 : i32
+// 4. exactly one loop, i32 induction variable, three carried values (o/m/l)
+// VARLENREW: scf.for %{{.*}} = %c0_i32 to %[[BND]] step %c1_i32 iter_args(
+// 5. no per-block branch survives (the block guard was the only scf.if here)
+// VARLENREW-NOT: scf.if
+// 6. K/V tiles: one BN-wide tile each, read unconditionally
+// VARLENREW: tt.load %{{.*}} {boundaryCheck = array<i32: 0, 1>, padding = 1 : i32} : !tt.ptr<tensor<128x64xbf16>>
+// VARLENREW: tt.load %{{.*}} {boundaryCheck = array<i32: 0, 1>, padding = 1 : i32} : !tt.ptr<tensor<64x128xbf16>>
+// 7. the new per-token weight reduce over the slot axis (1x16 -> 1x1)
+// VARLENREW: "tt.reduce"(
+// 8. valid = (weight > 0) & (token <= row_position) & (token < TK)
+// VARLENREW: arith.cmpf ogt, %{{.*}}, %{{.*}} : tensor<64xf32>
+// VARLENREW: arith.cmpi sle, %{{.*}}, %{{.*}} : tensor<64xi32>
+// VARLENREW: arith.cmpi slt, %{{.*}}, %{{.*}} : tensor<64xi32>
+// 9. softmax max and sum are still 2-D over BN
+// VARLENREW: "tt.reduce"(
+// VARLENREW: "tt.reduce"(
+// 10. one masked output store (and the lse store) leave the function
+// VARLENREW: tt.store
+// VARLENREW: tt.store
+// VARLENREW: tt.return
+
+// ---------- joint golden standard: Rule A + Rule B (JOINTREW) ---------------
+// (2026-11-03) The joint flavour is the launch-contract one: the rewrite commits
+// hacc.program_grid_transforms (the launcher divides the grid by the row factor)
+// and the kernel keeps "program id == query row". The in-kernel flavour (flat
+// program id + `if active`) that the hand-written reference `nsa_fwd_new.py`
+// uses is a *different* plumbing; SelectedBlockScanRule must never emit both
+// (see the mutual-exclusion check in the rule and 15-v3-realignment.md 0.1).
+//
+// RUN: triton-opt %S/Inputs/nsa_fwd_const_ns.mlir -graph-optimize='rule-mask=196608' -o %t.joint
+// RUN: FileCheck %s --check-prefix=JOINTREW < %t.joint
+
+// JOINTREW: hacc.program_grid_transforms = {extent_source = "runtime_original_grid"
+// the joint function grows the hidden original-grid arguments Rule B appends
+// JOINTREW: tt.func public @parallel_nsa_fwd_kernel(
+// no per-block branch survives: the scan loop is the only loop
+// JOINTREW-NOT: scf.if
+// JOINTREW: scf.for
+// the per-token weight reduce is present (axis 2, the lifted row axis), so A ran
+// JOINTREW: "tt.reduce"(%{{.*}}) <{axis = 2 : i32}>
+// and the rewritten body still ends with the masked stores
+// JOINTREW: tt.store
+// JOINTREW: tt.return
+
+// ---------- S = 17 (non power-of-two table width) (S17REW) ------------------
+// The slot axis must be padded to next_pow2(S) = 32 and the slot index clamped
+// to S-1 so the table read stays inside its row; `tt.make_range` must never be
+// asked for a 17-wide range.
+//
+// RUN: triton-opt %S/Inputs/nsa_fwd_s17.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.s17
+// RUN: FileCheck %s --check-prefix=S17REW < %t.s17
+
+// S17REW-LABEL: tt.func public @parallel_nsa_fwd_kernel(
+// padded slot range (32, not 17)
+// S17REW: tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32>
+// the clamp that keeps the read inside the row
+// S17REW: arith.minsi %{{.*}}, %{{.*}} : tensor<32xi32>
+// the vectorised table read covers the PADDED width
+// S17REW: tt.load %{{.*}} : tensor<32x!tt.ptr<i64>>
+// and the per-block branch is gone
+// S17REW-NOT: scf.if
+// S17REW: scf.for
+
+// ---------- bwd dq dyn NS: folded index address (BWDYNREW / BWDYNJOINT) -----
+// (2026-11-03) The dyn-NS spelling of the bwd dq kernel folds the row advance
+// into the in-loop index address:
+//     tt.addptr %root, arith.addi(%rowOffset, %iv)
+// The dense kernels keep it as a separate SSA value instead:
+//     tt.addptr %rowBase, %iv      (%rowBase = tt.addptr %root, %rowOffset)
+// The address is the same, but matchIndexTable used to insist that the offset be
+// exactly the induction variable, so this spelling was rejected -- which left the
+// block_counts production path of the bwd dq kernel silently unmatchable.
+// Inputs/nsa_bwd_dq_dyn_ns.mlir is exactly that IR.  The rewrite re-creates the
+// row base the vectorised read needs (tt.addptr %root, %rowOffset) in the
+// prologue, so both spellings land on the same scan form.
+// RUN: triton-opt %S/Inputs/nsa_bwd_dq_dyn_ns.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.bwdyndyn.ctl
+// RUN: triton-opt %S/Inputs/nsa_bwd_dq_dyn_ns.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.bwdyndyn
+// RUN: FileCheck %s --check-prefix=BWDYNREW < %t.bwdyndyn
+// RUN: not diff %t.bwdyndyn.ctl %t.bwdyndyn
+// RUN: triton-opt %t.bwdyndyn -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.bwdyndyn.twice
+// RUN: diff %t.bwdyndyn %t.bwdyndyn.twice
+
+// the vectorised table read, the single additive accumulator and the one reduce
+// BWDYNREW-LABEL: tt.func public @parallel_nsa_bwd_kernel_dq(
+// BWDYNREW-NOT: scf.if
+// BWDYNREW: tt.load %{{.*}} : tensor<16x!tt.ptr<i64>>
+// BWDYNREW: scf.for %{{.*}} = %c0_i32 to %{{.*}} step %c1_i32 iter_args(%{{.*}} = %{{.*}}) -> (tensor<16x128xf32>)
+// BWDYNREW: "tt.reduce"(%{{.*}}) <{axis = 1 : i32}>
+
+// the joint gate accepts the same shape and publishes the runtime grid contract
+// RUN: triton-opt %S/Inputs/nsa_bwd_dq_dyn_ns.mlir -graph-optimize='rule-mask=196608' -o %t.bwdyndyn.joint
+// RUN: FileCheck %s --check-prefix=BWDYNJOINT < %t.bwdyndyn.joint
+
+// BWDYNJOINT: hacc.program_grid_transforms = {extent_source = "runtime_original_grid"
+// BWDYNJOINT: tt.func public @parallel_nsa_bwd_kernel_dq(
+// BWDYNJOINT-NOT: scf.if
+// BWDYNJOINT: scf.for
+// BWDYNJOINT: "tt.reduce"(%{{.*}}) <{axis = 2 : i32}>
+// BWDYNJOINT: tt.store
+// BWDYNJOINT: tt.return
+
+// ---------- varlen + block_counts: 7 loop-invariant scalar loads (VARLENBCREW)
+// (2026-11-03) The production varlen dispatch also passes block_counts, so the
+// loop-invariant scalar loads before the loop are 2 token_indices_q + 2
+// cu_seqlens_q + 2 cu_seqlens_k + 1 block_counts = 7, not the 6 of the pure
+// varlen prefix.  The skeleton budget used to be six and rejected the whole
+// dispatch before matchIndexTable ran.  Inputs/nsa_fwd_varlen_bc.mlir is that IR.
+// RUN: triton-opt %S/Inputs/nsa_fwd_varlen_bc.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.varlenbc.ctl
+// RUN: triton-opt %S/Inputs/nsa_fwd_varlen_bc.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.varlenbc
+// RUN: FileCheck %s --check-prefix=VARLENBCREW < %t.varlenbc
+// RUN: not diff %t.varlenbc.ctl %t.varlenbc
+
+// VARLENBCREW-LABEL: tt.func public @parallel_nsa_fwd_kernel(
+// VARLENBCREW-NOT: scf.if
+// VARLENBCREW: tt.load %{{.*}} : tensor<16x!tt.ptr<i64>>
+// VARLENBCREW: %{{.*}}:3 = scf.for
+// VARLENBCREW: "tt.reduce"(%{{.*}}) <{axis = 1 : i32}>
+
+// (meta) the joint gate must still refuse it: Rule B does not lift varlen, so
+// offering only bit 65536 must leave the IR untouched.
+// RUN: triton-opt %S/Inputs/nsa_fwd_varlen_bc.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o %t.varlenbc.gated
+// RUN: diff %t.varlenbc.ctl %t.varlenbc.gated
+
+// ---------- H == 1 + dyn NS: table length from the row stride (H1DYNREW) -----
+// (2026-11-03) With H == 1 the head split folds away, so the row base loses its
+// i_h*S addend and the row stride of block_indices is H*S == S.  The table
+// length used to be recoverable only from a CONSTANT trip count, so the dyn-NS
+// (block_counts) H == 1 decode shape never matched.  The matcher now reads S off
+// the constant multiplier of the pid-carrying row offset, but only when the
+// function carries no `i_bh % H` remainder -- H > 1 always leaves one, and with
+// H > 1 that same constant would be H*S, i.e. a vector read spilling into the
+// next head's row.
+// Inputs/nsa_fwd_h1_dyn_ns.mlir is that IR (H=1 HQ=16 G=16 K=V=64 S=16 BS=32).
+// RUN: triton-opt %S/Inputs/nsa_fwd_h1_dyn_ns.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.h1dyn.ctl
+// RUN: triton-opt %S/Inputs/nsa_fwd_h1_dyn_ns.mlir -graph-optimize='rule-mask=196608' -o %t.h1dyn.joint
+// RUN: FileCheck %s --check-prefix=H1DYNREW < %t.h1dyn.joint
+// RUN: not diff %t.h1dyn.ctl %t.h1dyn.joint
+// the joint rewrite lands on the runtime-grid flavour with R=8 and the slot
+// axis still S=16 wide (the row stride H*S was read as S because H == 1)
+// H1DYNREW: hacc.program_grid_transforms = {extent_source = "runtime_original_grid"
+// H1DYNREW: tt.func public @parallel_nsa_fwd_kernel(
+// H1DYNREW-NOT: scf.if
+// H1DYNREW: tensor<8x16x!tt.ptr<i64>>
+// H1DYNREW: scf.for
+// H1DYNREW: "tt.reduce"(%{{.*}}) <{axis = 2 : i32}>
+// H1DYNREW: tt.store
+// H1DYNREW: tt.return

@@ -14,12 +14,15 @@
 // bwd dq kernel: `selected-block-scan: stage tiles declined`, function
 // byte-identical.  These RUN lines pin both spellings down.
 //
-// GATED (3rd RUN) locks in the joint contract: with Rule B's bit off, Rule A
-// must NOT commit — the gather loop, its scf.if and the per-iteration scalar
-// table load all stay in place.
+// The GATED pair (3rd/4th RUN) locks in that Rule A needs no Rule B bit: Rule A
+// always runs Rule B's real implementation (QueryRowBatching.h), so offering
+// only bit 65536 must give the same IR as 65536|131072 -- the standalone Rule B
+// scheduled by 131072 finds nothing left to lift in the joint result.
 
 // RUN: triton-opt %S/Inputs/nsa_bwd_dq_mptr.mlir -graph-optimize='rule-mask=196608' -o - | FileCheck %s --check-prefix=MPTR
-// RUN: triton-opt %S/Inputs/nsa_bwd_dq_mptr.mlir -graph-optimize='rule-mask=65536' -o - | FileCheck %s --check-prefix=GATED
+// RUN: triton-opt %S/Inputs/nsa_bwd_dq_mptr.mlir -graph-optimize='rule-mask=65536' -o %t.gated
+// RUN: triton-opt %S/Inputs/nsa_bwd_dq_mptr.mlir -graph-optimize='rule-mask=196608' -o %t.joint
+// RUN: diff %t.joint %t.gated
 // RUN: triton-opt %S/Inputs/nsa_bwd_dq_const_ns.mlir -graph-optimize='rule-mask=196608' -o - | FileCheck %s --check-prefix=ADDPTR
 
 // ---- the production (mptr) spelling: the loop is fully rewritten ----
@@ -41,14 +44,6 @@
 // The single dq store survives; nothing else was added to the function.
 // MPTR: tt.store
 // MPTR-NOT: scf.if
-
-// ---- joint gate closed: nothing may be committed ----
-// GATED-LABEL: tt.func public @parallel_nsa_bwd_kernel_dq
-// The per-iteration scalar table read and the block guard survive untouched.
-// GATED: tt.load %{{.*}} : !tt.ptr<i64>
-// GATED: arith.muli %{{.*}} : i32
-// GATED: scf.if
-// GATED-NOT: tt.reduce
 
 // ---- the legacy addptr spelling must keep matching (no regression) ----
 // ADDPTR-LABEL: tt.func public @parallel_nsa_bwd_kernel_dq

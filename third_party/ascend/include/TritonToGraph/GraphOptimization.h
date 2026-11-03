@@ -67,18 +67,21 @@ enum class GraphOptimizationRuleId : GraphOptimizationRuleMask {
   StoreCoveragePlanning = 16384,
   ContiguousBlockAccessFormation = 32768,
   // 规则 A（selected-block scan）：把按下标表选择的稀疏循环改写成顺序扫描，
-  // 且必须在规则 B 行提升之前完成。默认关闭，只有显式置位该规则位时才注册。
+  // 且必须在规则 B 行提升之前完成。默认开启（位在默认 mask 里）；A 始终走
+  // 规则 B 的 materialize 入口，由 B 的真实实现决定收不收。
   // Rule A (selected-block scan) turns the table-indexed sparse loop into a
-  // sequential scan and must run before rule B lifts it.  It is default-off and
-  // is registered only when this bit is explicitly opted in.
+  // sequential scan and must run before rule B lifts it.  It is default-on (its
+  // bit is part of the default mask); A always goes through Rule B's
+  // materialize entry and B's real implementation decides.
   SelectedBlockScan = 65536,
   // 规则 B（query row batching）：把按下标表选择的稀疏块循环按查询行批量提升，
   // 每组 R 行共享 K/V tile。它与 RowCoalescing 共用 RowLiftBuilder，但 matcher
-  // 独立，因此两条规则可分别开关；按 RFC #2686 与 IAT 同处 ProgramMapping 阶段。
-  // Rule B (query row batching) batches R query rows of a table-indexed sparse
-  // block loop so one K/V tile feeds them.  It shares RowLiftBuilder with
-  // RowCoalescing but owns its own matcher, so the two rules stay independently
-  // gated; RFC #2686 places it in the ProgramMapping phase, alongside IAT.
+  // 独立，因此两条规则可分别开关；按 RFC #2686 与 IAT 同处 ProgramMapping
+  // 阶段。 Rule B (query row batching) batches R query rows of a table-indexed
+  // sparse block loop so one K/V tile feeds them.  It shares RowLiftBuilder
+  // with RowCoalescing but owns its own matcher, so the two rules stay
+  // independently gated; RFC #2686 places it in the ProgramMapping phase,
+  // alongside IAT.
   QueryRowBatching = 131072,
 };
 
@@ -180,8 +183,8 @@ getGraphOptimizationRulePhase(GraphOptimizationRuleId rule) {
   case GraphOptimizationRuleId::SelectedBlockScan:
     return GraphOptimizationRulePhase::SelectedBlockScan;
   // 按 RFC #2686，规则 B（query row batching）与 IAT 同处 ProgramMapping 阶段。
-  // Rule B (query row batching) runs in the ProgramMapping phase, alongside IAT,
-  // as specified by RFC #2686.
+  // Rule B (query row batching) runs in the ProgramMapping phase, alongside
+  // IAT, as specified by RFC #2686.
   case GraphOptimizationRuleId::QueryRowBatching:
     return GraphOptimizationRulePhase::ProgramMapping;
   case GraphOptimizationRuleId::RowCoalescing:
@@ -263,17 +266,25 @@ constexpr GraphOptimizationRuleMask kKnownGraphOptimizationRuleMask =
         GraphOptimizationRuleId::StoreCoveragePlanning) |
     getGraphOptimizationRuleMask(
         GraphOptimizationRuleId::ContiguousBlockAccessFormation) |
-    getGraphOptimizationRuleMask(
-        GraphOptimizationRuleId::SelectedBlockScan) |
-    getGraphOptimizationRuleMask(
-        GraphOptimizationRuleId::QueryRowBatching);
+    getGraphOptimizationRuleMask(GraphOptimizationRuleId::SelectedBlockScan) |
+    getGraphOptimizationRuleMask(GraphOptimizationRuleId::QueryRowBatching);
 
 constexpr GraphOptimizationRuleMask kDefaultEligibleGraphOptimizationRuleMask =
     kLegacyGraphOptimizationRuleMask |
     getGraphOptimizationRuleMask(
         GraphOptimizationRuleId::IndependentAxisTensorize) |
     getGraphOptimizationRuleMask(
-        GraphOptimizationRuleId::PersistentTaskStripMining);
+        GraphOptimizationRuleId::PersistentTaskStripMining) |
+    // #2686 Rule A/B 已转为默认开启：规则位进入默认可用集，
+    // kDefaultGraphOptimizationRuleMask（= 本集合）随之变为 199679。
+    // A 与 B 之间没有独立开关：A 始终走 B 的 materialize 入口，由 B
+    // 决定收不收； 131072 只决定规则 B 是否作为独立规则进调度。 #2686 Rules A/B
+    // are now default-on: their bits join the default-eligible set, so
+    // kDefaultGraphOptimizationRuleMask (== this set) becomes 199679. A and B
+    // have no separate switch: A always goes through B's materialize entry and
+    // B decides; bit 17 only schedules Rule B as a standalone rule.
+    getGraphOptimizationRuleMask(GraphOptimizationRuleId::SelectedBlockScan) |
+    getGraphOptimizationRuleMask(GraphOptimizationRuleId::QueryRowBatching);
 
 constexpr GraphOptimizationRuleMask kFixedDefaultOffGraphOptimizationRuleMask =
     getGraphOptimizationRuleMask(
@@ -283,11 +294,7 @@ constexpr GraphOptimizationRuleMask kFixedDefaultOffGraphOptimizationRuleMask =
     getGraphOptimizationRuleMask(
         GraphOptimizationRuleId::StoreCoveragePlanning) |
     getGraphOptimizationRuleMask(
-        GraphOptimizationRuleId::ContiguousBlockAccessFormation) |
-    getGraphOptimizationRuleMask(
-        GraphOptimizationRuleId::SelectedBlockScan) |
-    getGraphOptimizationRuleMask(
-        GraphOptimizationRuleId::QueryRowBatching);
+        GraphOptimizationRuleId::ContiguousBlockAccessFormation);
 
 constexpr GraphOptimizationRuleMask kDefaultGraphOptimizationRuleMask =
     kDefaultEligibleGraphOptimizationRuleMask;
@@ -299,7 +306,10 @@ static_assert(kLegacyGraphOptimizationRuleMask == 511,
               "legacy graph optimization rule mask is an ABI contract");
 static_assert(kDefaultGraphOptimizationRuleMask ==
                   kDefaultEligibleGraphOptimizationRuleMask,
-              "IAT and PTSM must remain enabled by default");
+              "the default set must stay equal to the default-eligible set");
+static_assert(kDefaultGraphOptimizationRuleMask == 199679,
+              "default graph rule mask is 3071 plus #2686 Rule A (bit 16) and "
+              "Rule B (bit 17)");
 static_assert(kKnownGraphOptimizationRuleMask ==
                   (kDefaultEligibleGraphOptimizationRuleMask |
                    kFixedDefaultOffGraphOptimizationRuleMask),
@@ -353,13 +363,13 @@ struct IntermediatePrecisionBoundaryElisionRuleOptions {};
 struct StoreCoveragePlanningRuleOptions {};
 struct ContiguousBlockAccessFormationRuleOptions {};
 struct SelectedBlockScanRuleOptions {
+  // 规则 A 与规则 B 之间没有独立的开关：A 始终通过 QueryRowBatching.h 的
+  // materialize 入口执行 B，收不收由 B 自己决定。
+  // forceApply 只是测试用的逃生门，让 A 在没有 B 的情况下单独落地。
+  // There is no separate Rule A/Rule B enable flag: Rule A always runs Rule B
+  // through the QueryRowBatching.h materialize entry and lets Rule B decide.
+  // forceApply is only a test escape hatch that lands A without B.
   bool forceApply = false;
-  // Rule A 只有与规则 B 同批开启时才允许连带 materialize B；规则位的判断在
-  // 注册阶段完成，避免规则内部再去解码 mask。
-  // Rule A may materialize Rule B only when Rule B's bit is opted in as well.
-  // The mask decision is made at registration time, so the rule itself never
-  // decodes the mask.
-  bool queryRowBatchingEnabled = false;
 };
 
 struct GraphOptimizationOptions {

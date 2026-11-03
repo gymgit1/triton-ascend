@@ -1,7 +1,7 @@
 // === #2686 Rule A (SelectedBlockScanRule, bit 65536) — NEGATIVE cases ===
 //
 // STATUS: post-implementation form; every RUN line below is green.  What the
-// file now covers: (a) varlen, (b) K/V anchored on the grid axis instead of the
+// file now covers: (b) K/V anchored on the grid axis instead of the
 // index table, (d) the table address is not the induction variable, (e) the
 // causal mask carries a non-zero token-side shift, (f) the tile is not exactly
 // one block wide on the token axis.  Sections kept the original lettering so the
@@ -16,17 +16,18 @@
 // BWDREW.  Nothing about it belongs in this file any more: "declines and is
 // byte-identical" is the opposite of the current contract.
 //
-// What "must hold" means here, precisely: with the escape hatch OPEN (so the
-// joint Rule A+Rule B gate cannot be the reason nothing happened), Rule A's
-// matcher must still decline these shapes, therefore the output must be
-// BYTE-IDENTICAL to the rule-off run, and triton-opt must not print a single
-// line on stderr.  Both halves are asserted:
+// What "must hold" means here, precisely: with the escape hatch OPEN (so Rule B
+// cannot be the reason nothing happened), Rule A's own matcher must still
+// decline these shapes, therefore the output must be BYTE-IDENTICAL to the
+// rule-off run, and triton-opt must not print a single line on stderr.  Both
+// halves are asserted:
 //   * diff  -> "no change"            (repo precedent row-coalescing-dot-fallback.mlir:1-7)
 //   * FileCheck -> "the pre-rewrite pattern is really there", so the diff cannot
 //     pass because the fixture silently stopped containing the shape.
-// Why force-apply and not just rule-mask=65536: without it the stub Rule B
-// matcher already blocks the rewrite, so a "no change" assertion would be
-// vacuous.  The escape hatch is written out as
+// Why force-apply and not just rule-mask=65536: without it Rule A hands its
+// sandbox to Rule B's real implementation, which declines these shapes on its
+// own account, so the "no change" assertion would prove nothing about Rule A's
+// matcher.  The escape hatch is written out as
 // `selected-block-scan-force-apply=true`, like every other bool option in this
 // repo, instead of as a bare bool leaning on MLIR's implicit true.
 //
@@ -68,16 +69,21 @@
 // BS48: arith.select %{{.*}}, %{{.*}}, %{{.*}} : tensor<16x48xi1>, tensor<16x48xf32>
 // BS48: "tt.reduce"(
 
-// ---------- (a) varlen ------------------------------------------------------
-// varlen: trip count is a scalar i64 load, induction variable is i64, and four
-// extra scalar loads (token_indices x2, offsets x2) precede the loop, with
-// address operands that are themselves gathered indices.  RFC §6 puts varlen
-// out of scope for Rule A.
+// ---------- (a) varlen: the joint gate still declines it -------------------
+// (2026-11-03) Rule A now RECOGNIZES the varlen dispatch: the row position
+// (token_indices_q) and the K/V base (cu_seqlens) are loop-invariant scalar
+// loads, which is exactly what matchRowPosition / checkAddressOperand accept
+// after the varlen relaxation.  What must still hold is the JOINT contract:
+// with only Rule A's bit enabled and no escape hatch, the function is left
+// BYTE-IDENTICAL because Rule B declines varlen and A must never land alone
+// (A alone trades O(NS) block reads for an O(TK) token scan).  The rewritten
+// shape under the escape hatch is asserted separately as group VARLENREW in
+// nsa_selected_block_scan.mlir.
 // RUN: triton-opt %S/Inputs/nsa_fwd_varlen.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.varlen.ctl
-// RUN: triton-opt %S/Inputs/nsa_fwd_varlen.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.varlen
+// RUN: triton-opt %S/Inputs/nsa_fwd_varlen.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o %t.varlen
 // RUN: diff %t.varlen.ctl %t.varlen
 // RUN: FileCheck %s --check-prefix=VARLEN < %t.varlen
-// RUN: triton-opt %S/Inputs/nsa_fwd_varlen.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o /dev/null 2> %t.varlen.err
+// RUN: triton-opt %S/Inputs/nsa_fwd_varlen.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o /dev/null 2> %t.varlen.err
 // RUN: diff %t.empty %t.varlen.err
 
 // VARLEN-LABEL: tt.func public @parallel_nsa_fwd_kernel(

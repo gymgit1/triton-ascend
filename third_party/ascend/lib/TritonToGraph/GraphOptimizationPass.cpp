@@ -592,19 +592,21 @@ void populateBuiltinGraphOptimizationRules(
     rules.push_back(createContiguousBlockAccessFormationRule(
         options.contiguousBlockAccessFormation));
   }
-  // 规则 A 只在显式置位 65536 时注册；它允许连带 materialize 规则 B 的前提
-  // 是 B 的规则位 131072 也一并打开。
-  // Rule A is registered only when bit 65536 is opted in.  It may materialize
-  // Rule B only when Rule B's bit is opted in as well.
+  // 规则 A 在规则位 65536 置位时注册（该位已进入默认 mask）。A 与 B 之间没有
+  // 额外的开关要在这里拼：A 始终走 QueryRowBatching.h 的 materialize 入口，
+  // 由 B 的真实实现决定收不收，131072 只决定规则 B 作为独立规则是否进调度。
+  // Rule A is registered when bit 65536 is set (that bit is part of the default
+  // mask now).  Nothing has to be stitched together here: A always goes through
+  // the QueryRowBatching.h materialize entry and B's real implementation
+  // decides; bit 131072 only controls whether Rule B is scheduled as a
+  // standalone rule.
   if (isRuleEnabled(options.enabledRuleMask,
                     GraphOptimizationRuleId::SelectedBlockScan)) {
-    SelectedBlockScanRuleOptions scanOptions = options.selectedBlockScan;
-    scanOptions.queryRowBatchingEnabled =
-        isRuleEnabled(options.enabledRuleMask,
-                      GraphOptimizationRuleId::QueryRowBatching);
-    rules.push_back(createSelectedBlockScanRule(scanOptions));
+    rules.push_back(createSelectedBlockScanRule(options.selectedBlockScan));
   }
-  // 规则 B（query row batching）默认关闭，只有显式置位规则位 131072 时才注册。
+  // 规则 B（query row batching）在规则位 131072 置位时注册（该位已进入默认
+  // mask）；它在 ProgramMapping 阶段独立调度，通常已经被规则 A 的 materialize
+  // 处理过的循环在这里已经是幂等的。
   if (isRuleEnabled(options.enabledRuleMask,
                     GraphOptimizationRuleId::QueryRowBatching)) {
     rules.push_back(createQueryRowBatchingRule());

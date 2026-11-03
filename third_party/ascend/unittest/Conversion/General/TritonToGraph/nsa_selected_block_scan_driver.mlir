@@ -19,9 +19,14 @@
 // RUN: triton-opt --split-input-file --verify-each %s -graph-optimize='rule-mask=68607' -o - | FileCheck %s --check-prefix=COMBINED
 // RUN: not triton-opt %s -graph-optimize='rule-mask=1048576' -o /dev/null 2>&1 | FileCheck %s --check-prefix=REJECT
 
-// The new bit must also be accepted on the real kernel IR (exit 0, and — with
-// the joint gate closed, i.e. without the escape hatch — no change).
+// The new bit must also be accepted on the real kernel IR (exit 0).  Rule A has
+// no separate Rule B gate -- it always runs Rule B's real implementation (the
+// QueryRowBatching.h materialize entry) -- so bit 65536 alone must produce
+// exactly the same IR as the joint 65536|131072 run below.
 // RUN: triton-opt %S/Inputs/nsa_fwd_const_ns.mlir -graph-optimize='rule-mask=65536' -o /dev/null
+// RUN: triton-opt %S/Inputs/nsa_fwd_const_ns.mlir -graph-optimize='rule-mask=65536' -o %t.rulea
+// RUN: triton-opt %S/Inputs/nsa_fwd_const_ns.mlir -graph-optimize='rule-mask=196608' -o %t.joint
+// RUN: diff %t.rulea %t.joint
 
 // Joint Rule A + Rule B path: 65536 | 131072 = 196608.  Rule A rewrites the
 // sparse loop and materializes Rule B's contract inside its own sandbox, so

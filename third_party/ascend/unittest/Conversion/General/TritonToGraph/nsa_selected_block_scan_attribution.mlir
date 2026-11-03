@@ -1,8 +1,9 @@
 // === #2686 Rule A (SelectedBlockScanRule, bit 65536) — attribution guard ===
 //
 // What this file proves: for every fixture Rule A is pointed at, both the
-// "graph-optimize enabled but no rule" baseline (rule-mask=0) and the 11 rules
-// registered today (rule-mask=3071) leave the IR byte-for-byte unchanged.
+// "graph-optimize enabled but no rule" baseline (rule-mask=0) and the 11
+// baseline-bundle rules (rule-mask=3071, i.e. the default mask 199679 minus the
+// #2686 Rule A/B bits) leave the IR byte-for-byte unchanged.
 // Therefore any diff produced by Rule A (rule-mask=65536 plus the escape hatch)
 // is attributable to Rule A alone -- the same "isolate the rule so nothing can
 // be blamed on another graph rule" contract that
@@ -72,7 +73,7 @@
 // The additive (bwd dq) fixture joined the attributed set on 2026-11-02, when
 // Rule A's additive branch made it a POSITIVE case (group G of
 // nsa_selected_block_scan.mlir, prefix BWDREW): the diff Rule A produces there
-// must still be attributable to Rule A alone, so the 11 default rules have to
+// must still be attributable to Rule A alone, so the 11 baseline rules have to
 // leave the pre-rewrite additive loop exactly as they find it.
 // BWDPRE below pins that pre-rewrite shape (scalar per-iteration table read,
 // one iter_arg, scf.if, addptr + masked K/V tiles, three dots, tt.trans) so the
@@ -153,7 +154,7 @@
 // NS = tt.load(block_counts + ...) -> runtime trip count, i64 induction var.
 // Decision D3 (settled 2026-10-31) accepts this, so the fixture is a positive
 // case in nsa_selected_block_scan.mlir (group D, prefix DYNREW); here it only
-// has to stay untouched by the 11 default rules.
+// has to stay untouched by the 11 baseline rules.
 // DYNS-LABEL: tt.func public @parallel_nsa_fwd_kernel(
 // DYNS: %[[NS:.*]] = tt.load %{{.*}} : !tt.ptr<i64>
 // DYNS: scf.for %{{.*}} = %c0_i64 to %[[NS]] step %c1_i64
@@ -232,7 +233,7 @@
 
 // ---------------------------------------------------------------------------
 // BWDPRE — Inputs/nsa_bwd_dq_const_ns.mlir : POSITIVE case (additive), untouched
-// by the 11 default rules
+// by the 11 baseline rules
 // ---------------------------------------------------------------------------
 // Pre-rewrite shape of the bwd dq additive kernel, i.e. exactly what Rule A's
 // additive branch consumes: constant-trip-count i32 loop with ONE iter_arg (the

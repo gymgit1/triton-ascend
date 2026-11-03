@@ -37,6 +37,7 @@ from triton.backends.ascend.program_grid import (
     INDEPENDENT_AXIS_TENSORIZE_RULE_BIT,
     PERSISTENT_TASK_STRIP_MINING_RULE_BIT,
     ProgramGridContractError,
+    QUERY_ROW_BATCHING_RULE_BIT,
     SELECTED_BLOCK_SCAN_RULE_BIT,
     normalize_graph_optimization_rule_mask,
 )
@@ -307,9 +308,12 @@ def test_graph_optimize_pass_accepts_zero_rule_mask(tmp_path):
     assert_reparseable(module, tmp_path, "zero-rule-mask")
 
 
-def test_default_graph_mask_enables_iat_and_ptsm():
-    expected_mask = 511 | INDEPENDENT_AXIS_TENSORIZE_RULE_BIT | PERSISTENT_TASK_STRIP_MINING_RULE_BIT
+def test_default_graph_mask_enables_iat_ptsm_and_nsa_rule_pair():
+    expected_mask = (511 | INDEPENDENT_AXIS_TENSORIZE_RULE_BIT | PERSISTENT_TASK_STRIP_MINING_RULE_BIT
+                     | SELECTED_BLOCK_SCAN_RULE_BIT | QUERY_ROW_BATCHING_RULE_BIT)
 
+    # 3071 | Rule A (1 << 16) | Rule B (1 << 17)
+    assert expected_mask == 199679
     assert DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK == expected_mask
     assert NPUOptions(arch="Ascend910_95").rule_mask == expected_mask
 
@@ -320,7 +324,8 @@ def test_default_generic_graph_mask_excludes_legacy_memory_compatibility(tmp_pat
     The generic GraphOptimizePass runs at early TTIR.  Row, Axis, Chunk, and
     StridedLoadStoreRewrite retain their original compatibility-pass slots, so
     this strided memory shape must not acquire either coalescing metadata or
-    an indirect-memory op merely because the default mask is 3071.
+    an indirect-memory op merely because the default mask carries the native
+    bundle plus the #2686 Rule A/B pair.
     """
     options = NPUOptions(arch="Ascend910_95", enable_graph_optimize=True)
     default_result = make_ttir(
@@ -339,7 +344,7 @@ def test_default_generic_graph_mask_excludes_legacy_memory_compatibility(tmp_pat
 
 
 def test_default_graph_mask_preserves_native_graph_rule_bundle(monkeypatch, tmp_path):
-    """Default 3071 retains native 1|2|4 behavior, including StoreCoalescing,
+    """The default mask retains native 1|2|4 behavior, including StoreCoalescing,
     without running legacy rules.
 
     This input has the LoadStoreTranspose (bit 1) structural signature.  The
@@ -921,28 +926,40 @@ def test_graph_optimize_options_contribute_to_npu_hash():
     assert (NPUOptions(enable_graph_optimize=False).hash() != NPUOptions(enable_graph_optimize=True).hash())
 
 
-# --- #2686 Rule A (SelectedBlockScanRule, rule bit SELECTED_BLOCK_SCAN_RULE_BIT) ---
+# --- #2686 Rule A/B (SelectedBlockScanRule bit 16, QueryRowBatchingRule bit 17) ---
 #
-# The bit is wired through TWO whitelists that must be changed together:
+# Both bits are wired through TWO whitelists that must be changed together:
 #   * the C++ one, kKnownGraphOptimizationRuleMask in
-#     third_party/ascend/include/TritonToGraph/GraphOptimization.h:225, enforced
+#     third_party/ascend/include/TritonToGraph/GraphOptimization.h, enforced
 #     by triton-opt and by add_graph_optimize, and
 #   * the Python one, GRAPH_OPTIMIZATION_KNOWN_RULE_MASK in
-#     third_party/ascend/backend/program_grid.py, which moved from 0xFBFF (15
-#     bits: 0-9 and 11-15) to 0x1FBFF (those 15 bits plus bit 16), enforced by
-#     NPUOptions and normalize_graph_optimization_rule_mask.
+#     third_party/ascend/backend/program_grid.py (0x3FBFF: bits 0-9 and 11-17),
+#     enforced by NPUOptions and normalize_graph_optimization_rule_mask.
 # Widening only one layer fails differently: C++-only keeps NPUOptions raising
 # at option construction; Python-only lets the option through and the pybind
-# add_graph_optimize rejects it instead.  The five cases below pin both layers
-# plus the "default stays off", "unknown bits stay rejected" and "accepted means
-# eligible, not force-applied" contracts.
+# add_graph_optimize rejects it instead.  Both layers also carry the default
+# mask (199679 = 3071 | bit 16 | bit 17), so the cases below pin the
+# "default-on" decision, the "unknown bits stay rejected" contract, and that
+# Rule A's bit alone already produces the same IR as bit 16|17 (Rule A has no
+# separate Rule B enable flag; it always calls Rule B's materialize entry).
 
 RULE_A_TTIR_FIXTURES = (Path(__file__).resolve().parent.parent / "Conversion" / "General" / "TritonToGraph" / "Inputs")
 
 
+def _render_graph_optimize(fixture, mask):
+    context = ir.context()
+    ir.load_dialects(context)
+    ascend_ir.load_dialects(context)
+    module = ir.parse_mlir_module(str(fixture), context)
+    pm = ir.pass_manager(context)
+    ascend.passes.ttir.add_graph_optimize(pm, rule_mask=mask)
+    pm.run(module, "")
+    return str(module)
+
+
 def test_rule_mask_accepts_selected_block_scan():
     # The two whitelists must land together: the C++ kKnown mask and the
-    # Python GRAPH_OPTIMIZATION_KNOWN_RULE_MASK (0xFBFF -> 0x1FBFF).
+    # Python GRAPH_OPTIMIZATION_KNOWN_RULE_MASK (0x3FBFF: bits 0-9, 11-17).
     options = NPUOptions(arch="Ascend910_95", rule_mask=SELECTED_BLOCK_SCAN_RULE_BIT)
     assert options.rule_mask == SELECTED_BLOCK_SCAN_RULE_BIT
     assert GRAPH_OPTIMIZATION_KNOWN_RULE_MASK & SELECTED_BLOCK_SCAN_RULE_BIT
@@ -955,10 +972,12 @@ def test_rule_mask_still_rejects_unknown_bits():
         normalize_graph_optimization_rule_mask(1 << 20)
 
 
-def test_default_graph_mask_unchanged():
-    assert DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK == 3071
-    assert NPUOptions(arch="Ascend910_95").rule_mask == 3071
-    assert not (DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK & SELECTED_BLOCK_SCAN_RULE_BIT)
+def test_default_graph_mask_includes_nsa_rule_pair():
+    # 3071 | bit 16 (Rule A) | bit 17 (Rule B)
+    assert DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK == 199679
+    assert NPUOptions(arch="Ascend910_95").rule_mask == 199679
+    assert DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK & SELECTED_BLOCK_SCAN_RULE_BIT
+    assert DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK & QUERY_ROW_BATCHING_RULE_BIT
 
 
 def test_add_graph_optimize_accepts_selected_block_scan(tmp_path):
@@ -971,27 +990,21 @@ def test_add_graph_optimize_accepts_selected_block_scan(tmp_path):
     assert_reparseable(module, tmp_path, "selected-block-scan-mask")
 
 
-def test_rule_a_gate_off_leaves_real_kernel_ir_unchanged():
-    """`accepted` must mean `eligible`, not `force applied`.
+def test_rule_a_bit_alone_matches_a_plus_b():
+    """Rule A has no separate Rule B gate.
 
-    The earlier version of this test ran on `graph_optimize_kernel`, which has no
-    gather loop at all: a byte-identical result only proved that the matcher
-    never ran, not that the gate held.  This one uses the positive TTIR fixture
-    the lit tests rewrite (a real NSA forward kernel that does contain the
-    pattern), asserts the pattern really is present, and then pins that adding
-    bit 16 to the default mask changes nothing -- the rule is eligible but not
-    force-applied, so the joint Rule A + Rule B gate declines while the plan is
-    being built.  The rewriting half of the gate is covered by the lit
-    `-force-apply` RUN lines, which can pass the escape hatch the Python option
-    surface deliberately does not expose; that escape hatch does rewrite this
-    exact fixture, which is what makes the equality here attributable to the
-    gate rather than to a non-match.
+    Rule A always runs Rule B's real implementation (the QueryRowBatching.h
+    materialize entry) inside its own sandbox and lets Rule B decide, so bit 16
+    alone must produce exactly the same IR as bit 16|17: the 131072 bit only
+    decides whether Rule B is ALSO scheduled as a standalone rule, where it
+    finds nothing left to lift.  This mirrors the `-graph-optimize
+    'rule-mask=65536'` vs `'rule-mask=196608'` equality pinned by
+    `unittest/Conversion/General/TritonToGraph/nsa_selected_block_scan.mlir`.
 
-    Shared fixture: this is the same file
-    `unittest/Conversion/General/TritonToGraph/nsa_selected_block_scan.mlir`
-    feeds to triton-opt, so moving or renaming `Inputs/nsa_fwd_const_ns.mlir`
-    has to update both places -- the pytest reads the fixture directly instead
-    of duplicating it.
+    Shared fixture: that lit file feeds the same
+    `Inputs/nsa_fwd_const_ns.mlir`, so moving or renaming the fixture has to
+    update both places -- the pytest reads it directly instead of duplicating
+    it.
     """
     fixture = RULE_A_TTIR_FIXTURES / "nsa_fwd_const_ns.mlir"
     source = fixture.read_text()
@@ -999,15 +1012,25 @@ def test_rule_a_gate_off_leaves_real_kernel_ir_unchanged():
     assert "!tt.ptr<i64>" in source
     assert "scf.for" in source
 
-    def render(mask):
-        context = ir.context()
-        ir.load_dialects(context)
-        ascend_ir.load_dialects(context)
-        module = ir.parse_mlir_module(str(fixture), context)
-        pm = ir.pass_manager(context)
-        ascend.passes.ttir.add_graph_optimize(pm, rule_mask=mask)
-        pm.run(module, "")
-        return str(module)
+    baseline = DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK & ~(SELECTED_BLOCK_SCAN_RULE_BIT | QUERY_ROW_BATCHING_RULE_BIT)
+    assert baseline == 3071
+    a_only = baseline | SELECTED_BLOCK_SCAN_RULE_BIT
+    assert _render_graph_optimize(fixture, a_only) == _render_graph_optimize(fixture,
+                                                                             a_only | QUERY_ROW_BATCHING_RULE_BIT)
 
-    default_mask = DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK
-    assert render(default_mask) == render(default_mask | SELECTED_BLOCK_SCAN_RULE_BIT)
+
+def test_default_graph_mask_rewrites_real_nsa_kernel():
+    """Default-on contract: the A+B pair fires with no caller-supplied mask.
+
+    The default mask carries bits 16 and 17, so the rewrite materializes for
+    this fixture without any `rule_mask=` argument.  The lit `JOINTREW` case
+    pins the exact rewritten shape; here we only assert that the default
+    differs from the baseline bundle and that the sparse `scf.if` fast path is
+    gone.
+    """
+    fixture = RULE_A_TTIR_FIXTURES / "nsa_fwd_const_ns.mlir"
+    baseline = DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK & ~(SELECTED_BLOCK_SCAN_RULE_BIT | QUERY_ROW_BATCHING_RULE_BIT)
+    baseline_ir = _render_graph_optimize(fixture, baseline)
+    default_ir = _render_graph_optimize(fixture, DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK)
+    assert baseline_ir != default_ir
+    assert "scf.if" not in default_ir

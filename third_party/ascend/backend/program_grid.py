@@ -22,10 +22,16 @@ GRAPH_OPTIMIZATION_KNOWN_RULE_MASK = 0x3FBFF
 INDEPENDENT_AXIS_TENSORIZE_RULE_BIT = 1 << 9
 PERSISTENT_TASK_STRIP_MINING_RULE_BIT = 1 << 11
 QUERY_ROW_BATCHING_RULE_BIT = 1 << 17
-# Rule bit for #2686 Rule A (SelectedBlockScanRule); off unless opted in.
+# Rule bit for #2686 Rule A (SelectedBlockScanRule). Rule A and Rule B are
+# default-on since both bits join DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK below.
+# Rule A has no separate Rule B switch: it always calls Rule B's materialize
+# entry and Rule B's real implementation decides; bit 17 only schedules Rule B
+# as a standalone rule.
 SELECTED_BLOCK_SCAN_RULE_BIT = 1 << 16
 DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK = (511 | INDEPENDENT_AXIS_TENSORIZE_RULE_BIT
-                                        | PERSISTENT_TASK_STRIP_MINING_RULE_BIT)
+                                        | PERSISTENT_TASK_STRIP_MINING_RULE_BIT
+                                        | SELECTED_BLOCK_SCAN_RULE_BIT
+                                        | QUERY_ROW_BATCHING_RULE_BIT)
 
 RUNTIME_ORIGINAL_GRID = "runtime_original_grid"
 HIDDEN_EXTENT_AXES = (0, 1)
