@@ -105,6 +105,19 @@ std::optional<IntegerBounds> inferMonotonicBounds(Value value, Value pid,
 // `inferMonotonicBounds`.
 bool isMonotoneInPid(Value value, Value pid, int64_t grid);
 
+// 引擎尚未支持的各类模式的开关。所有开关默认关闭，未置位的能力会保持
+// 原有的失败关闭路径。
+// Capability switches for patterns the engine does not lift yet. Every switch
+// defaults off, so an unset feature keeps the original fail-closed path.
+struct RowLiftFeatures {
+  // 循环体内出现 tt.reduce。
+  // tt.reduce appears in the loop body.
+  bool reduce = false;
+  // 条件不依赖查询行的 scf.if。
+  // scf.if whose condition does not depend on the query row.
+  bool loopInvariantIf = false;
+};
+
 // 单个提升值的字节预算。超过该宽度的值默认被拒绝，由
 // splitWideAccumulator 能力负责将其对半拆分。
 // Byte budget for one lifted value.  A value wider than this is declined by
@@ -180,6 +193,7 @@ struct RowLiftCandidate {
   // per-row validity mask be trimmed against the launch grid and is what the
   // row-count decision uses for its `grid/R >= coreNum` constraint.
   int64_t grid = 0;
+  RowLiftFeatures features;
 };
 
 // 以下判定函数只检查 IR、不生成 IR，供规则 matcher 与重写路径共用：matcher
@@ -191,6 +205,12 @@ struct RowLiftCandidate {
 // same predicate again so both stages cannot drift apart.
 
 
+// 能否重建条件与查询行无关的 scf.if：条件为标量 i1 且不依赖 `pid`，每个分支
+// 单 block，结果不携带块指针。
+// True when the scf.if can be rebuilt with every lifted row on the same branch:
+// a scalar i1 condition independent of `pid`, single-block branches, and no
+// block pointer among the results.
+bool liftsRowInvariantIf(scf::IfOp ifOp, Value pid);
 
 
 // 只提升与查询行相关的值。与行无关的 K/V load 保持二维；被提升的 lhs
@@ -213,6 +233,22 @@ private:
   // 按操作种类分派单条指令的重建；无法支持时返回 false，整次提升失败。
   // Rebuild one operation according to its kind; false declines the rewrite.
   bool rewrite(Operation *op);
+  // 在 axis+1 上重建 tt.reduce（前插了行维），并原样复用 combine region。
+  // Rebuild tt.reduce on axis+1 after the row dimension was inserted.
+  bool rewriteReduce(triton::ReduceOp reduce);
+  // 把值广播到目标形状：标量做 splat，行提升值补齐缺失的尾部单位维。
+  // Broadcast `v` to `target`: a scalar becomes a splat and a row-lifted value
+  // gains the missing trailing unit dimensions first.
+  Value broadcastFullValue(Value v, RankedTensorType target);
+  // 重建条件与查询行无关的 scf.if，两个分支都按行提升后的类型重建。
+  // Rebuild an scf.if whose condition does not depend on the query row.
+  bool rewriteIfOp(scf::IfOp old);
+  // 重建一个分支 region，返回新的 yield 值。`split` 逐结果说明该值是否以两个
+  // 半宽值表示，两个分支必须给出同一判断。
+  // Rebuild one branch region of an scf.if and its yield values.  `split` says
+  // per result whether it is represented by two half-width values; both branches
+  // must agree on it.
+  bool rewriteIfBody(Region &from, Region &to, ArrayRef<bool> split);
   // 合并一次提升访存涉及的所有掩码：描述符边界掩码、原始 mask 操作数以及
   // 运行期有效行掩码。没有任何掩码时返回空 Value；某一部分无法对齐到指针
   // 形状时 `ok` 置 false。
@@ -265,6 +301,7 @@ private:
 
   IRRewriter &rewriter;
   RowLiftCandidate candidate;
+  RowLiftFeatures features;
 
   // 原始 SSA 值到重建后计算的映射。
   // Original SSA values mapped to the rebuilt computation.

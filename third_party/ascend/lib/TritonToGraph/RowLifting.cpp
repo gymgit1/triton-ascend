@@ -54,11 +54,13 @@ namespace cfg {
 // 文件内函数与既定需求条目的对应关系：
 //   1. 公共组件：本文件即从 DotRowCoalescing 抽出的行提升引擎，各规则
 //      各自维护 matcher，重建逻辑只保留这一份。
+//   2. tt.reduce 与条件与行号无关的 scf.if：rewriteReduce / rewriteIfOp。
 //   8. 「入口生成合并版与回退版」由规则层（Rule / ProgramGridTransform）
 //      负责，不属于本文件。
 //
-// 约定：DotRow 规则不置位任何能力开关，因此其输出与基线指令序列逐字节
-// 一致。
+// 约定：RowLiftFeatures 中的能力开关全部默认关闭，未置位的能力走原有的
+// 失败关闭路径；DotRow 规则不置位任何新开关，因此其输出与基线指令序列
+// 逐字节一致。
 
 // 判断 v 是否等于 pid 或由 pid 的顶层计算链产生；不深入 region。
 bool dependsOnValue(Value v, Value pid) {
@@ -481,7 +483,7 @@ static int64_t getTensorBytes(RankedTensorType type) {
 
 // 保存重写器与候选描述，能力开关从候选同步过来。
 RowLiftBuilder::RowLiftBuilder(IRRewriter &rewriter, RowLiftCandidate candidate)
-    : rewriter(rewriter), candidate(candidate) {}
+    : rewriter(rewriter), candidate(candidate), features(candidate.features) {}
 
 // 运行期网格把 x 轴 extent 作为倒数第二个隐藏参数追加在函数参数尾部
 // （末尾一个是 y 轴 extent）。参数布局由 ProgramGridTransform 定义，这里集中
@@ -679,8 +681,17 @@ bool RowLiftBuilder::rewrite(Operation *op) {
     return true;
   }
 
-  // 步骤 3：带 region 的形态暂不支持重建（通用克隆只复制操作数与结果类型，
-  // 会留下缺失 region 的指令），先失败关闭。
+  // 步骤 3：带 region 的形态无法走通用克隆（通用克隆只复制操作数与结果
+  // 类型，会留下缺失 region 的指令），必须单独重建。
+  // Dispatch the region-bearing shapes that the generic path below cannot
+  // rebuild: it clones operands and result types only, so it would emit an op
+  // whose region is missing.
+  if (auto reduce = dyn_cast<triton::ReduceOp>(op))
+    return rewriteReduce(reduce);
+  // 目前只有 scf.if 能按带 region 的方式重建；其他形态失败关闭，避免生成
+  // 缺少 region 的操作。
+  if (auto ifOp = dyn_cast<scf::IfOp>(op))
+    return rewriteIfOp(ifOp);
   if (op->getNumRegions() != 0)
     return false;
 
@@ -1072,6 +1083,41 @@ Value RowLiftBuilder::broadcastRowValue(Value v, RankedTensorType target) {
   return rewriter.create<triton::BroadcastOp>(v.getLoc(), target, v);
 }
 
+// 在 axis+1 上重建 tt.reduce，并原样复用 combine region。
+// 行维插在最前面后，原 axis 对应的轴号全部后移一位。
+bool RowLiftBuilder::rewriteReduce(triton::ReduceOp reduce) {
+  // 能力未开启或没有输入时保持失败关闭。
+  if (!features.reduce || reduce.getSrcs().empty())
+    return false;
+
+  // 所有源值补行维。
+  SmallVector<Value> sources;
+  for (Value src : reduce.getSrcs())
+    sources.push_back(ensureRowDimension(src));
+
+  // 归约轴从 axis 变为 axis+1，逐行独立归约。
+  auto replacement = rewriter.create<triton::ReduceOp>(
+      reduce.getLoc(), sources, reduce.getAxis() + 1);
+  // combine region 只关心元素类型，与形状无关，因此可以整段原样复用。
+  // The combine region sees element types only, so it is reused verbatim.
+  rewriter.cloneRegionBefore(reduce.getCombineOp(),
+                             replacement.getCombineOp(),
+                             replacement.getCombineOp().end());
+  valueMapping.map(reduce.getResults(), replacement.getResults());
+  return true;
+}
+
+// 把值广播到目标形状：标量 splat，行提升值补齐缺失的单位维。
+Value RowLiftBuilder::broadcastFullValue(Value v, RankedTensorType target) {
+  // 标量直接 splat；已带行维的 [R,...] 值先补 tile 方向的单位维再广播。
+  // A scalar becomes a splat; a row-lifted [R x ...] value gains the tile
+  // dimensions behind its row dimension before broadcasting.
+  if (!isa<RankedTensorType>(v.getType()))
+    return rewriter.create<triton::SplatOp>(v.getLoc(), target, v);
+  if (v.getType() == target)
+    return v;
+  return broadcastRowValue(v, target);
+}
 
 
 
@@ -1085,9 +1131,97 @@ Value RowLiftBuilder::broadcastRowValue(Value v, RankedTensorType target) {
 
 
 
+// scf.if 能否按「所有提升行走同一分支」重建的完整判据：条件必须是标量与行
+// 无关，分支各只有一个 block，结果不能是块指针。规则 matcher 与 rewriteIfOp
+// 共用，匹配阶段就能拒绝逐行走不同分支的形态。
+// The complete predicate for a row-invariant scf.if, shared by the rule's
+// matcher and rewriteIfOp.
+bool liftsRowInvariantIf(scf::IfOp ifOp, Value pid) {
+  // 条件必须是标量 i1，且不依赖查询行；否则各行可能走不同分支。这里用会
+  // 穿透 region 的 isPidInvariant：条件可能由某个 scf.if 的分支产出，浅层
+  // 判据会把这种情况误判为行无关。
+  // Every lifted row takes the same branch, so the condition stays a scalar and
+  // must not depend on the query row.  isPidInvariant looks through regions: the
+  // condition may come from a branch of another scf.if, which the shallow probe
+  // would wrongly report as row-invariant.
+  Value condition = ifOp.getCondition();
+  if (!condition.getType().isInteger(1) || !isPidInvariant(condition, pid))
+    return false;
+  // 每个分支目前只支持单 block 形态。
+  if (!llvm::hasSingleElement(ifOp.getThenRegion().getBlocks()) ||
+      (!ifOp.getElseRegion().empty() &&
+       !llvm::hasSingleElement(ifOp.getElseRegion().getBlocks())))
+    return false;
+  // 块指针不能作为 scf.if 的结果值。
+  return llvm::none_of(ifOp.getResultTypes(), isTensorPointer);
+}
 
+// 重建条件与查询行无关的 scf.if，分支结果按提升后的类型重建。
+// 因为所有提升行都走同一分支，条件保持标量、不补行维。
+bool RowLiftBuilder::rewriteIfOp(scf::IfOp old) {
+  // 能力未开启时保持原有失败关闭路径。
+  if (!features.loopInvariantIf)
+    return false;
+  // 条件必须是标量 i1 且未带行维，否则各行可能走不同分支。
+  // Every lifted row takes the same branch, so the condition stays a scalar.
+  Value condition = old.getCondition();
+  if (!condition.getType().isInteger(1) || hasRowDimension(condition))
+    return false;
+  // 每个分支目前只支持单 block 形态。
+  if (!llvm::hasSingleElement(old.getThenRegion().getBlocks()) ||
+      (!old.getElseRegion().empty() &&
+       !llvm::hasSingleElement(old.getElseRegion().getBlocks())))
+    return false;
 
+  // 结果类型统一补行维；块指针不能作为 scf.if 的结果值。
+  // Every result gains the row dimension.
+  SmallVector<Type> types;
+  for (Type t : old.getResultTypes()) {
+    // A block pointer cannot be carried by an scf.if result.
+    if (isTensorPointer(t))
+      return false;
+    types.push_back(getLiftedType(t));
+  }
 
+  // 先建出带空分支的 scf.if，再逐分支重建。
+  auto replacement = rewriter.create<scf::IfOp>(
+      old.getLoc(), types, valueMapping.lookupOrDefault(condition),
+      /*withElseRegion=*/!old.getElseRegion().empty());
+  if (!rewriteIfBody(old.getThenRegion(), replacement.getThenRegion()) ||
+      !rewriteIfBody(old.getElseRegion(), replacement.getElseRegion()))
+    return false;
+
+  // 分支重建完成后插入点会留在分支 block 内，这里移回 if 之后。
+  // Body rewriting leaves the insertion point inside the branch blocks.
+  rewriter.setInsertionPointAfter(replacement);
+  valueMapping.map(old.getResults(), replacement.getResults());
+  return true;
+}
+
+// 重建 scf.if 的一个分支 region，并生成提升后的 yield。
+bool RowLiftBuilder::rewriteIfBody(Region &from, Region &to) {
+  if (from.empty())
+    return true;
+
+  // 新 scf.if 已经为每个分支建好一个 block，这里清空其占位内容后重放指令。
+  // The new scf.if already owns one block per branch, possibly with a
+  // placeholder terminator that this rebuild replaces.
+  Block *body = &to.front();
+  body->clear();
+  rewriter.setInsertionPointToStart(body);
+  for (Operation &op : from.front().without_terminator())
+    if (!rewrite(&op))
+      return false;
+
+  // 重建分支 yield：每个值补行维。
+  auto yield = cast<scf::YieldOp>(from.front().getTerminator());
+  SmallVector<Value> values;
+  for (Value v : yield.getOperands())
+    values.push_back(ensureRowDimension(v));
+
+  rewriter.create<scf::YieldOp>(yield.getLoc(), values);
+  return true;
+}
 
 } // namespace cfg
 } // namespace triton
