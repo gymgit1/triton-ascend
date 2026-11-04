@@ -60,6 +60,8 @@ namespace cfg {
 //   4. 规则 B 的注册与 matcher 在 QueryRowBatchingRule.cpp，本文件不承担。
 //   5. 下标表改成每行一份地读：循环体内与行相关的 load 在逐行有效掩码下
 //      各自读取自己那一份（步骤 4b），不做整表提升。
+//   6. O 与 lse 的带掩码写回：maskedStore 能力 + rewriteDescriptorStore，
+//      循环内保持压平形状，不出现逐轮 reshape。
 //   8. 「入口生成合并版与回退版」由规则层（Rule / ProgramGridTransform）
 //      负责，不属于本文件。
 //
@@ -862,10 +864,13 @@ bool RowLiftBuilder::rewrite(Operation *op) {
     }
   }
 
-  // 步骤 4i：运行期网格下的 store 需要逐行有效掩码，因此单独重建。带掩码的
-  // 写回能力尚未开启，带掩码 store 暂时失败关闭。
+  // 步骤 4i：带掩码的 store（O、lse 的写回）只有在 maskedStore 能力开启时
+  // 才提升；否则通用克隆会构造出形状与提升后指针不匹配的 mask。
+  // A masked store is lifted only when the capability is enabled; the generic
+  // clone below would otherwise build a mask whose shape no longer matches the
+  // lifted pointer.
   if (auto store = dyn_cast<triton::StoreOp>(op)) {
-    if (candidate.runtimeGrid) {
+    if (candidate.runtimeGrid || (store.getMask() && features.maskedStore)) {
       Value pointer = ensureRowDimension(store.getPtr());
       if (!isa<RankedTensorType>(pointer.getType()))
         return false;
@@ -1567,7 +1572,7 @@ bool RowLiftBuilder::emitDescriptorLoad(triton::LoadOp load,
   // maskedStore 能力控制。
   // A mask operand on a block pointer needs the same row expansion as the
   // store side, so it stays gated behind maskedStore.
-  if (load.getMask())
+  if (load.getMask() && !features.maskedStore)
     return false;
   // 边界检查轴号必须落在 tile 维度内。
   ArrayRef<int32_t> boundaryCheck = load.getBoundaryCheck();
@@ -1650,7 +1655,7 @@ bool RowLiftBuilder::rewriteDescriptorStore(
   // maskedStore 能力控制。
   // O and lse are written back under a mask, so the mask operand is part of
   // the row expansion when the capability is enabled.
-  if (store.getMask())
+  if (store.getMask() && !features.maskedStore)
     return false;
   // 边界检查轴号必须落在 tile 维度内。
   ArrayRef<int32_t> boundaryCheck = store.getBoundaryCheck();

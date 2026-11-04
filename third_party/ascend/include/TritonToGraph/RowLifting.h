@@ -124,6 +124,9 @@ struct RowLiftFeatures {
   // A row-dependent load in the loop body, rebuilt under the per-row active
   // mask so a row whose scan already ended never touches memory.
   bool maskedLoad = false;
+  // O 和 lse 带掩码写回。
+  // O and lse are written back under a mask.
+  bool maskedStore = false;
 };
 
 // 单个提升值的字节预算。超过该宽度的值默认被拒绝，由

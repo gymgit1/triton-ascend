@@ -433,6 +433,8 @@ matchQueryRows(triton::FuncOp fn, uint64_t l0aBudgetBytes,
   candidate.features.tensorPointer = true;
   // The per-row active mask keeps a row whose scan already ended off memory.
   candidate.features.maskedLoad = true;
+  // O and lse are written back under the per-row mask.
+  candidate.features.maskedStore = true;
   // 行数完全交给公共策略，规则 B 不自带收益模型：M 维不设上限
   // （targetDotRows 保持 0）。
   // The row count comes from the shared policy, so rule B carries no private
