@@ -36,6 +36,7 @@
 #include "llvm/Support/Debug.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 #define DEBUG_TYPE "graph-optimize"
 
@@ -434,18 +435,25 @@ int64_t selectRowsPerProgram(int64_t grid, int64_t maxDotRows,
   if (maxTensorBytes > 0)
     tighten(budget / maxTensorBytes);
   // UB 预算：提升后与查询行相关的值随 R 线性增长，因此以原始函数的峰值活值
-  // 作为每因子需求，即 R × estimatePeakLiveBytes <= UB。预算是 ResourceSnapshot
-  // 的真实可用 UB（物理容量减预留后打安全系数），它与 L0A/L0C、网格一样只在 R
-  // 取值的阈值里生效，不再作为事后的合法性判据。
+  // 作为每因子需求，即 R × peak × 复制份数 <= UB。静态峰值按一份统计，而后端
+  // 会多缓冲循环携带的 UB 张量（见 kUBBufferReplication 的实测数据），不乘这份
+  // 复制就会放行装不进 UB 的形态（NSA bwd-dq 4 行提升真机 ub overflow）。预算
+  // 是 ResourceSnapshot 的真实可用 UB（物理容量减预留后打安全系数），它与
+  // L0A/L0C、网格一样只在 R 取值的阈值里生效，不再作为事后的合法性判据。
   // UB budget: query-row-dependent values grow linearly with R, so the un-lifted
-  // peak live bytes are the per-factor demand, i.e. R × estimatePeakLiveBytes <=
-  // UB.  The budget is the real usable UB from ResourceSnapshot (physical
-  // capacity minus reserved, scaled by the safety percent), and it bounds the R
-  // value together with L0A/L0C and the grid instead of acting as a post-hoc
-  // legality check.
-  if (policy.ubBudgetBytes > 0 && peakLiveBytes > 0)
-    tighten(static_cast<int64_t>(
-        policy.ubBudgetBytes / static_cast<uint64_t>(peakLiveBytes)));
+  // peak live bytes times the backend's buffer replication are the per-factor
+  // demand, i.e. R × peak × replication <= UB.  The static peak counts one copy
+  // while the backend multi-buffers loop-carried UB tensors (see the measured
+  // numbers on kUBBufferReplication); without that factor a form that cannot fit
+  // UB is admitted (the NSA bwd-dq 4-row lift overflows on device).  The budget is
+  // the real usable UB from ResourceSnapshot (physical capacity minus reserved,
+  // scaled by the safety percent), and it bounds the R value together with
+  // L0A/L0C and the grid instead of acting as a post-hoc legality check.
+  if (policy.ubBudgetBytes > 0 && peakLiveBytes > 0) {
+    const uint64_t perFactorDemand =
+        static_cast<uint64_t>(peakLiveBytes) * kUBBufferReplication;
+    tighten(static_cast<int64_t>(policy.ubBudgetBytes / perFactorDemand));
+  }
   // 提升后 M 维上限；0 表示调用方不限制。
   // Cap on the lifted M dimension; zero means the caller does not cap it.
   if (policy.targetDotRows > 0 && maxDotRows > 0)
@@ -473,6 +481,11 @@ int64_t selectRowsPerProgram(int64_t grid, int64_t maxDotRows,
   // monotone, so it still needs the downward walk.
   while (factor >= 2 && grid && grid % factor != 0)
     factor /= 2;
+
+  if (::getenv("TRITON_GRAPH_UB_DEBUG"))
+    llvm::errs() << "graph-ub[rowcount]: unLiftedPeak=" << peakLiveBytes
+                 << " ubBudget=" << policy.ubBudgetBytes << " limit=" << *limit
+                 << " R=" << factor << "\n";
 
   return factor >= 2 ? factor : 1;
 }

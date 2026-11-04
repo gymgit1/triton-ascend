@@ -10,16 +10,17 @@
 // directory (no budget options) is unaffected.  An over-budget form is declined
 // with a warning on the live function; the pass never fails.
 //
-// Measured on Inputs/nsa_fwd_const_ns.mlir: rule A's own form peaks at 40,964 B,
-// the joint rule A + rule B form at 164,864 B.  Rule B judges its own candidates
-// on a demand figure, not that peak: once the value dimension leaves one vector
-// register it multiplies the estimate by the split-tier x loop-carried-buffer
-// amplification (2 x 2), so the joint form demands 659,456 B.  The production
-// budget is 209,715 B (physical 256 KiB x 80 %), which is why section 5 below
-// passes a larger explicit capacity: it exercises the gate's "fits, do not warn"
-// path, while section 4 pins the declining path.
+// Measured on Inputs/nsa_fwd_const_ns.mlir: rule A's own form peaks at 41,108 B,
+// the joint rule A + rule B form at 165,488 B.  The predicate budgets a demand
+// figure, not that peak: the static estimate counts each UB tensor once while
+// the backend multi-buffers loop-carried UB buffers, so both forms are scaled by
+// the buffer replication factor (kUBBufferReplication = 2): rule A demands
+// 82,216 B and the joint form 330,976 B.  The production budget is 209,715 B
+// (physical 256 KiB x 80 %), so rule A's own form fits but the joint form does
+// not; section 5 passes a larger explicit capacity to exercise the gate's
+// "fits, do not warn" path, while section 4 pins the declining path.
 
-// --- 1. UB: budget 2048*80/100 = 1638 B < rule A's 40,964 B ---------------
+// --- 1. UB: budget 2048*80/100 = 1638 B < rule A's 82,216 B demand -------
 // force-apply commits rule A alone, so its own overflow declines the rewrite and
 // names both numbers.  The IR stays byte-identical to the control.
 // RUN: triton-opt %S/Inputs/nsa_fwd_const_ns.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.ctl
@@ -48,14 +49,14 @@
 // RUN: diff %t.ctl %t.joint
 
 // --- 5. joint path under budgets wide enough for rule B's demand model ----
-// 1 MiB x 80 % = 838,861 B >= the joint form's 659,456 B demand, so the second
+// 1 MiB x 80 % = 838,861 B >= the joint form's 330,976 B demand, so the second
 // (post-rule-B) checkpoint passes and the committed form is the lifted loop.
 // RUN: triton-opt %S/Inputs/nsa_fwd_const_ns.mlir -graph-optimize='rule-mask=196608 ub-capacity-bytes=1048576 mapping-l0a-capacity-bytes=65536 mapping-l0b-capacity-bytes=65536 mapping-l0c-capacity-bytes=262144' -canonicalize -cse -o %t.jointfit 2> %t.jointfit.err
 // RUN: diff %t.empty %t.jointfit.err
 // RUN: FileCheck %s --check-prefix=JOINTFIT --implicit-check-not='scf.if' < %t.jointfit
 
 // BUDGETWARN — the UB verdict: which form, both numbers, the decline.
-// BUDGETWARN: warning: selected-block-scan: rule A's rewrite needs 40964 bytes of UB, budget 1638; declining
+// BUDGETWARN: warning: selected-block-scan: rule A's rewrite needs 82216 bytes of UB, budget 1638; declining
 
 // CUBEWARN — the cube verdict (no scalar to quote; the budgets are per-arch).
 // CUBEWARN: warning: selected-block-scan: rule A's rewrite exceeds the L0A/L0B/L0C cube budgets; declining

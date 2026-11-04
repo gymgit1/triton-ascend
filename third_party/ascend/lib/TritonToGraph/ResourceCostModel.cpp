@@ -385,6 +385,23 @@ std::optional<uint64_t> cfg::getStaticTensorBytes(Type type) {
   if (!elementBits || *elementBits == 0)
     return std::nullopt;
 
+  // UB 按字节寻址：后端把 i1 掩码这类窄元素按「1 字节/元素」落地，而不是位
+  // 紧凑。实测 bishengir 的 hivm IR 里 memref<4x16x256x1xi1> 占 16 KiB
+  // （16384 个元素 = 16384 B，正好 1 B/元素），按位宽折算会把掩码低估 8 倍，
+  // 而掩码正是 SelectedBlockScan/QueryRowBatching 提升后常驻 UB 的大头之一
+  // （多缓冲后还会被复制 3~5 份）。因此先把元素宽度向上取整到整字节，再乘
+  // 元素数。
+  // UB is byte-addressed: the backend materialises narrow elements such as i1
+  // masks at one byte per element rather than bit-packed.  A bishengir hivm
+  // memref<4x16x256x1xi1> occupies 16 KiB (16384 elements = 16384 B, i.e.
+  // exactly 1 B/element), so dividing by 8 under-counts masks 8x -- and masks
+  // are among the biggest UB residents the SelectedBlockScan / QueryRowBatching
+  // lifting adds (the backend then replicates them 3~5x when multi-buffering).
+  // Round the element width up to whole bytes before multiplying by the element
+  // count.
+  const uint64_t elementBytes =
+      std::max<uint64_t>(1, (static_cast<uint64_t>(*elementBits) + 7) / 8);
+
   uint64_t elements = 1;
   for (int64_t dimension : tensor.getShape()) {
     if (dimension < 0)
@@ -393,12 +410,10 @@ std::optional<uint64_t> cfg::getStaticTensorBytes(Type type) {
       return std::nullopt;
   }
 
-  uint64_t totalBits = 0;
-  if (!checkedMul(elements, *elementBits, totalBits))
+  uint64_t totalBytes = 0;
+  if (!checkedMul(elements, elementBytes, totalBytes))
     return std::nullopt;
-  if (totalBits > std::numeric_limits<uint64_t>::max() - 7)
-    return std::nullopt;
-  return (totalBits + 7) / 8;
+  return totalBytes;
 }
 
 LiveByteEstimate cfg::estimatePeakLiveBytes(Operation *root) {

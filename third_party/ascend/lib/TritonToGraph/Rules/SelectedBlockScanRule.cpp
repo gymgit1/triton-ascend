@@ -44,6 +44,7 @@
 #include "TritonToGraph/GraphOptimizationRule.h"
 #include "TritonToGraph/ProgramGridTransform.h"
 #include "TritonToGraph/QueryRowBatching.h"
+#include "TritonToGraph/RowLifting.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -67,6 +68,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 
@@ -2695,11 +2697,22 @@ static bool budgetOverflow(triton::FuncOp sandboxFunction,
                            llvm::StringRef form, triton::FuncOp liveFunction) {
   if (std::optional<uint64_t> safeUB = resources.getSafeUBBudget()) {
     LiveByteEstimate estimate = estimatePeakLiveBytes(sandboxFunction);
-    if (estimate.known && estimate.peakLiveBytes > *safeUB) {
+    // 静态峰值只按一份统计 UB 张量，后端对循环携带的 UB 缓冲做多缓冲，因此判据
+    // 要按复制份数折算（见 kUBBufferReplication 的实测数据）。
+    // The static peak counts one copy of each UB tensor while the backend
+    // multi-buffers loop-carried UB buffers, so the predicate budgets the
+    // replicated demand (see the measured numbers on kUBBufferReplication).
+    const uint64_t demand =
+        estimate.known ? estimate.peakLiveBytes * kUBBufferReplication : 0;
+    if (::getenv("TRITON_GRAPH_UB_DEBUG"))
+      llvm::errs() << "graph-ub[rule]: form=" << form
+                   << " liftedPeak=" << estimate.peakLiveBytes
+                   << " known=" << estimate.known << " demand=" << demand
+                   << " ubBudget=" << *safeUB << "\n";
+    if (estimate.known && demand > *safeUB) {
       liveFunction.emitWarning()
-          << "selected-block-scan: " << form << " needs "
-          << estimate.peakLiveBytes << " bytes of UB, budget " << *safeUB
-          << "; declining";
+          << "selected-block-scan: " << form << " needs " << demand
+          << " bytes of UB, budget " << *safeUB << "; declining";
       return true;
     }
   }

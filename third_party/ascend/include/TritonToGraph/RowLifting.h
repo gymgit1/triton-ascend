@@ -143,6 +143,29 @@ constexpr int64_t kMaxLiftedValueBytes = 128 * 1024;
 // derived from the hardware width rather than a hard-coded column count.
 constexpr int64_t kVectorRegisterBytes = 256;
 
+// UB 多缓冲复制份数：`--enable-auto-multi-buffer` 在 A5（950 系列）默认打开，
+// 后端把循环携带的 UB 张量复制成两份缓冲（hivm.multi_buffer >= 2），而
+// estimatePeakLiveBytes 只按一份统计，于是静态峰值系统性低估 UB 需求。
+// 实测 NSA bwd-dq（B7_T111_H2_HQ32_K110）：静态峰值 107,604 B，bishengir 的
+// plan-memory 实际要 247,808 B（2.30×），按一份估算的预算判据因此放行了一个
+// 装不进 216 KiB 的 4 行提升形态，真机报 ub overflow。
+// 按两份建模：一轮流水的循环携带缓冲至少双缓冲。split-tier 的半宽链项不再单列
+// ——宽累加器已由 splitWideAccumulator 与单值预算约束，重复计会和新 R 定界叠加
+// 成 4 倍，把本可两行的形态压到不提升。
+// UB multi-buffer copies: `--enable-auto-multi-buffer` is on by default on A5
+// (950 family), and the backend double-buffers loop-carried UB tensors
+// (hivm.multi_buffer >= 2) while estimatePeakLiveBytes counts each value once,
+// so the static peak systematically under-estimates the UB demand.  Measured on
+// NSA bwd-dq (B7_T111_H2_HQ32_K110): a static peak of 107,604 B became
+// 247,808 B in bishengir's plan-memory (2.30x), so the one-copy check let a
+// 4-row lifted form through that cannot fit 216 KiB and the device reported
+// ub overflow.  Model two copies: a pipelined loop-carried buffer is at least
+// double buffered.  The split-tier half-chain term is deliberately not
+// re-applied: the wide accumulator is already bounded by splitWideAccumulator
+// and the per-value budget, and counting it again would combine with the new R
+// bound into 4x and suppress lifts that do fit.
+constexpr uint64_t kUBBufferReplication = 2;
+
 // 查询行数的收益策略。行数决策只在这里实现，资源模型只需替换本策略即可。
 // Profitability policy for the query-row count.  The row-count decision lives
 // here and nowhere else, so a resource model only has to replace this function.
