@@ -245,3 +245,58 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num
     tt.return
   }
 }
+// -----
+
+// A runtime trip count is lifted too.  The bound stays a scalar load because it
+// is pid-invariant, and each row's active mask ends its own iterations.
+
+// CHECK: module attributes {{.*}}hacc.coalesce_factor = 64 : i32
+// CHECK-LABEL: tt.func @table_read_runtime_bound(
+// CHECK: tt.load {{.*}} : !tt.ptr<i32>
+// CHECK: scf.for
+// CHECK: tt.load {{.*}} : tensor<64x!tt.ptr<i32>>
+// CHECK: tt.load {{.*}} : tensor<64x16x16x!tt.ptr<f16>>
+// CHECK: tt.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<1024x16xf16> * tensor<16x16xf16> -> tensor<1024x16xf32>
+// CHECK: arith.select {{.*}} : tensor<64x16x16xi1>, tensor<64x16x16xf32>
+// CHECK: tt.store {{.*}} : tensor<64x16x16x!tt.ptr<f32>>
+module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num_tiles = 64 : i32} {
+  tt.func @table_read_runtime_bound(%A: !tt.ptr<f16>, %B: !tt.ptr<f16>, %C: !tt.ptr<f32>, %S: !tt.ptr<i32>, %N: !tt.ptr<i32>) {
+    %pid = tt.get_program_id x : i32
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %stride = arith.constant 256 : i32
+    %base = arith.muli %pid, %stride : i32
+    %ub = tt.load %N : !tt.ptr<i32>
+    %r = tt.make_range {start = 0 : i32, end = 16 : i32} : tensor<16xi32>
+    %c = tt.make_range {start = 0 : i32, end = 16 : i32} : tensor<16xi32>
+    %r2 = tt.expand_dims %r {axis = 1 : i32} : tensor<16xi32> -> tensor<16x1xi32>
+    %c2d = tt.expand_dims %c {axis = 0 : i32} : tensor<16xi32> -> tensor<1x16xi32>
+    %sixteen = arith.constant dense<16> : tensor<16x1xi32>
+    %rs = arith.muli %r2, %sixteen : tensor<16x1xi32>
+    %rr = tt.broadcast %rs : tensor<16x1xi32> -> tensor<16x16xi32>
+    %cc = tt.broadcast %c2d : tensor<1x16xi32> -> tensor<16x16xi32>
+    %local = arith.addi %rr, %cc : tensor<16x16xi32>
+    %bases = tt.splat %base : i32 -> tensor<16x16xi32>
+    %offset = arith.addi %bases, %local : tensor<16x16xi32>
+    %ap = tt.splat %A : !tt.ptr<f16> -> tensor<16x16x!tt.ptr<f16>>
+    %pa = tt.addptr %ap, %offset : tensor<16x16x!tt.ptr<f16>>, tensor<16x16xi32>
+    %bp = tt.splat %B : !tt.ptr<f16> -> tensor<16x16x!tt.ptr<f16>>
+    %pb = tt.addptr %bp, %local : tensor<16x16x!tt.ptr<f16>>, tensor<16x16xi32>
+    %si = tt.addptr %S, %pid : !tt.ptr<i32>, i32
+    %zero0 = arith.constant dense<0.0> : tensor<16x16xf32>
+    %loop = scf.for %iv = %c0 to %ub step %c1 iter_args(%acc0 = %zero0) -> (tensor<16x16xf32>) : i32 {
+      %sp = tt.addptr %si, %iv : !tt.ptr<i32>, i32
+      %blk = tt.load %sp : !tt.ptr<i32>
+      %blks = tt.splat %blk : i32 -> tensor<16x16xi32>
+      %pqa = tt.addptr %pa, %blks : tensor<16x16x!tt.ptr<f16>>, tensor<16x16xi32>
+      %a = tt.load %pqa : tensor<16x16x!tt.ptr<f16>>
+      %b = tt.load %pb : tensor<16x16x!tt.ptr<f16>>
+      %dot0 = tt.dot %a, %b, %acc0 : tensor<16x16xf16> * tensor<16x16xf16> -> tensor<16x16xf32>
+      scf.yield %dot0 : tensor<16x16xf32>
+    }
+    %cp = tt.splat %C : !tt.ptr<f32> -> tensor<16x16x!tt.ptr<f32>>
+    %pc = tt.addptr %cp, %offset : tensor<16x16x!tt.ptr<f32>>, tensor<16x16xi32>
+    tt.store %pc, %loop : tensor<16x16x!tt.ptr<f32>>
+    tt.return
+  }
+}

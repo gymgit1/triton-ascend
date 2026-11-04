@@ -58,6 +58,8 @@ namespace cfg {
 //   3. Q、O 的 tensor pointer 展开成指针张量：rewriteTensorPointer，以及
 //      描述符 load/store 的重建。
 //   4. 规则 B 的注册与 matcher 在 QueryRowBatchingRule.cpp，本文件不承担。
+//   5. 下标表改成每行一份地读：循环体内与行相关的 load 在逐行有效掩码下
+//      各自读取自己那一份（步骤 4b），不做整表提升。
 //   8. 「入口生成合并版与回退版」由规则层（Rule / ProgramGridTransform）
 //      负责，不属于本文件。
 //
@@ -724,6 +726,46 @@ bool RowLiftBuilder::rewrite(Operation *op) {
       return rewriteDescriptorStore(store, it->second);
   }
 
+  // 步骤 4b：循环体内与行相关的普通 load。某些行的扫描可能已经结束，只有
+  // 逐行有效掩码能把它们挡在内存之外，缺少该能力时保持原有的投机访存
+  // 语义并拒绝提升。
+  if (auto load = dyn_cast<triton::LoadOp>(op)) {
+    if (op->getParentOfType<scf::ForOp>()) {
+      // A row-dependent load in the body reads the addresses of rows whose
+      // scan may already have ended.  Only the per-row active mask keeps those
+      // rows off memory, so without the capability the load stays speculative
+      // and is declined.
+      if (!features.maskedLoad || !rowActiveMask)
+        return false;
+      Value pointer = ensureRowDimension(load.getPtr());
+      if (!isa<RankedTensorType>(pointer.getType()))
+        return false;
+      bool ok = true;
+      Value mask =
+          combineMemoryMask(pointer, load.getMask(), rowActiveMask, ok);
+      if (!ok || !mask)
+        return false;
+      // other 值（掩码为假时的填充）同样要补行维并与提升后的类型对齐。
+      auto type = getLiftedType(load.getType());
+      Value other =
+          load.getOther()
+              ? broadcastFullValue(ensureRowDimension(load.getOther()), type)
+              : buildMaskPadding(rewriter, op->getLoc(), type,
+                                 load.getPadding());
+      if (!other)
+        return false;
+      auto replacement = rewriter.create<triton::LoadOp>(
+          op->getLoc(), pointer, mask, other, load.getBoundaryCheck(),
+          load.getPadding(), load.getCache(), load.getEvict(),
+          load.getIsVolatile());
+      valueMapping.map(load.getResult(), replacement.getResult());
+      return true;
+    }
+    // 循环外的 load 没有「扫描提前结束」的行，继续走下面通用重建，
+    // 保持历史行为。
+    // A load above the loop has no row whose scan could have ended early, so it
+    // keeps the historical generic rebuild below.
+  }
   // 步骤 4c：dot。只有 A 与查询行相关、B 与行无关时才提升：把 [R,M,K] 展平
   // 成 [R*M,K] 复用普通 dot，结果再 reshape 回 [R,M,N]。
   if (auto dot = dyn_cast<triton::DotOp>(op)) {
@@ -972,6 +1014,12 @@ bool RowLiftBuilder::rewriteLoop(scf::ForOp old) {
     valueMapping.map(arg, loop.getRegionIterArgs()[index]);
 
   rewriter.setInsertionPointToStart(loop.getBody());
+  // 步骤 4：循环体内与行相关的访存需要逐行有效掩码，因此必须在重建循环体
+  // 之前就准备好。
+  // A row-dependent body access needs the per-row mask, so it has to be
+  // available before the body is rebuilt.
+  if (features.maskedLoad)
+    rowActiveMask = createLoopActiveMask(old, loop);
   for (Operation &op : old.getBody()->without_terminator())
     if (!rewrite(&op))
       return false;

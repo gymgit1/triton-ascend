@@ -119,6 +119,11 @@ struct RowLiftFeatures {
   // Q 和 O 由 tt.make_tensor_ptr 构造。
   // Q and O are built with tt.make_tensor_ptr.
   bool tensorPointer = false;
+  // 循环体内与行相关的 load，在逐行有效掩码下重建，保证扫描已结束的行
+  // 不再访问内存。
+  // A row-dependent load in the loop body, rebuilt under the per-row active
+  // mask so a row whose scan already ended never touches memory.
+  bool maskedLoad = false;
 };
 
 // 单个提升值的字节预算。超过该宽度的值默认被拒绝，由
