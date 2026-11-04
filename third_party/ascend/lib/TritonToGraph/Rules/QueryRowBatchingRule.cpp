@@ -57,18 +57,23 @@ namespace {
 
 // 规则 B（QueryRowBatchingRule，规则位 131072，ProgramMapping 阶段）只负责
 // 行提升：保持循环结构，把与查询行相关的值前插行维 [R]（每个 program 处理 R
-// 个查询行），并借助公共引擎 RowLiftBuilder 完成逐行掩码访存与掩码写回。它
-// 不要求循环已经是顺序扫描，也不用「循环体内是否还有下标表读」这类形态代理
-// 反推上游规则是否已经跑过：循环体内与行相关的访存一律由重写路径的逐行有效
-// 掩码兜住，判定口径只有一份。
+// 个查询行），并借助公共引擎完成逐行掩码访存与掩码写回。把「按下标表选择」
+// 的稀疏循环（nsa 风格）改写成顺序扫描是规则 A（SelectedBlockScanRule，规则位
+// 65536）的职责。按 RFC #2686，只有 A 的顺序化与 B 的行提升一起做才有收益，
+// 所以 B 对 A 暴露的是 materialize 接口：A 在自己的沙箱里改成顺序扫描后直接
+// 调用 B 完成重写，B 不再用「循环体内是否还有下标表读」这类形态代理去反推
+// A 是否已经跑过。B 自己的调度入口与 A 的调用入口共用同一份重写实现。
 // Rule B (QueryRowBatchingRule, bit 131072, ProgramMapping phase) owns row
 // lifting only: it keeps the loop structure and prepends the query-row dimension
 // [R] to row-dependent values (R query rows per program), relying on the shared
-// RowLiftBuilder engine for per-row masked accesses and masked write-back.  It
-// neither requires the loop to be a sequential scan nor infers "has an upstream
-// rule run?" from shape proxies such as an in-loop index table: row-dependent
-// accesses inside the loop are covered by the per-row masks the rewrite emits,
-// so there is exactly one decision rule.
+// engine for per-row masked accesses and masked write-back.  Turning a
+// table-indexed sparse loop (nsa-style selection) into a sequential scan belongs
+// to rule A (SelectedBlockScanRule, bit 65536).  RFC #2686 only pays off when A's
+// sequentialization and B's row lifting happen together, so B exposes a
+// materialize entry to A: A sequentializes inside its sandbox and calls B to
+// perform the rewrite there.  B no longer infers "has A run?" from shape proxies
+// such as an in-loop index table.  B's own scheduling entry shares one rewrite
+// implementation with that A-facing entry.
 
 constexpr llvm::StringLiteral kCoalesceFactorAttr = "hacc.coalesce_factor";
 constexpr llvm::StringLiteral kCoalesceAxisAttr = "hacc.coalesce_axis";
@@ -87,28 +92,27 @@ static int64_t tensorStorageBytes(RankedTensorType tensor) {
 
 // 识别可按规则 B 重建的查询行循环，返回候选（行数、能力开关、静态网格）。
 // 本函数是「是否重写」的唯一判定入口：调度器入口 createQueryRowBatchingPlan
-// 先走这里，返回 nullopt 就表示不改写。它只做形态 / 资源判定与 R 计算，不
-// 修改 IR。
+// 与规则 A 的 materializeQueryRowBatchingCandidate 都先走这里，返回 nullopt
+// 就表示不改写。它只做形态 / 资源判定与 R 计算，不修改 IR。
 //
 // Matcher for rule B's query-row lift.  This is the single "should we rewrite?"
-// entry behind the scheduler; it only decides and derives R, and never edits the
-// IR.  Every check is fail-closed.
+// entry shared by the scheduler and rule A's materialize entry; it only decides
+// and derives R, and never edits the IR.  Every check is fail-closed.
 //
 // 判据按三层组织，任一层不满足都直接拒绝：
 //
 // 1) 启动契约门（函数开头的契约检查）。静态网格必须合法、函数体恰好一个 block、模块
 //    内只有一个 public entry、模块上不能已有合并契约。前三条是重写器的实现
-//    前提（它整体重建单入口函数）；后两条是幂等门，防止规则 B、IAT 或两次
+//    前提（它整体重建单入口函数）；后两条是幂等门，防止规则 A/B、IAT 或两次
 //    调度重复提升。这一组条件与 DotRowCoalescing 的 matchDotRows 逐条相同，
 //    区别只是那边把后两条写成字面量。
 //
 // 2) 结构门（walk 内逐 op 检查 + 走查结束后的后置条件）。只接受「单条查询行
 //    循环 + 单 axis-0 pid」：pid 是行索引的唯一来源，多循环或多 pid 无法定义
 //    一次 R 行合并。dot 必须是 rank-2 且 lhs 为 f16/bf16（cube 指令的类型
-//    要求）；行相关的 dot 必须是外部已提升、本规则未提升的形态，因为 B 是
-//    跨查询行共享的 K/V tile，提升它没有收益，重写器也没有对应实现。循环必须
-//    在入口 block、lb 为常量 0、step 为正常数，否则行号与有效位无法按仿射关系
-//    重建。
+//    要求）；行相关的 dot 要求 A 已提升、B 未提升，因为 B 是跨查询行共享的
+//    K/V tile，提升它没有收益，重写器也没有对应实现。循环必须在入口 block、
+//    lb 为常量 0、step 为正常数，否则行号与有效位无法按仿射关系重建。
 //    与 DotRowCoalescing 相比，B 额外允许 tt.reduce（bwd dq 形态）、条件与
 //    pid 无关的 scf.if、tensor pointer、循环内行相关 load（由 maskedLoad 承担）
 //    以及多个 store；DotRow 则要求 reduce 数为 0、store 恰好 1 个、循环内
@@ -138,13 +142,10 @@ static int64_t tensorStorageBytes(RankedTensorType tensor) {
 // - allowSplit：是否允许结构性拆半（宽累加器拆成两条半宽链）。它与 R 的
 //   取值互相影响，所以由本函数统一算出并写进候选。
 //
-// 「循环是否已顺序化」不是这里的判据：B 不推断上游规则是否已经跑过，
-// 循环体内与行相关的访存一律由重写路径的逐行有效掩码（maskedLoad/maskedStore）
-// 兜住，因此判定口径只有一份，不会因为形态代理条件而漂移。
-// Sequentialization is not a criterion here either: the matcher never infers
-// whether an upstream rule already ran, because row-dependent accesses inside the
-// loop are covered by the per-row masks the rewrite emits.  That keeps a single
-// decision rule that cannot drift along shape proxies.
+// 「循环是否已顺序化」不是这里的判据：按下标表读的稀疏循环由规则 A 负责
+// 顺序化，A 改完之后才调用 B。B 自己调度时也不再推断「A 是否已经跑过」，
+// 循环体内与行相关的访存一律由重写路径的逐行有效掩码（maskedLoad）兜住，
+// 因此判定口径只有一份，不会因为形态代理条件而漂移。
 static std::optional<RowLiftCandidate>
 matchQueryRows(triton::FuncOp fn, uint64_t l0aBudgetBytes,
                uint64_t l0cBudgetBytes, uint64_t coreNum,
@@ -319,14 +320,13 @@ matchQueryRows(triton::FuncOp fn, uint64_t l0aBudgetBytes,
         reject(l, "volatile load");
         return;
       }
-      // 块指针与普通 load 都在这里放行：循环体内是否还按下标表读索引不由本
-      // 规则判断，也不据此反推上游规则是否已经跑过。与行相关的普通 load 由重写
+      // 块指针与普通 load 都在这里放行：循环体内是否还按下标表读索引由规则 A
+      // 负责消除，B 不再据此判断「A 是否已经跑过」。与行相关的普通 load 由重写
       // 路径的逐行有效掩码兜住（maskedLoad），因此不在这里拦。
       // Both block-pointer and plain loads are accepted: whether the loop still
-      // reads an index table is not this rule's concern and is not used to infer
-      // what an upstream rule already did.  A row-dependent plain load is covered
-      // by the rewrite path's per-row active mask (maskedLoad), so it is not
-      // rejected here.
+      // reads an index table is rule A's business, and B no longer infers "has A
+      // run?" from it.  A row-dependent plain load is covered by the rewrite
+      // path's per-row active mask (maskedLoad), so it is not rejected here.
       return;
     }
 
@@ -505,10 +505,11 @@ matchQueryRows(triton::FuncOp fn, uint64_t l0aBudgetBytes,
 
   // 累加器拆分的判据原本只在重写路径里执行，这里在匹配阶段先判一遍：注定
   // 失败的形态不再进入沙箱克隆与 verify。重写路径仍会调用同一组判据，两处
-  // 共用一份实现，不会漂移。
+  // 共用一份实现，不会漂移。表读判据仍然不做：顺序扫描由规则 A 保证。
   // The split predicate used to run only on the rewrite path.  Evaluating it
   // here keeps a doomed shape out of the sandbox clone and verify; the rewrite
-  // path calls the same predicate, so the two cannot drift.
+  // path calls the same predicate.  The table-read predicate is still absent:
+  // rule A guarantees the sequential scan.
   if (!canSplitWideAccumulators(loop, candidate.rowsPerProgram,
                                 candidate.features.splitWideAccumulator,
                                 candidate.splitValueBudgetBytes)) {
@@ -521,13 +522,16 @@ matchQueryRows(triton::FuncOp fn, uint64_t l0aBudgetBytes,
 
 // 规则 B 的唯一重写实现：在传入的模块上就地匹配、重建并验证，最后发布启动
 // 契约。静态网格发布 coalesce 三属性；运行时网格给函数补隐藏 extent 参数并
-// 发布 hacc.program_grid_transforms。调用方必须传私有沙箱：失败时模块可能
-// 已被部分改写，不能是线上 IR。
+// 发布 hacc.program_grid_transforms。调度入口与规则 A 的调用入口都走这里，
+// 因此两条入口不会产生不同结果。调用方必须传私有沙箱：失败时模块可能已被
+// 部分改写，不能是线上 IR。
 // The single rewrite implementation for rule B.  It matches, rebuilds and
 // verifies in place on the given module, then publishes the launch contract:
 // static grids get the three coalesce attributes, runtime grids get the hidden
-// extent argument plus hacc.program_grid_transforms.  The caller must pass a
-// private sandbox, because a failure may leave the module partially rewritten.
+// extent argument plus hacc.program_grid_transforms.  Both the scheduler entry
+// and rule A's entry call this, so the two paths cannot diverge.  The caller
+// must pass a private sandbox, because a failure may leave the module partially
+// rewritten.
 static LogicalResult rewriteQueryRowBatchInPlace(
     ModuleOp module, triton::FuncOp function, const ResourceSnapshot &resources,
     std::optional<int64_t> forcedRows = std::nullopt, bool allowSplit = true) {
@@ -750,10 +754,35 @@ public:
 
 } // namespace
 
+LogicalResult
+// 规则 B 面向规则 A 的唯一接口：在给定沙箱模块上直接完成匹配、重写与 verify，
+// 成功即代表 B 的行提升已经真实落地在沙箱里，A 可以连同自己的顺序化一起提交。
+cfg::materializeQueryRowBatchingCandidate(ModuleOp module,
+                                          triton::FuncOp function,
+                                          const ResourceSnapshot &resources) {
+  if (!module || !function ||
+      function->getParentOfType<ModuleOp>() != module)
+    return failure();
+
+  // Rule B is supported only on Ascend 950, like the dot-row rule.
+  if (!hacc::utils::isAscend950(module))
+    return failure();
+
+  // 与调度入口共用同一份「沙箱重写 + UB 预算重试」实现，避免两条入口出现
+  // 不同的因子或不同的可行性判断。
+  // Share the sandbox-rewrite-and-retry implementation with the scheduler entry,
+  // so both entries pick the same factor and the same feasibility verdict.
+  auto plan = createQueryRowBatchingPlan(function, /*epoch=*/0, resources);
+  if (!plan)
+    return failure();
+  IRRewriter rw(module.getContext());
+  return plan->apply(rw);
+}
+
 std::unique_ptr<RewritePlan>
-// 规则 B 的调度入口：按资源快照提取 L0/UB 预算，在沙箱中调用同一份重写实现
-// 并 verify 后才交付计划。
-// Scheduler entry: it extracts the L0/UB budgets, runs the shared rewrite on a
+// 规则 B 的调度入口：按资源快照提取 L0 预算，在沙箱中调用同一份重写实现并
+// verify 后才交付计划。
+// Scheduler entry: it extracts the L0 budgets, runs the shared rewrite on a
 // sandbox and only hands out a plan once that sandbox verifies.
 cfg::createQueryRowBatchingPlan(triton::FuncOp function, unsigned epoch,
                                 const ResourceSnapshot &resources) {
