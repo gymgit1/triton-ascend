@@ -29,6 +29,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
 #if TRITON_ASCEND_HAS_INPROC_COSTMODEL
@@ -39,6 +40,8 @@
 #include <limits>
 #include <tuple>
 #include <utility>
+
+#define DEBUG_TYPE "resource-cost"
 
 using namespace mlir;
 using namespace triton;
@@ -80,8 +83,25 @@ bool isUBResidentTensor(Value value) {
   if (!value)
     return false;
   auto tensor = dyn_cast<RankedTensorType>(value.getType());
-  return tensor && tensor.hasStaticShape() &&
-         isa<FloatType>(tensor.getElementType());
+  if (!tensor || !tensor.hasStaticShape())
+    return false;
+  // 整数张量（索引网格、地址向量、i1 掩码、下标表）同样在 UB 里落地，之前只
+  // 认浮点元素类型，导致行提升展开出来的地址向量完全漏算。元素宽度一律按实际
+  // 位宽统计（getElementBitWidth），地址向量由此按 i32 计 4 字节/元素，而不是
+  // 按 !tt.ptr 隐含的 64 位地址计 8 字节。
+  // 指针张量本身不重复计入：它的地址语义已经由配对的整数偏移张量表达，两边都
+  // 算会把同一份地址占用记两遍。
+  // Integer tensors (index grids, address vectors, i1 masks, index tables) are
+  // also materialised in UB; the old float-only filter dropped the address vectors
+  // that row lifting expands, so they were never budgeted.  Widths follow the
+  // actual element width, which makes an address vector cost 4 bytes per element
+  // (i32) instead of the 8 the !tt.ptr element type would imply.  Pointer tensors
+  // are not counted separately: the paired integer offset tensor already expresses
+  // the same address footprint, so counting both would double it.
+  Type elementType = tensor.getElementType();
+  if (isa<triton::PointerType>(elementType))
+    return false;
+  return isa<FloatType, IntegerType>(elementType);
 }
 
 bool isStorageViewOperation(Operation *operation) {
@@ -524,6 +544,7 @@ LiveByteEstimate cfg::estimatePeakLiveBytes(Operation *root) {
   llvm::sort(positions);
   positions.erase(std::unique(positions.begin(), positions.end()),
                   positions.end());
+  uint64_t bestPosition = 0;
   for (uint64_t position : positions) {
     llvm::SmallVector<const IntervalState *, 16> live;
     for (const auto &entry : intervals) {
@@ -556,7 +577,22 @@ LiveByteEstimate cfg::estimatePeakLiveBytes(Operation *root) {
       selected.push_back(state);
     }
     estimate.peakLiveBytes = std::max(estimate.peakLiveBytes, liveBytes);
+    if (liveBytes >= estimate.peakLiveBytes)
+      bestPosition = position;
   }
+
+  LLVM_DEBUG({
+    const uint64_t peakPosition = bestPosition;
+    llvm::dbgs() << "resource-cost: peak " << estimate.peakLiveBytes
+                 << " bytes at position " << peakPosition << "\n";
+    for (const auto &entry : intervals) {
+      const IntervalState &state = entry.second;
+      if (state.begin > peakPosition || peakPosition > state.end)
+        continue;
+      llvm::dbgs() << "  live " << state.bytes << " bytes "
+                   << state.value.getType() << "\n";
+    }
+  });
 
   estimate.known = true;
   estimate.reason = ResourceCostRejectReason::None;

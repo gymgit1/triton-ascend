@@ -1969,10 +1969,20 @@ static bool buildScanPrologue(IRRewriter &rewriter, ScanCandidate &candidate,
   prologue.tableWidth = TW;
   Value offs =
       rewriter.create<triton::MakeRangeOp>(loc, tensorTy({TW}, i32), 0, TW);
-  Value lastSlot = rewriter.create<arith::ConstantIntOp>(loc, S - 1, 32);
-  Value lastSlotSplat =
-      rewriter.create<triton::SplatOp>(loc, tensorTy({TW}, i32), lastSlot);
-  Value slotIdx = rewriter.create<arith::MinSIOp>(loc, offs, lastSlotSplat);
+  // 只有存在填充车道（TW > S）时才需要把车道号钳到最后一个合法槽位；TW == S
+  // 时钳位是恒等运算，留着它会把表读的列下标变成 min(range, 常量)，下游
+  // 偏移分析把 min 判成非结构化，强制整条表读走 indirect_load。
+  // Clamp the lane to the last valid slot only when padded lanes exist
+  // (TW > S).  For TW == S the clamp is an identity, and keeping it turns the
+  // slot index into min(range, const) - which the offset analysis classifies as
+  // unstructured and forces onto the indirect-load path.
+  Value slotIdx = offs;
+  if (TW > S) {
+    Value lastSlot = rewriter.create<arith::ConstantIntOp>(loc, S - 1, 32);
+    Value lastSlotSplat =
+        rewriter.create<triton::SplatOp>(loc, tensorTy({TW}, i32), lastSlot);
+    slotIdx = rewriter.create<arith::MinSIOp>(loc, offs, lastSlotSplat);
+  }
   // Spelling (b) of the index address (tt.addptr %root, (addi %rowOff, %iv))
   // has no row-base addptr to reuse: build it here, next to the vectorized read
   // that consumes it and outside the loop, so its dominance is the prologue's.

@@ -137,11 +137,12 @@ static int64_t tensorStorageBytes(RankedTensorType tensor) {
 //    逐行掩码能力。
 //
 // 3) 资源与收益门（构造候选并选行的部分）。R 由 RFC #2686 第 4 节的四条阈值推出：
-//    R·G×BK×elemBytes ≤ L0A、R·G×BN×4 ≤ L0C、单值预算（UB 代理）、
-//    gridX/R ≥ coreNum；selectRowsPerProgram 取全部上界的最小值后向下取
-//    2 的幂（实现层的重试按折半走，RFC 本身未要求 2 的幂）。R <= 1 表示没有
-//    可合并的行，直接拒绝。最后用 canSplitWideAccumulators 做一次预检，避免
-//    注定失败的宽累加器形态进入沙箱克隆与 verify。
+//    R·G×BK×elemBytes ≤ L0A、R·G×BN×4 ≤ L0C、R×峰值活值 ≤ 真实可用 UB、
+//    gridX/R ≥ coreNum（单值预算作为拆分判据另行参与）；selectRowsPerProgram
+//    取全部上界的最小值后向下取 2 的幂（实现层的重试按折半走，RFC 本身未要求
+//    2 的幂）。R <= 1 表示没有可合并的行，直接拒绝。最后用
+//    canSplitWideAccumulators 做一次预检，避免注定失败的宽累加器形态进入
+//    沙箱克隆与 verify。
 //
 // 参数语义：
 // - l0aBudgetBytes / l0cBudgetBytes：资源快照中的安全预算（容量 × 安全
@@ -149,8 +150,11 @@ static int64_t tensorStorageBytes(RankedTensorType tensor) {
 //   降级），不是「预算为零」的拒绝条件。
 // - coreNum：物理核数，用于 gridX/R >= coreNum；运行期网格 grid 未知时为 0，
 //   该约束自动不参与定界。
-// - forcedRows：调用方钉住的因子。UB 超预算时上层按 2 的幂下调重试，重试
-//   必须让所有依赖行数的判据（L0 需求、单值预算、拆分判据）使用同一个因子。
+// - ubBudgetBytes：资源快照中的真实可用 UB（容量减预留后再乘安全百分比）；
+//   0 表示容量未知，UB 约束关闭。RFC #2686 第 4 节把 UB 与 L0A/L0C、网格并列，
+//   作为压低 R 的阈值，而不是事后的合法性判据。
+// - forcedRows：调用方钉住的因子。上层按 2 的幂下调重试时，必须让所有依赖行数
+//   的判据（L0 需求、单值预算、UB 预算、拆分判据）使用同一个因子。
 // - allowSplit：是否允许结构性拆半（宽累加器拆成两条半宽链）。它与 R 的
 //   取值互相影响，所以由本函数统一算出并写进候选。
 //
@@ -161,6 +165,7 @@ static int64_t tensorStorageBytes(RankedTensorType tensor) {
 static std::optional<RowLiftCandidate>
 matchQueryRows(triton::FuncOp fn, uint64_t l0aBudgetBytes,
                uint64_t l0cBudgetBytes, uint64_t coreNum,
+               uint64_t ubBudgetBytes,
                std::optional<int64_t> forcedRows = std::nullopt,
                bool allowSplit = true) {
   ModuleOp module = fn->getParentOfType<ModuleOp>();
@@ -209,15 +214,9 @@ matchQueryRows(triton::FuncOp fn, uint64_t l0aBudgetBytes,
   // dot 的 M 维最大值：targetDotRows / maxDotRows 上界（B 的 targetDotRows=0，
   // 该条不生效）；存入候选后参与单值预算，并在重写时展开 M = maxDotRows × R。
   int64_t maxDotRows = 1;
-  // dot 的 N 维（值维）最大值：存入候选，exceedsUBBudget 用它判断值宽是否
-  // 超过一个向量寄存器，从而决定是否按 4 倍放大 UB 需求。
-  int64_t maxDotCols = 1;
-  // 累加器元素的字节数：把「列数」换算成一个向量寄存器等于多少列；存入候选，
-  // 与 maxDotCols 相乘后和 kVectorRegisterBytes 比较。
-  // Bytes per accumulator element: turns a column count into vector registers.
-  int64_t accumulatorElemBytes = 4;
   // 所有张量结果的最大字节数：selectRowsPerProgram 的单值预算上界
-  // budget / maxTensorBytes（拆半档预算翻倍）。
+  // budget / maxTensorBytes（拆半档预算翻倍）。UB 的每因子需求另由原始函数的
+  // 峰值活值给出，不再用这个单张量代理。
   int64_t maxTensorBytes = 1;
   // 原始 dot 的 lhs tile 最坏字节需求：写入 policy.maxL0ABytes，对应 L0A 上界
   // l0ABudgetBytes / maxL0ABytes。
@@ -318,14 +317,6 @@ matchQueryRows(triton::FuncOp fn, uint64_t l0aBudgetBytes,
         reject(d, "dot operand or shape");
       else {
         maxDotRows = std::max(maxDotRows, a.getShape()[0]);
-        maxDotCols = std::max(maxDotCols, b.getShape()[1]);
-        // 累加器元素宽度决定「一个向量寄存器等于多少列」；D 是累加器结果。
-        // The accumulator element width decides how many columns one vector
-        // register holds; D carries the accumulator type.
-        if (auto res = dyn_cast<RankedTensorType>(d.getD().getType()))
-          accumulatorElemBytes =
-              std::max(accumulatorElemBytes,
-                       elementStorageBytes(res.getElementType()));
         maxL0ABytes = std::max(maxL0ABytes, tensorStorageBytes(a));
         if (auto acc = dyn_cast<RankedTensorType>(d.getC().getType()))
           maxL0CBytes = std::max(maxL0CBytes, tensorStorageBytes(acc));
@@ -459,14 +450,6 @@ matchQueryRows(triton::FuncOp fn, uint64_t l0aBudgetBytes,
   candidate.features.tensorPointer = true;
   candidate.features.maskedLoad = true;
   candidate.features.maskedStore = true;
-  // 与查询行相关的块指针（Q）保留成块描述符，行维作为最外轴、行有效位交给
-  // 边界检查的零填充：展开成指针张量会被后端降级成逐元素间接访存，并常驻
-  // 一条 i64 地址向量，既占 UB 又拿不到 DMA 带宽。
-  // A query-row-dependent block pointer (Q) stays a block descriptor with the
-  // row axis outermost and row validity delegated to the boundary check's zero
-  // padding: expanding it into a pointer tensor degrades to per-element indirect
-  // access, keeps an i64 address vector resident (UB) and loses DMA bandwidth.
-  candidate.features.rowDescriptor = true;
   // 值维（PV 的 N 维）超过「M × 64 列」时按手写 kernel 的做法拆成两半，
   // 否则 V 补到 128 的形态会让 [R,G,128] 的 f32 累加器撑爆 UB。拆半是结构性
   // 的：V 的访存、PV dot、元素链与 O 的写回各复制成两条 64 宽链，与手写 kernel
@@ -488,33 +471,42 @@ matchQueryRows(triton::FuncOp fn, uint64_t l0aBudgetBytes,
   // stays zero) and lets the split capability double the byte budget.  The
   // L0A/L0C demands are a correctness constraint: the rewrite widens the lhs
   // and accumulator tiles by the factor, and a zero budget disables the check.
+  // UB 约束的每因子需求：estimatePeakLiveBytes 只能看到未提升的原始函数，而
+  // 提升后与查询行相关的值整体按 R 放大，所以原始峰值就是 R 的每倍需求。与行
+  // 无关的常驻值也计入其中，因此这个上界是保守的（只会把 R 压得更低）。
+  // Per-factor UB demand: estimatePeakLiveBytes sees the un-lifted function, and
+  // lifting scales the query-row-dependent values by R, so the original peak is
+  // the per-factor demand.  Row-invariant residents are counted in it too, which
+  // makes the bound conservative (it can only lower R further).
+  LiveByteEstimate liveEstimate = estimatePeakLiveBytes(fn.getOperation());
+  const int64_t peakLiveBytes =
+      liveEstimate.known ? static_cast<int64_t>(liveEstimate.peakLiveBytes) : 0;
+
   RowCountPolicy policy;
   policy.splitWideAccumulator = candidate.features.splitWideAccumulator;
   policy.maxL0ABytes = maxL0ABytes;
   policy.maxL0CBytes = maxL0CBytes;
   policy.l0ABudgetBytes = l0aBudgetBytes;
   policy.l0CBudgetBytes = l0cBudgetBytes;
+  policy.ubBudgetBytes = ubBudgetBytes;
   policy.coreNum = coreNum;
   candidate.rowsPerProgram = selectRowsPerProgram(
-      grid ? grid.getInt() : 0, maxDotRows, maxTensorBytes, policy);
+      grid ? grid.getInt() : 0, maxDotRows, maxTensorBytes, peakLiveBytes,
+      policy);
   // 预算不够时上层会按 2 的幂下调重试；这里把重试因子钉在候选上，后续所有
-  // 依赖行数的判据（L0 需求、单值预算、拆分判据）都用这同一个因子。
+  // 依赖行数的判据（L0 需求、单值预算、UB 预算、拆分判据）都用这同一个因子。
   // The caller retries with smaller powers of two when the budget does not fit;
   // pin that factor on the candidate so every row-count dependent judgement (L0
-  // demand, per-value budget, split predicate) uses the same value.
+  // demand, per-value budget, UB budget, split predicate) uses the same value.
   if (forcedRows)
     candidate.rowsPerProgram = std::min(candidate.rowsPerProgram, *forcedRows);
   if (candidate.rowsPerProgram <= 1)
     return std::nullopt;
 
-  // 重写期要用的量留在候选里：提升后的 M 由原始 M 与因子相乘得到，UB 预算
-  // 判定还要用到原始 N 维与累加器元素宽度。
+  // 重写期要用的量留在候选里：提升后的 M 由原始 M 与因子相乘得到。
   // Keep what the rewrite needs on the candidate: the lifted M is the original M
-  // times the factor, and the UB budget check also reads the original N dimension
-  // and the accumulator element width.
+  // times the factor.
   candidate.maxDotRows = maxDotRows;
-  candidate.maxDotCols = maxDotCols;
-  candidate.accumulatorElemBytes = accumulatorElemBytes;
   // 单值预算按「提升后的 M × 每个值一行一个向量寄存器」设定：末维不超过一个
   // 向量寄存器（f32 即 64 列）的原样保留，超过的（V 补到 128）落进拆半路径。
   // 阈值由 kVectorRegisterBytes 推出，不再写死列数。
@@ -544,54 +536,6 @@ matchQueryRows(triton::FuncOp fn, uint64_t l0aBudgetBytes,
   return candidate;
 }
 
-// 值维超过一个向量寄存器时，静态活值估计会低估提升后的 UB 需求，原因有两项：
-//   1. 拆半档有两条半宽链，但 canonicalValues 把它们归到同一个 owner 只计一份，
-//      即少计「半宽链数」这一项；
-//   2. 后端对循环携带的 UB 张量按两份缓冲，静态估计按一份计，即少计「循环
-//      缓冲数」这一项。
-// 放大系数由这两项相乘得到，不再写死一个经验常数。一个向量寄存器以内的值链
-// 没有这两项放大，保持原判定。
-// Once the value dimension exceeds one vector register the static live-byte
-// estimate under-counts the lifted UB demand for two reasons: the split tier has
-// two half-width chains but canonicalValues assigns them to one owner and counts
-// them once, and the backend buffers loop-carried UB tensors twice while the
-// estimate counts one copy.  The amplification is the product of these two
-// model factors instead of a hard-coded constant.  Chains within one vector
-// register keep the plain estimate.
-constexpr uint64_t kSplitTierHalfChains = 2;
-constexpr uint64_t kLoopCarriedBuffers = 2;
-
-// 提升后的函数体峰值活值是否放不进目标核的 UB 预算。UB 容量未知（零）时
-// 不施加约束，沿用既有行为；估计不可得时同样不拒绝。
-// True when the lifted body's peak live bytes do not fit the target core's UB
-// budget.  An unknown capacity (zero) leaves the check disabled, and an
-// unavailable estimate is not a reason to reject.
-static bool exceedsUBBudget(triton::FuncOp function,
-                            const ResourceSnapshot &resources,
-                            int64_t maxDotCols,
-                            int64_t accumulatorElemBytes) {
-  const std::optional<uint64_t> safe = resources.getSafeUBBudget();
-  if (!safe)
-    return false;
-  LiveByteEstimate estimate = estimatePeakLiveBytes(function.getOperation());
-  if (!estimate.known)
-    return false;
-  uint64_t demand = estimate.peakLiveBytes;
-  // 判定条件用列数 × 元素字节，与 kVectorRegisterBytes 同一口径。
-  // The predicate compares columns × element bytes against the same vector
-  // register width the budget uses.
-  if (maxDotCols * accumulatorElemBytes > kVectorRegisterBytes) {
-    const uint64_t scale = kSplitTierHalfChains * kLoopCarriedBuffers;
-    if (demand > std::numeric_limits<uint64_t>::max() / scale)
-      return true;
-    demand *= scale;
-  }
-  LLVM_DEBUG(llvm::dbgs() << "query-row: peak live " << estimate.peakLiveBytes
-                          << " bytes, demand " << demand << " bytes, UB budget "
-                          << *safe << " bytes\n");
-  return demand > *safe;
-}
-
 // 规则 B 的唯一重写实现：在传入的模块上就地匹配、重建并验证，最后发布启动
 // 契约。静态网格发布 coalesce 三属性；运行时网格给函数补隐藏 extent 参数并
 // 发布 hacc.program_grid_transforms。调度入口与规则 A 的调用入口都走这里，
@@ -617,7 +561,8 @@ static LogicalResult rewriteQueryRowBatchInPlace(
 
   auto candidate =
       matchQueryRows(function, l0aBudgetBytes, l0cBudgetBytes,
-                     resources.coreNum, forcedRows, allowSplit);
+                     resources.coreNum, resources.getSafeUBBudget().value_or(0),
+                     forcedRows, allowSplit);
   if (!candidate)
     return failure();
 
@@ -675,17 +620,21 @@ class QueryRowBatchingPlan final : public RewritePlan {
   // capacities are unknown and the factor stays unconstrained.
   uint64_t l0aBudgetBytes = 0;
   uint64_t l0cBudgetBytes = 0;
-  // 创建计划时的物理核数，重新匹配时按同一约束复算因子。
+  // 创建计划时的真实可用 UB 与物理核数，重新匹配时按同一组约束复算因子。
+  // Real usable UB and physical core count captured at plan creation; revalidation
+  // recomputes the factor from the same constraints.
+  uint64_t ubBudgetBytes = 0;
   uint64_t coreNum = 0;
 
   // 保存候选、创建 epoch 以及已私有验证的沙箱模块。
   QueryRowBatchingPlan(RowLiftCandidate candidate, unsigned epoch,
                        OwningOpRef<ModuleOp> prepared, uint64_t l0aBudgetBytes,
-                       uint64_t l0cBudgetBytes, uint64_t coreNum,
-                       bool allowSplit)
+                       uint64_t l0cBudgetBytes, uint64_t ubBudgetBytes,
+                       uint64_t coreNum, bool allowSplit)
       : candidate(candidate), epoch(epoch), prepared(std::move(prepared)),
         allowSplit(allowSplit), l0aBudgetBytes(l0aBudgetBytes),
-        l0cBudgetBytes(l0cBudgetBytes), coreNum(coreNum) {}
+        l0cBudgetBytes(l0cBudgetBytes), ubBudgetBytes(ubBudgetBytes),
+        coreNum(coreNum) {}
 
 public:
   // 返回规则 B 的规则 ID。
@@ -707,19 +656,21 @@ public:
       return failure();
 
     auto current = matchQueryRows(candidate.function, l0aBudgetBytes,
-                                  l0cBudgetBytes, coreNum, std::nullopt,
-                                  allowSplit);
+                                  l0cBudgetBytes, coreNum, ubBudgetBytes,
+                                  candidate.rowsPerProgram, allowSplit);
     return success(current && current->anchor == candidate.anchor &&
                    current->rowsPerProgram == candidate.rowsPerProgram &&
                    current->runtimeGrid == candidate.runtimeGrid);
   }
 
   // 档位由调用方传入：拆半首选档把过宽的值维复制成两条半宽链，整宽兜底档
-  // 只在结构拆半不可表达时使用。这里只按 2 的幂下调因子重试。
+  // 只在结构拆半不可表达时使用。行数已由四条资源约束（含 UB）定好，这里只在
+  // 重写形态失败时按 2 的幂下调因子兜底。
   // The tier is chosen by the caller: the preferred split tier duplicates an
   // over-wide value dimension into two half-width chains, and the whole-width
   // fallback is used only when the structural split cannot express the shape.
-  // This function only walks the factor down by powers of two.
+  // The four resource constraints (UB included) already fixed the row count,
+  // so this loop only steps the factor down when the rewrite shape fails.
   static std::unique_ptr<QueryRowBatchingPlan> create(
       RowLiftCandidate candidate, unsigned epoch,
       const ResourceSnapshot &resources, bool allowSplit) {
@@ -729,6 +680,7 @@ public:
       l0aBudgetBytes = resources.getSafeL0ABudget().value_or(0);
       l0cBudgetBytes = resources.getSafeL0CBudget().value_or(0);
     }
+    const uint64_t ubBudgetBytes = resources.getSafeUBBudget().value_or(0);
 
     ModuleOp module = candidate.function->getParentOfType<ModuleOp>();
     int64_t factor = candidate.rowsPerProgram;
@@ -744,13 +696,12 @@ public:
                               << (allowSplit ? " (split)" : " (no split)")
                               << "\n");
       if (succeeded(rewriteQueryRowBatchInPlace(*sandbox, cloned, resources,
-                                                factor, allowSplit)) &&
-          !exceedsUBBudget(cloned, resources, candidate.maxDotCols,
-                           candidate.accumulatorElemBytes))
+                                                factor, allowSplit)))
         return std::unique_ptr<QueryRowBatchingPlan>(
             new QueryRowBatchingPlan(candidate, epoch, std::move(sandbox),
                                      l0aBudgetBytes, l0cBudgetBytes,
-                                     resources.coreNum, allowSplit));
+                                     ubBudgetBytes, resources.coreNum,
+                                     allowSplit));
 
       if (factor == 2)
         break;
@@ -758,7 +709,7 @@ public:
       // so the next admissible value is simply the next power of two down.
       factor /= 2;
     }
-    LLVM_DEBUG(llvm::dbgs() << "query-row: no factor fits the UB budget\n");
+    LLVM_DEBUG(llvm::dbgs() << "query-row: no factor rewrites\n");
     return nullptr;
   }
 
@@ -875,7 +826,7 @@ cfg::createQueryRowBatchingPlan(triton::FuncOp function, unsigned epoch,
   for (bool allowSplit : {true, false}) {
     auto tierCandidate = matchQueryRows(
         function, l0aBudgetBytes, l0cBudgetBytes, resources.coreNum,
-        std::nullopt, allowSplit);
+        resources.getSafeUBBudget().value_or(0), std::nullopt, allowSplit);
     if (!tierCandidate)
       continue;
     if (auto plan = QueryRowBatchingPlan::create(*tierCandidate, epoch,

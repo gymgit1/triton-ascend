@@ -125,17 +125,6 @@ struct RowLiftFeatures {
   // 输出累加器过宽，需要沿宽度拆成两半。
   // The output accumulator is too wide and must be split along its width.
   bool splitWideAccumulator = false;
-  // 与查询行相关的块指针保留成块描述符，把行维作为描述符的最外轴（运行期
-  // 形状即行数），行有效位交给 boundary check 的零填充，而不是把描述符展开
-  // 成指针张量再逐行掩码。展开的指针张量会被后端降级成逐元素间接访存，
-  // 并常驻 i64 地址向量；描述符形态则是一次 DMA。
-  // A query-row-dependent block pointer stays a descriptor with the row dimension
-  // as its outermost axis (whose runtime shape is the row count), and row
-  // validity is left to the boundary check's zero padding instead of expanding
-  // the descriptor into a pointer tensor and masking per row.  An expanded
-  // pointer tensor degrades to per-element indirect access and keeps an i64
-  // address vector resident; the descriptor form is one DMA.
-  bool rowDescriptor = false;
 };
 
 // 单个提升值的字节预算。超过该宽度的值默认被拒绝，由
@@ -164,6 +153,15 @@ struct RowCountPolicy {
   // 单个提升值的字节预算。
   // Byte budget for one lifted value.
   int64_t maxLiftedValueBytes = kMaxLiftedValueBytes;
+  // 目标核的真实可用 UB（物理容量减去预留，再乘安全系数）。提升后常驻 UB 的
+  // 活值随 R 线性增长，因此它和 L0A/L0C、网格一样是压低 R 的阈值；0 表示容量
+  // 未知，该约束关闭。来源见 RFC #2686 第 4 节第三条约束。
+  // Real usable UB of the target core (physical capacity minus reserved space, then
+  // scaled by the safety percent).  Values resident in UB grow linearly with R,
+  // so this bounds R exactly like L0A/L0C and the grid do; zero means the
+  // capacity is unknown and the constraint is disabled.  It is the third constraint
+  // of RFC #2686 section 4.
+  uint64_t ubBudgetBytes = 0;
   // 拆分能力会同时生成两个半宽值而非一个全宽值，因此单值预算翻倍。
   // The split capability materialises two half-width values instead of one
   // full-width value, so the per-value budget doubles.
@@ -190,15 +188,18 @@ struct RowCountPolicy {
 
 // 为一个 program 选择要处理的查询行数。`grid` 是静态启动网格，为 0 表示
 // 运行期范围（最后一组用掩码处理）；`maxDotRows` 是最宽的提升后 M 维，
-// `maxTensorBytes` 是候选会生成的最大值。返回 1 表示没有可获利的因子，
-// 调用方据此决定不做行提升。
+// `maxTensorBytes` 是候选会生成的最大值；`peakLiveBytes` 是原始函数的峰值
+// UB 活值，作为 UB 约束的每因子需求（0 或未知时该约束不参与定界）。
+// 返回 1 表示没有可获利的因子，调用方据此决定不做行提升。
 // Pick the number of query rows one program handles.  `grid` is the static
 // launch grid, or zero for a runtime extent whose partial group is masked;
-// `maxDotRows` is the widest lifted M dimension and `maxTensorBytes` the largest
-// value the candidate materialises.  Returning 1 means no factor is profitable,
-// which callers treat as "do not lift".
+// `maxDotRows` is the widest lifted M dimension, `maxTensorBytes` the largest
+// value the candidate materialises, and `peakLiveBytes` the original peak live
+// UB bytes, which is the per-factor demand of the UB constraint (zero or
+// unknown disables it).  Returning 1 means no factor is profitable, which
+// callers treat as "do not lift".
 int64_t selectRowsPerProgram(int64_t grid, int64_t maxDotRows,
-                             int64_t maxTensorBytes,
+                             int64_t maxTensorBytes, int64_t peakLiveBytes,
                              const RowCountPolicy &policy = RowCountPolicy{});
 
 // 一个可按「每个 program 处理多行」重建的函数体。
@@ -217,19 +218,6 @@ struct RowLiftCandidate {
   // Widest original dot M dimension, used to derive the lifted M dimension that
   // the per-value budget and the split predicate are expressed in.
   int64_t maxDotRows = 1;
-  // 原始 dot 的值维（累加器 N 维）。按 kVectorRegisterBytes 换算后超过一个
-  // 向量寄存器宽度时，提升后的值链要么被拆成两条半宽链、要么留下一个超宽
-  // 累加器，静态活值估计都会低估，UB 预算判定据此放大需求。
-  // Value dimension of the original dots (the accumulator's N axis).  Once it
-  // exceeds one vector register at kVectorRegisterBytes, the lifted value chain
-  // is either split into two half-width chains or left as an over-wide
-  // accumulator, and the static live-byte estimate under-counts it; the UB
-  // budget check amplifies the demand accordingly.
-  int64_t maxDotCols = 1;
-  // 累加器元素的字节数，用来把列数换算成向量寄存器宽度；没有 dot 时为 f32。
-  // Bytes per accumulator element, used to convert the column count into vector
-  // register widths; defaults to f32 for a candidate without a dot.
-  int64_t accumulatorElemBytes = 4;
   // 单个提升进位值的字节预算，超过即由 splitWideAccumulator 能力对半拆分。
   // 规则 B 用「提升后的 M × 每个值一行一个向量寄存器」重新设定它，于是末维
   // 超过一个向量寄存器的累加器会被对半拆开，阈值不再是写死的列数。
@@ -334,58 +322,6 @@ private:
   // Rebuild a descriptor load on the expanded pointer tensor.
   bool rewriteDescriptorLoad(triton::LoadOp load,
                              const LiftedDescriptor &descriptor);
-  // 保留成块描述符的查询行相关块指针：`pointer` 是以行维为最外轴的新描述符。
-  // A query-row-dependent block pointer that stays a descriptor; `pointer` is
-  // the new descriptor whose outermost axis is the row dimension.
-  struct RowDescriptor {
-    Value pointer;
-    // 提升后的 tile 形状（[R] + 原 tile 形状，或拍平后的 [R·原最外轴, 其余]），
-    // 用于校验边界轴的取值范围。
-    // Lifted tile shape ([R] plus the original tile shape, or the flattened
-    // [R·outer axis, remaining axes]), used to validate the boundary-check axes.
-    SmallVector<int64_t> tileShape;
-    // 非空表示行维与原描述符最外轴已合并成一条轴，取值为原最外轴的完整
-    // extent（每行在该轴上前进的元素数）。此时 load/store 的值需要在
-    // [R, 原最外轴, 其余] 与 [R·原最外轴, 其余] 之间做按元素顺序的 reshape。
-    // Non-empty when the row dimension was merged into the descriptor's
-    // outermost axis; the value is that axis' full extent (the number of
-    // elements one row advances along it).  Load/store values then switch
-    // between [R, outer axis, rest] and [R·outer axis, rest] with an
-    // element-order-preserving reshape.
-    std::optional<int64_t> flattenedOuterExtent;
-  };
-  // 把查询行相关的块指针重建成「行维在最外层」的块描述符。只在能证明基址偏移
-  // 关于行号是仿射的、且其余索引都与行无关时才成功；否则返回 false，调用方
-  // 继续走原来的指针张量展开路径。
-  // Rebuild a query-row-dependent descriptor with the row dimension as the
-  // outermost axis.  It only succeeds when the base offset is provably affine in
-  // the row index and every other index is row-invariant; otherwise it returns
-  // false and the caller keeps the existing pointer-tensor expansion.
-  bool buildRowDescriptor(triton::MakeTensorPtrOp makePtr,
-                          RowDescriptor &descriptor);
-  // 用保留的块描述符重建 load：行有效位由 boundary check 的零填充承担，
-  // 因此不再生成逐行掩码。
-  // Rebuild a load on the retained descriptor; the boundary check's zero padding
-  // carries row validity, so no per-row mask is generated.
-  bool rewriteRowDescriptorLoad(triton::LoadOp load,
-                                const RowDescriptor &descriptor);
-  // 用保留的块描述符重建 store：最外轴的边界检查把写入范围夹到有效行内，
-  // 越界行不参与写回，因此也不再生成逐行掩码。
-  // Rebuild a store on the retained descriptor; the outermost axis' boundary
-  // check clamps the written region to valid rows, so out-of-range rows are not
-  // written and no per-row mask is generated.
-  bool rewriteRowDescriptorStore(triton::StoreOp store,
-                                 const RowDescriptor &descriptor);
-  // 证明 `value` 关于行号（原始 pid 结果）是仿射的，返回行步长（每行前进的
-  // 元素数）；不可分解时返回 nullopt。纯分析，不生成 IR。
-  // Prove that `value` is affine in the row index (the original pid result) and
-  // return the per-row stride in elements; nullopt when it cannot be
-  // decomposed.  Pure analysis, no IR is emitted.
-  std::optional<int64_t> analyzeAffineInRow(Value value, Value pid);
-  // 把同一个表达式在「行号取 0」处求值，用来得到描述符的标量基址。
-  // Evaluate the same expression at row index zero, which is the descriptor's
-  // scalar base offset.
-  Value materializeRowZeroPart(Value value, Value pid);
   // 用给定描述符发出一次 load 并交回结果，不做映射登记；拆半路径按两个描述符
   // 各调用一次，因此结果类型取自描述符的指针形状。
   // Emit one load for the given descriptor and hand back its result without
@@ -621,16 +557,6 @@ private:
   // Descriptors to halve along their last dimension, keyed by the
   // tt.make_tensor_ptr result.
   DenseMap<Value, SplitDescriptor> splitDescriptors;
-  // 保留成「行维在最外层」块描述符的那些原始描述符。
-  // Original descriptors that were kept as row-major-axis block descriptors.
-  DenseMap<Value, RowDescriptor> rowDescriptors;
-  // 锚点展开出的行号信息：组内首行 base = pid * R 与运行期行数上界。
-  // 二者都在重建行描述符时使用；静态网格没有运行期上界。
-  // Row information expanded at the anchor: the group's first row
-  // `base = pid * R` and the runtime row extent.  Both are needed to rebuild a
-  // row descriptor; a static grid has no runtime extent.
-  Value liftedRowStart;
-  Value liftedRowExtent;
 };
 
 } // namespace cfg

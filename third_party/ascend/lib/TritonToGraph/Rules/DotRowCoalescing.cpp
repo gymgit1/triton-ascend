@@ -338,8 +338,11 @@ static std::optional<RowCandidate> matchDotRows(triton::FuncOp fn,
   policy.l0ABudgetBytes = l0aBudgetBytes;
   policy.l0CBudgetBytes = l0cBudgetBytes;
   policy.coreNum = coreNum;
+  // This rule does not set a UB budget, so the peak live bytes are not used and
+  // the UB constraint stays disabled (zero).
   int64_t rows = selectRowsPerProgram(grid ? grid.getInt() : 0, maxDotRows,
-                                      maxTensorBytes, policy);
+                                      maxTensorBytes, /*peakLiveBytes=*/0,
+                                      policy);
   if (rows <= 1)
     return std::nullopt;
 
