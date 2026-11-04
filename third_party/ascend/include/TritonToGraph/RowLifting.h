@@ -119,14 +119,17 @@ struct RowLiftFeatures {
   // Q 和 O 由 tt.make_tensor_ptr 构造。
   // Q and O are built with tt.make_tensor_ptr.
   bool tensorPointer = false;
+  // O 和 lse 带掩码写回。
+  // O and lse are written back under a mask.
+  bool maskedStore = false;
   // 循环体内与行相关的 load，在逐行有效掩码下重建，保证扫描已结束的行
   // 不再访问内存。
   // A row-dependent load in the loop body, rebuilt under the per-row active
   // mask so a row whose scan already ended never touches memory.
   bool maskedLoad = false;
-  // O 和 lse 带掩码写回。
-  // O and lse are written back under a mask.
-  bool maskedStore = false;
+  // 输出累加器过宽，需要沿宽度拆成两半。
+  // The output accumulator is too wide and must be split along its width.
+  bool splitWideAccumulator = false;
 };
 
 // 单个提升值的字节预算。超过该宽度的值默认被拒绝，由
@@ -135,6 +138,15 @@ struct RowLiftFeatures {
 // default and halved by the splitWideAccumulator capability.
 constexpr int64_t kMaxLiftedValueBytes = 128 * 1024;
 
+// 单个提升值在「一行」上的宽度上限：A2/A5 的向量寄存器是 128 个 f16 车道
+// （256 B），换成 f32 即 64 列。超过一个向量寄存器的值链要折半，否则单条链
+// 跨多个寄存器，后端无法把它整体常驻 UB。阈值由硬件位宽推出，不写死列数。
+// Per-row width ceiling of one lifted value: the A2/A5 vector register holds
+// 128 f16 lanes (256 bytes), which is 64 f32 columns.  A chain wider than one
+// vector register has to be halved, otherwise a single chain spans several
+// registers and the backend cannot keep it resident in UB.  The threshold is
+// derived from the hardware width rather than a hard-coded column count.
+constexpr int64_t kVectorRegisterBytes = 256;
 
 // 查询行数的收益策略。行数决策只在这里实现，资源模型只需替换本策略即可。
 // Profitability policy for the query-row count.  The row-count decision lives
@@ -155,6 +167,10 @@ struct RowCountPolicy {
   // capacity is unknown and the constraint is disabled.  It is the third constraint
   // of RFC #2686 section 4.
   uint64_t ubBudgetBytes = 0;
+  // 拆分能力会同时生成两个半宽值而非一个全宽值，因此单值预算翻倍。
+  // The split capability materialises two half-width values instead of one
+  // full-width value, so the per-value budget doubles.
+  bool splitWideAccumulator = false;
   // 原始 dot 的 L0A/L0C tile 最坏字节需求；重写按因子把它们放大，因此实际
   // 需求是 demand * factor。两值为 0 表示候选不含 dot，不受 L0 约束。
   // Worst-case L0A/L0C tile bytes of the original dots.  The rewrite widens
@@ -205,6 +221,14 @@ struct RowLiftCandidate {
   // row-count decision uses for its `grid/R >= coreNum` constraint.
   int64_t grid = 0;
   RowLiftFeatures features;
+  // 单个提升进位值的字节预算，超过即由 splitWideAccumulator 能力对半拆分。
+  // 规则 B 用「提升后的 M × 每个值一行一个向量寄存器」重新设定它，于是末维
+  // 超过一个向量寄存器的累加器会被对半拆开，阈值不再是写死的列数。
+  // Byte budget for one lifted carried value; anything above it is halved by the
+  // splitWideAccumulator capability.  Rule B re-derives it as "lifted M × one
+  // vector register per row", so an accumulator whose last dimension exceeds one
+  // vector register is halved and the threshold stops being a hard-coded count.
+  int64_t splitValueBudgetBytes = kMaxLiftedValueBytes;
 };
 
 // 以下判定函数只检查 IR、不生成 IR，供规则 matcher 与重写路径共用：matcher
@@ -229,6 +253,17 @@ bool canExpandTensorPointer(triton::MakeTensorPtrOp makePtr, bool enabled);
 // block pointer among the results.
 bool liftsRowInvariantIf(scf::IfOp ifOp, Value pid);
 
+// 能否把超过单值预算的循环进位值沿宽度拆半：预算内的值不拆；超过两倍预算、
+// 末维不是偶数、或累加器岛不合法时拒绝。`rowsPerProgram` 是提升后的行数，
+// 用来把单行的字节数换算成提升后的宽度；`budgetBytes` 是提升后的单值预算。
+// 能力未开启时恒为 true。
+// True when every carried value above the per-value budget can be halved along
+// its width; values within the budget are left alone.  `rowsPerProgram`
+// converts a single row's byte count into the lifted width, and `budgetBytes`
+// is the lifted per-value budget.  Without the capability the check is vacuous.
+bool canSplitWideAccumulators(scf::ForOp loop, int64_t rowsPerProgram,
+                              bool enabled,
+                              int64_t budgetBytes = kMaxLiftedValueBytes);
 
 // 只提升与查询行相关的值。与行无关的 K/V load 保持二维；被提升的 lhs
 // [BT,G,K] 在每个 dot 处展平成 [BT*G,K]，而不是生成 batched dot。
@@ -334,9 +369,86 @@ private:
   // `iv < ub` splatted over the lifted rows; every row-dependent memory
   // access in the loop body is rebuilt under it.
   Value createLoopActiveMask(scf::ForOp old, scf::ForOp loop);
+  // 用两个连续半宽值表示一个提升值。splitWideAccumulator 能力会对 dot、
+  // 累加器上的逐元素链和 store 各重建两次，保证没有单个操作生成超过预算
+  // 的全宽值。
+  // A lifted value represented by two contiguous half-width pieces. The
+  // splitWideAccumulator capability rebuilds the dot, the elementwise chain on
+  // the accumulator and the store once per half, so no single operation
+  // materialises a value wider than the per-value byte budget.
+  struct SplitValue {
+    Value first;
+    Value second;
+  };
 
+  // 找出超出字节预算且可安全拆半的累加器，返回其循环进位索引，并登记要按
+  // 最后一维拆半的描述符。必须在重建函数体之前调用：描述符可能位于循环之前，
+  // 一旦先按整宽展开就无法再拆。
+  // Find the accumulators that exceed the byte budget and can be split safely,
+  // and record the descriptors that must be halved.  This has to run before the
+  // body is rebuilt: a descriptor above the loop is already expanded by the time
+  // the loop is rebuilt, so a whole-width expansion could no longer be halved.
+  bool planWideAccumulatorSplits(scf::ForOp old,
+                                 SmallVectorImpl<int64_t> &indices);
 
+  // 一个按最后一维拆成两半的描述符。展开成指针张量时两半各自持有一份指针，
+  // 与行无关而走克隆路径时则持有一对块指针。
+  // One descriptor halved along its last dimension.  The expanded form keeps one
+  // pointer tensor per half; a row-invariant descriptor keeps a pair of block
+  // pointers instead.
+  struct SplitDescriptor {
+    LiftedDescriptor first;
+    LiftedDescriptor second;
+    Value firstPointer;
+    Value secondPointer;
+    bool expanded = false;
+  };
 
+  // 沿最后一维把值拆成两个连续半宽值（仅用于进位初值等无法结构拆分的形态）。
+  // Splits `value` along its last dimension into two contiguous halves; only used
+  // for the loop-carried initial value, which has no structural source.
+  bool splitLastDimension(Value value, SplitValue &halves);
+  // 取一个已规划拆半值的两个半宽提升值：先复用重写期已登记的两半，否则按规划
+  // 的半宽从原始值直接重建（splat 常量与 splat 折叠成半宽常量，其余形态先拆
+  // 再各自补行维），避免先提升成全宽再拆。两者都不可用时返回 false，调用方据
+  // 此放弃整次提升。
+  // Return the two half-width lifted values of a value planned for halving: reuse
+  // the halves registered during rewriting, otherwise rebuild them from the
+  // original value using the planned half width (a splat constant or a scalar
+  // splat collapses into a half-width constant; anything else is halved first and
+  // lifted per half), so a full-width lifted temporary is never materialised.
+  // Returning false makes the caller decline the whole lift.
+  bool ensureRowHalves(Value old, SplitValue &halves);
+  // 把一个整宽操作数按半宽重建：只有「各列取值相同」的形态（标量 splat、
+  // 沿最后一维从 1 广播、splat 常量）可以这样折叠，重建后同一个半宽值同时
+  // 供两半使用。返回空 Value 表示无法结构折叠。
+  // Rebuild a full-width operand at half width.  Only shapes whose value is
+  // identical across the columns (a scalar splat, a broadcast from a trailing
+  // unit dimension, a splat constant) collapse this way, and the single result is
+  // shared by both halves.  A null Value means the operand cannot be collapsed.
+  Value rebuildHalfOperand(Value full, RankedTensorType halfType);
+  // 与行无关的块指针按最后一维拆成两个半宽块指针；与行相关的则两半各自展开
+  // 成半宽指针张量。
+  // Split a descriptor into two half-width pieces: a row-invariant block pointer
+  // becomes a pair of half-width block pointers, and a row-dependent one is
+  // expanded once per half.
+  bool rewriteSplitTensorPointer(triton::MakeTensorPtrOp makePtr,
+                                 SplitDescriptor &descriptor);
+  // 用拆半描述符发出两次半宽 load。
+  // Emit one half-width load per half of a split descriptor.
+  bool rewriteSplitDescriptorLoad(triton::LoadOp load, SplitDescriptor &descriptor);
+  // 按操作种类分派拆分累加器的重建（dot / store / 逐元素算术）。
+  // Dispatch the split-aware rebuild by operation kind.
+  bool rewriteSplitOp(Operation *op);
+  // 用两个半宽 B 与对应的累加器半宽各重建一次 dot。
+  // Rebuild the dot once per half-width accumulator and matching B half.
+  bool rewriteSplitDot(triton::DotOp dot);
+  // 把纯逐元素算术按半宽重建两次。
+  // Rebuild pure elementwise arithmetic once per half width.
+  bool rewriteSplitElementwise(Operation *op);
+  // 把指针、值和掩码都拆半后发出两次半宽 store。
+  // Split pointer, value and mask, then emit two half-width stores.
+  bool rewriteSplitStore(triton::StoreOp store);
   // 把 scf.for 重建为每个 program 处理多行的循环。
   // Rebuild an scf.for into a loop that handles several query rows.
   bool rewriteLoop(scf::ForOp old);
@@ -375,6 +487,12 @@ private:
   // Block pointers that were expanded into pointer tensors, keyed by their
   // original descriptor value.
   DenseMap<Value, LiftedDescriptor> liftedDescriptors;
+  // 由两个半宽值代替单个提升值的那些值。消费方必须先走拆分感知路径，
+  // 否则依赖探测会查不到全宽映射。
+  // Values carried by two half-width values instead of one lifted value.
+  // Consumers are rebuilt through the split-aware path before the generic
+  // dependency probing can look up a missing full-width mapping.
+  DenseMap<Value, SplitValue> splitValues;
   // 在最后一行求值、用于形成共享循环上界的标量值。
   // Scalar values evaluated at the last row to form the shared loop bound.
   IRMapping lastRowMapping;
@@ -383,6 +501,30 @@ private:
   // Per-row validity mask of the rebuilt loop; an empty mask means the current
   // loop has not materialised one yet.
   Value rowActiveMask;
+  // 循环进位值中的哪些要被拆半，在重建函数体之前就已确定：描述符可能位于
+  // 循环之外，必须先拆再展开。
+  // Which carried values are halved, decided before the body is rebuilt because
+  // a descriptor above the loop has to be split before it is expanded.
+  SmallVector<int64_t> plannedSplitIndices;
+  // 规划阶段认定将由两个半宽值表示的那些原始值（含累加器、dot 结果与穿过
+  // scf.if 的结果）。重写 scf.if 时必须在建出结果类型之前就知道哪些结果要
+  // 占两项半宽类型，因此这份判断不能只存在于重写期的 splitValues。
+  // Original values that planning decided to represent as two half-width values,
+  // including the accumulator, dot results and the values that flow through an
+  // scf.if.  Rebuilding an scf.if has to know which results take two half-width
+  // types before it is created, so this decision cannot live only in the
+  // rewrite-time `splitValues`.
+  DenseSet<Value> plannedSplitValues;
+  // 规划阶段为每个要拆半的原始值登记的半宽（最后一维的宽度）。在生成任何 IR
+  // 之前填充，因此半宽值的类型无需等到重写期 splitValues 才知道。
+  // Half width (trailing extent) recorded during planning for every value that
+  // has to be halved.  It is filled before any IR is generated, so a half-width
+  // type no longer depends on the rewrite-time `splitValues`.
+  DenseMap<Value, int64_t> plannedHalfWidths;
+  // 需要按最后一维拆半的描述符，键为 tt.make_tensor_ptr 的结果。
+  // Descriptors to halve along their last dimension, keyed by the
+  // tt.make_tensor_ptr result.
+  DenseMap<Value, SplitDescriptor> splitDescriptors;
 };
 
 } // namespace cfg

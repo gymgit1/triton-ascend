@@ -62,6 +62,8 @@ namespace cfg {
 //      各自读取自己那一份（步骤 4b），不做整表提升。
 //   6. O 与 lse 的带掩码写回：maskedStore 能力 + rewriteDescriptorStore，
 //      循环内保持压平形状，不出现逐轮 reshape。
+//   7. 输出累加器过宽时沿宽度拆成两半：planWideAccumulatorSplits 与四个
+//      rewriteSplit* 函数，能力默认关闭。
 //   8. 「入口生成合并版与回退版」由规则层（Rule / ProgramGridTransform）
 //      负责，不属于本文件。
 //
@@ -394,9 +396,13 @@ static bool isTensorPointer(Type type) {
 int64_t selectRowsPerProgram(int64_t grid, int64_t maxDotRows,
                              int64_t maxTensorBytes, int64_t peakLiveBytes,
                              const RowCountPolicy &policy) {
-  // 单个提升值的字节预算。
-  // Per-value byte budget.
-  const int64_t budget = policy.maxLiftedValueBytes;
+  // 拆分路径会物化两个半宽值，因此单值预算可以翻倍；若不翻倍，拆分路径
+  // 永远不可能被收益模型选中。
+  // The split path materialises two half-width values, so it may spend twice
+  // the per-value budget; without the doubling a split could never be chosen.
+  const int64_t budget = policy.splitWideAccumulator
+                             ? 2 * policy.maxLiftedValueBytes
+                             : policy.maxLiftedValueBytes;
 
   // 每条约束都形如 demand * factor <= budget，等价于 factor <= budget / demand，
   // 因此逐因子比较可以折叠成取所有上界的最小值。
@@ -519,6 +525,16 @@ bool RowLiftBuilder::run(triton::FuncOp fn) {
   }
   scf::ForOp loop = *loops.begin();
   Value upperBound = loop.getUpperBound();
+  // 累加器拆分必须在重写任何指令之前定下来：要拆半的描述符可能位于循环
+  // 之前，一旦先按整宽展开成指针张量，就无法再按半宽重建。
+  // The accumulator split has to be decided before any instruction is rewritten:
+  // a descriptor above the loop would otherwise be expanded at full width and
+  // could no longer be rebuilt per half.
+  plannedSplitIndices.clear();
+  plannedSplitValues.clear();
+  plannedHalfWidths.clear();
+  if (!planWideAccumulatorSplits(loop, plannedSplitIndices))
+    return false;
   // 新建一个空 block 作为重建目标，先挂到函数体尾部，成功后替换旧 block。
   auto *fresh = new Block();
   fn.getBody().push_back(fresh);
@@ -666,6 +682,32 @@ bool RowLiftBuilder::rewrite(Operation *op) {
   // 步骤 0：循环是唯一会改变循环进位值个数的形态。
   if (auto loop = dyn_cast<scf::ForOp>(op))
     return rewriteLoop(loop);
+
+  // 步骤 0b：已规划拆半的描述符必须在这里就拆半。这一步要早于下面的依赖
+  // 探测：与行无关的描述符会被当作普通指令整宽克隆，而规划要求它产出两个
+  // 半宽描述符；消费它的 load 也必须走两半 load，否则只映射出一个整宽值。
+  // A descriptor planned for halving has to be split here, before the
+  // dependence probe below: a row-invariant one would otherwise be cloned at
+  // full width, and its load would map a single whole-width value.
+  if (auto makePtr = dyn_cast<triton::MakeTensorPtrOp>(op)) {
+    auto split = splitDescriptors.find(makePtr.getResult());
+    if (split != splitDescriptors.end())
+      return rewriteSplitTensorPointer(makePtr, split->second);
+  }
+  if (auto load = dyn_cast<triton::LoadOp>(op)) {
+    auto split = splitDescriptors.find(load.getPtr());
+    if (split != splitDescriptors.end())
+      return rewriteSplitDescriptorLoad(load, split->second);
+  }
+
+  // 步骤 1a：拆分累加器没有全宽映射，消费方必须先走拆分感知路径，否则下面
+  // 的依赖探测会查不到映射，克隆出带无效操作数的指令。
+  // A split accumulator has no full-width mapping, so its consumers must be
+  // rebuilt before the dependency probe below (which would otherwise look up
+  // the absent mapping and clone the op with an invalid operand).
+  if (llvm::any_of(op->getOperands(),
+                   [&](Value v) { return splitValues.contains(v); }))
+    return rewriteSplitOp(op);
 
   // 步骤 2：判断本指令是否与查询行相关。
   //   descriptor —— 操作数是已展开的块指针，必须走描述符访存路径；
@@ -991,11 +1033,33 @@ bool RowLiftBuilder::rewriteLoop(scf::ForOp old) {
   // 每个循环从头开始，清空上一个循环遗留的有效行掩码。
   rowActiveMask = Value();
 
-  // 步骤 1+2：原循环的进位值统一补上行维。
-  // Step 1+2: every carried value gains the row dimension.
+  // 步骤 1+2：原循环的进位值统一补上行维；哪些累加器要拆半已在 run 里定下
+  // （描述符必须先于展开拆半），新循环要为每个拆半值携带两个进位值。拆半
+  // 初值直接从原始进位值算，避免对已提升值再做一次行维提升。
+  // Step 1+2: every carried value gains the row dimension; the accumulators
+  // planned for halving in `run` become two loop-carried values.  A split
+  // initial value is derived from the original one, never from its lifted copy.
+  SmallVector<int64_t> splitIndices(plannedSplitIndices.begin(),
+                                    plannedSplitIndices.end());
+
+  // 建立「原进位值索引 -> 新进位值起始位置 + 个数」的映射：一个未拆分的
+  // 累加器对应 1 个新进位值，拆分的累加器对应 2 个半宽值。
+  // One original accumulator maps onto one or two loop-carried values.
   SmallVector<Value> loopInit;
-  for (Value arg : old.getInitArgs())
-    loopInit.push_back(ensureRowDimension(arg));
+  SmallVector<std::pair<int64_t, int64_t>> ranges;
+  for (auto [index, arg] : llvm::enumerate(old.getInitArgs())) {
+    if (llvm::is_contained(splitIndices, static_cast<int64_t>(index))) {
+      SplitValue halves;
+      if (!ensureRowHalves(arg, halves))
+        return false;
+      ranges.push_back({loopInit.size(), 2});
+      loopInit.push_back(halves.first);
+      loopInit.push_back(halves.second);
+    } else {
+      ranges.push_back({loopInit.size(), 1});
+      loopInit.push_back(ensureRowDimension(arg));
+    }
+  }
 
   // 步骤 3：末行上界必须已经物化到 lastRowMapping（run 里克隆的标量上界
   // 切片产生），否则说明上界被不支持的 region 包住，本次提升放弃。
@@ -1013,10 +1077,17 @@ bool RowLiftBuilder::rewriteLoop(scf::ForOp old) {
       loopInit);
   loop->setAttrs(old->getAttrs());
 
-  // 归纳变量与各进位值的映射。
+  // 归纳变量与各进位值的映射：拆分值登记到 splitValues，普通值登记到
+  // valueMapping。
   valueMapping.map(old.getInductionVar(), loop.getInductionVar());
-  for (auto [index, arg] : llvm::enumerate(old.getRegionIterArgs()))
-    valueMapping.map(arg, loop.getRegionIterArgs()[index]);
+  for (auto [index, arg] : llvm::enumerate(old.getRegionIterArgs())) {
+    auto [start, count] = ranges[index];
+    if (count == 2)
+      splitValues[arg] = {loop.getRegionIterArgs()[start],
+                          loop.getRegionIterArgs()[start + 1]};
+    else
+      valueMapping.map(arg, loop.getRegionIterArgs()[start]);
+  }
 
   rewriter.setInsertionPointToStart(loop.getBody());
   // 步骤 4：循环体内与行相关的访存需要逐行有效掩码，因此必须在重建循环体
@@ -1047,13 +1118,27 @@ bool RowLiftBuilder::rewriteLoop(scf::ForOp old) {
                                                   previous));
   };
 
-  // 逐项生成新的 yield：原进位值补行维后逐项选择。
+  // 逐项生成新的 yield：拆分累加器产生两个半宽值，其余值补行维后逐项选择。
   SmallVector<Value> output;
   for (auto [index, value] : llvm::enumerate(yield.getOperands())) {
+    auto [start, count] = ranges[index];
+    if (count == 2) {
+      auto it = splitValues.find(value);
+      if (it == splitValues.end())
+        return false;
+      output.push_back(keep(
+          it->second.first, loop.getRegionIterArgs()[start],
+          cast<RankedTensorType>(loop.getRegionIterArgs()[start].getType())));
+      output.push_back(keep(
+          it->second.second, loop.getRegionIterArgs()[start + 1],
+          cast<RankedTensorType>(
+              loop.getRegionIterArgs()[start + 1].getType())));
+      continue;
+    }
     auto previous =
-        cast<RankedTensorType>(loop.getRegionIterArgs()[index].getType());
+        cast<RankedTensorType>(loop.getRegionIterArgs()[start].getType());
     output.push_back(keep(ensureRowDimension(value),
-                          loop.getRegionIterArgs()[index], previous));
+                          loop.getRegionIterArgs()[start], previous));
   }
 
   // 用新生成的 yield 替换循环体末尾的占位 terminator。
@@ -1062,9 +1147,19 @@ bool RowLiftBuilder::rewriteLoop(scf::ForOp old) {
   rewriter.setInsertionPointToEnd(loop.getBody());
   rewriter.create<scf::YieldOp>(old.getLoc(), output);
 
-  // 步骤 6：循环结果回填映射。
-  for (auto [index, result] : llvm::enumerate(old.getResults()))
-    valueMapping.map(result, loop.getResults()[index]);
+  // 步骤 6：循环结果回填映射。拆分的累加器以成对结果离开循环，后续 store
+  // 可以按同样方式拆它的指针，而不必重建全宽值。
+  for (auto [index, result] : llvm::enumerate(old.getResults())) {
+    auto [start, count] = ranges[index];
+    if (count == 2) {
+      // The halves leave the loop as a pair so that a later store can split its
+      // pointer the same way instead of rebuilding the full width.
+      splitValues[result] = {loop.getResults()[start],
+                             loop.getResults()[start + 1]};
+      continue;
+    }
+    valueMapping.map(result, loop.getResults()[start]);
+  }
 
   // 循环体之后继续发出后续指令。
   rewriter.setInsertionPointAfter(loop);
@@ -1083,22 +1178,738 @@ Value RowLiftBuilder::createLoopActiveMask(scf::ForOp old, scf::ForOp loop) {
 }
 
 
+// 前向声明：planWideAccumulatorSplits 与 canSplitWideAccumulators 都复用同
+// 一份累加器岛判定（定义见下方）。
+// Forward declaration: the accumulator-island check is shared by
+// planWideAccumulatorSplits and canSplitWideAccumulators.
+static bool isSplitFriendlyValue(Value value, Operation *loop, bool &sawDot);
+
+// 若一次使用是该 scf.if 分支末尾的 yield，返回对应的 if 结果；否则返回空值。
+// 累加器经过 scf.if 时值会变成 if 结果，岛分析必须穿过这一层，否则后半段
+// 的消费者（循环后的归一化与写回）会被误判为岛外。
+// If a use is the terminator of an scf.if branch, return the matching if result;
+// otherwise return a null value.  An accumulator that flows through an scf.if
+// turns into the if result, so the island analysis has to follow that edge or
+// the post-loop consumers would look like they are outside the island.
+static Value ifResultForYield(OpOperand &use) {
+  auto yield = dyn_cast<scf::YieldOp>(use.getOwner());
+  if (!yield)
+    return Value();
+  auto ifOp = dyn_cast<scf::IfOp>(yield->getParentOp());
+  if (!ifOp || use.getOperandNumber() >= ifOp.getNumResults())
+    return Value();
+  return ifOp.getResult(use.getOperandNumber());
+}
+
+// 收集累加器岛里由该值供给的 dot 与 store。遍历规则与 isSplitFriendlyValue
+// 保持一致：只跟进 dot 的累加器、store 的值、逐元素算术与 scf.if 的结果。
+// `island` 非空时同时记录岛内途经的每个原始值，供 scf.if 在建结果类型之前
+// 判断哪些结果要占两个半宽项。
+// Collect the dots and stores fed by `root` inside its accumulator island,
+// following exactly the same edges as isSplitFriendlyValue.  When `island` is
+// non-null every visited value is recorded as well, so an scf.if can decide
+// which results take two half-width types before it is created.
+static void collectSplitIsland(Value root, SmallVectorImpl<triton::DotOp> &dots,
+                               SmallVectorImpl<triton::StoreOp> &stores,
+                               Operation *loop = nullptr,
+                               DenseSet<Value> *island = nullptr) {
+  SmallVector<Value> work{root};
+  DenseSet<Value> seen;
+  while (!work.empty()) {
+    Value value = work.pop_back_val();
+    if (!seen.insert(value).second)
+      continue;
+    if (island)
+      island->insert(value);
+    for (OpOperand &use : value.getUses()) {
+      Operation *user = use.getOwner();
+      if (auto dot = dyn_cast<triton::DotOp>(user)) {
+        if (use.get() == dot.getC()) {
+          dots.push_back(dot);
+          work.push_back(dot.getResult());
+        }
+        continue;
+      }
+      if (auto store = dyn_cast<triton::StoreOp>(user)) {
+        if (use.get() == store.getValue())
+          stores.push_back(store);
+        continue;
+      }
+      if (isa<scf::YieldOp>(user)) {
+        // 回到本循环背边不算岛外：本循环的结果继续在岛内（循环之后的归一化
+        // 与写回都在岛上），if 分支的 yield 则沿对应结果走。
+        // Yielding to this loop's back edge stays inside the island: its result
+        // feeds the post-loop normalisation and write-back.  A branch yield of an
+        // scf.if continues on the matching if result.
+        if (loop && user->getParentOp() == loop) {
+          auto forOp = cast<scf::ForOp>(loop);
+          unsigned index = use.getOperandNumber();
+          if (index < forOp.getNumResults())
+            work.push_back(forOp.getResult(index));
+        } else if (Value result = ifResultForYield(use)) {
+          work.push_back(result);
+        }
+        continue;
+      }
+      if (user->getNumResults() == 1 && user->getNumRegions() == 0) {
+        StringRef dialect = user->getName().getDialectNamespace();
+        if (dialect == "arith" || dialect == "math")
+          work.push_back(user->getResult(0));
+      }
+    }
+  }
+}
+
+// 描述符能否沿最后一维拆成两半：它必须由块指针构造，tile 的最后一维与半宽
+// 对应的整宽一致且为偶数。
+// True when the descriptor can be halved along its last dimension: it is built
+// by a block pointer, and its last tile extent equals the full width and splits
+// into two equal halves.
+static bool descriptorHalvesAtWidth(Value pointer, int64_t width) {
+  auto makePtr = pointer.getDefiningOp<triton::MakeTensorPtrOp>();
+  if (!makePtr)
+    return false;
+  auto pointerType = dyn_cast<triton::PointerType>(makePtr.getType());
+  auto blockType =
+      pointerType ? dyn_cast<RankedTensorType>(pointerType.getPointeeType())
+                  : RankedTensorType();
+  return blockType && blockType.getRank() > 0 &&
+         blockType.getShape().back() == width && width >= 2 && width % 2 == 0;
+}
+
+// 累加器岛能否结构拆半：每个 dot 的 B 必须来自一个最后一维同宽的块指针
+// load，每个 store 的指针也必须是最后一维同宽的块指针，这样 V 的半宽由访存
+// 本身产生，而不是靠 reshape/trans/split 重组值。成功时把描述符追加到
+// `descriptors`。
+// True when the accumulator island can be split structurally: each dot's B has
+// to come from a block-pointer load whose last tile extent is the accumulator
+// width, and each store's pointer has to be a block pointer of the same width,
+// so the half-width V is produced by the memory access itself rather than by a
+// reshape/trans/split of a value.  The descriptors are appended on success.
+static bool describeSplitDescriptor(Value root, int64_t width,
+                                    SmallVectorImpl<Value> &descriptors,
+                                    Operation *loop = nullptr,
+                                    DenseSet<Value> *island = nullptr) {
+  SmallVector<triton::DotOp> dots;
+  SmallVector<triton::StoreOp> stores;
+  collectSplitIsland(root, dots, stores, loop, island);
+  // 岛里没有任何 dot 意味着没有可拆的 PV 累加器。
+  if (dots.empty())
+    return false;
+  for (triton::DotOp dot : dots) {
+    auto load = dot.getB().getDefiningOp<triton::LoadOp>();
+    if (!load || !descriptorHalvesAtWidth(load.getPtr(), width))
+      return false;
+    descriptors.push_back(load.getPtr());
+  }
+  for (triton::StoreOp store : stores) {
+    if (!descriptorHalvesAtWidth(store.getPtr(), width))
+      return false;
+    descriptors.push_back(store.getPtr());
+  }
+  return true;
+}
+
+// 找出超出字节预算且使用范围可安全拆半的累加器，输出需要拆分的循环进位索引
+// 与要拆半的描述符。
+bool RowLiftBuilder::planWideAccumulatorSplits(
+    scf::ForOp old, SmallVectorImpl<int64_t> &indices) {
+  // 能力关闭时不做任何拆分规划，走历史的全宽单值路径。
+  if (!features.splitWideAccumulator)
+    return true;
+
+  for (auto [index, arg] :
+       llvm::enumerate(old.getRegionIterArgs())) {
+    // 提升后的类型（行维在最前面），其字节数就是提升后的大小。
+    auto lifted = getLiftedType(arg.getType());
+    const int64_t budget = candidate.splitValueBudgetBytes;
+    const int64_t bytes = getTensorBytes(lifted);
+    if (bytes <= budget)
+      continue;
+    // 标量进位值或语义上不拆的值（rank < 2）在字节预算内本就通不过上一条，
+    // 这里再判一次以保持历史行为。
+    // A scalar-carried or semantically unsplit value (rank < 2) never exceeds
+    // the budget above; the check is kept so the historical path is unchanged.
+    if (lifted.getRank() < 2)
+      continue;
+
+    // 拆半后必须真的落回预算之内，且最后一维能均分成两个连续半宽。
+    // Halving must actually bring the value under the budget, and the width
+    // must be splittable into two equal contiguous halves.
+    if (bytes > 2 * budget)
+      return false;
+    int64_t width = lifted.getShape().back();
+    if (width < 2 || width % 2 != 0)
+      return false;
+
+    // 只有「累加器岛」内的值才能拆：它的所有使用者都必须能按半宽重建，且
+    // 岛里的 dot/store 都必须能从最后一维同宽的描述符结构拆半。
+    bool sawDot = false;
+    if (!isSplitFriendlyValue(arg, old, sawDot) || !sawDot)
+      return false;
+    SmallVector<Value> descriptors;
+    DenseSet<Value> island;
+    if (!describeSplitDescriptor(arg, width, descriptors, old.getOperation(),
+                                 &island))
+      return false;
+    // 把半宽记在规划阶段：此后生成任何 IR 都可以直接按半宽建类型，不必等
+    // 重写期的 splitValues。同一个值出现在两个岛里时半宽必须一致。
+    const int64_t halfWidth = width / 2;
+    for (Value value : island) {
+      auto [it, inserted] = plannedHalfWidths.try_emplace(value, halfWidth);
+      if (!inserted && it->second != halfWidth)
+        return false;
+      plannedSplitValues.insert(value);
+    }
+    // 进位初值在循环之外，不在岛内，但它同样要按规划的半宽生成两个初值。
+    Value init = old.getInitArgs()[index];
+    auto initType = dyn_cast<RankedTensorType>(init.getType());
+    if (!initType || initType.getShape().back() != 2 * halfWidth)
+      return false;
+    auto [initIt, initInserted] =
+        plannedHalfWidths.try_emplace(init, halfWidth);
+    if (!initInserted && initIt->second != halfWidth)
+      return false;
+    for (Value descriptor : descriptors)
+      splitDescriptors.try_emplace(descriptor, SplitDescriptor{});
+    indices.push_back(static_cast<int64_t>(index));
+  }
+  LLVM_DEBUG(llvm::dbgs()
+             << "row-lift: planned " << indices.size() << " split indices, "
+             << splitDescriptors.size() << " descriptors\n");
+  return true;
+}
+
+// 判断值的所有使用是否都留在累加器岛内，并用 sawDot 确认该岛确实由 dot 供给。
+//
+// 累加器岛的合法组成：dot 的 C 操作数、纯算术的中间结果、store 的值、以及
+// 送回本循环的 yield。任何越界使用者都会导致拆分失败，因为半宽值无法以
+// 全宽语义继续流动。
+static bool isSplitFriendlyValue(Value value, Operation *loop,
+                                 bool &sawDot) {
+  for (OpOperand &use : value.getUses()) {
+    Operation *user = use.getOwner();
+    if (auto dot = dyn_cast<triton::DotOp>(user)) {
+      // 只拆 dot 的累加器操作数；拆 A 或 B 会连带缩小收缩维，改变归约语义。
+      // Only the accumulator operand of the dot is split; halving A or B would
+      // also halve the contraction and change the reduction.
+      if (use.get() != dot.getC())
+        return false;
+      sawDot = true;
+      continue;
+    }
+    if (auto store = dyn_cast<triton::StoreOp>(user)) {
+      // 只允许作为被写回的值（O / lse），不能作为指针或掩码。
+      if (use.get() != store.getValue())
+        return false;
+      continue;
+    }
+    if (isa<scf::YieldOp>(user)) {
+      // yield 必须回到本循环的背边；也可以是 scf.if 分支的 yield，此时值变成
+      // 对应的 if 结果，继续沿该结果判定。
+      // A yield has to feed this loop's back edge; an scf.if branch yield is
+      // also allowed, in which case the value becomes the matching if result and
+      // the check continues on that result.
+      if (user->getParentOp() == loop)
+        continue;
+      Value result = ifResultForYield(use);
+      if (!result || !isSplitFriendlyValue(result, loop, sawDot))
+        return false;
+      continue;
+    }
+    // 岛上只允许逐元素算术修改值，并且算术结果本身也必须继续留在岛上。
+    // The island may only be reshaped by elementwise arithmetic, and each
+    // result of that arithmetic must itself stay inside the island.
+    if (user->getNumResults() != 1 || user->getNumRegions() != 0)
+      return false;
+    StringRef dialect = user->getName().getDialectNamespace();
+    if (dialect != "arith" && dialect != "math")
+      return false;
+    if (!isSplitFriendlyValue(user->getResult(0), loop, sawDot))
+      return false;
+  }
+  return true;
+}
+
+// 拆宽能力的匹配判据：把单行字节数乘以每个 program 的行数，超过单值预算的
+// 进位值必须能对半拆开（不超过两倍预算、末维为偶数、累加器岛合法且可由
+// 最后一维同宽的描述符结构拆半）。规则 matcher 用它提前拒绝拆不开的形态；
+// planWideAccumulatorSplits 在重写前用同一组规则挑选具体索引。
+// Match-time predicate for the split capability.  It multiplies a single row's
+// byte count by the row count, and every value above the per-value budget must
+// halve cleanly and structurally; planWideAccumulatorSplits picks the actual
+// indices with the same rules before the rewrite starts.
+bool canSplitWideAccumulators(scf::ForOp loop, int64_t rowsPerProgram,
+                              bool enabled, int64_t budgetBytes) {
+  // 能力未开启时不做拆分，也没有需要拒绝的形态。
+  if (!enabled)
+    return true;
+  for (Value carried : loop.getRegionIterArgs()) {
+    auto tensor = dyn_cast<RankedTensorType>(carried.getType());
+    // 标量进位值或语义上不拆的值（rank < 2）继续走历史单值路径。
+    if (!tensor || tensor.getRank() < 2)
+      continue;
+    int64_t perRow = getTensorBytes(tensor);
+    if (perRow <= 0)
+      continue;
+    int64_t bytes;
+    if (__builtin_mul_overflow(perRow, rowsPerProgram, &bytes) ||
+        bytes <= budgetBytes)
+      continue;
+    // 拆半后必须真的落回预算之内，且最后一维能均分成两个连续半宽。
+    // Halving must bring the value under the budget, and the width must be
+    // splittable into two equal contiguous halves.
+    if (bytes > 2 * budgetBytes)
+      return false;
+    int64_t width = tensor.getShape().back();
+    if (width < 2 || width % 2 != 0)
+      return false;
+    // 只有「累加器岛」内的值才能拆，且该岛确实由 dot 供给、能从结构上拆半。
+    bool sawDot = false;
+    if (!isSplitFriendlyValue(carried, loop.getOperation(), sawDot) || !sawDot)
+      return false;
+    SmallVector<Value> descriptors;
+    if (!describeSplitDescriptor(carried, width, descriptors, loop.getOperation()))
+      return false;
+  }
+  return true;
+}
 
 
+// 沿最后一维把值拆成两个连续半宽值。
+bool RowLiftBuilder::splitLastDimension(Value value, SplitValue &halves) {
+  auto type = dyn_cast<RankedTensorType>(value.getType());
+  if (!type || type.getRank() < 2)
+    return false;
+  int64_t width = type.getShape().back();
+  if (width < 2 || width % 2 != 0)
+    return false;
 
+  // 半宽形状：最后一维减半。
+  SmallVector<int64_t> halfShape(type.getShape().begin(),
+                                 type.getShape().end() - 1);
+  halfShape.push_back(width / 2);
+  auto halfType = RankedTensorType::get(halfShape, type.getElementType());
 
+  // 第一步：reshape 成 [.., 2, W/2]，使两个半宽在内存中连续。
+  // [.., W] -> [.., 2, W/2] keeps both halves contiguous, and the trailing
+  // transpose makes the size-2 dimension the one tt.split removes.
+  SmallVector<int64_t> pairShape(halfShape);
+  pairShape.pop_back();
+  pairShape.push_back(2);
+  pairShape.push_back(width / 2);
+  Value paired = reshape(value, pairShape);
 
+  // 第二步：转置把大小为 2 的维度移到最后一维，满足 tt.split 的格式要求。
+  SmallVector<int64_t> transposedShape(halfShape);
+  transposedShape.push_back(2);
+  SmallVector<int32_t> order;
+  for (int64_t dim = 0; dim + 1 < type.getRank(); ++dim)
+    order.push_back(static_cast<int32_t>(dim));
+  order.push_back(static_cast<int32_t>(type.getRank()));
+  order.push_back(static_cast<int32_t>(type.getRank() - 1));
+  Value transposed = rewriter.create<triton::TransOp>(
+      value.getLoc(), RankedTensorType::get(transposedShape,
+                                            type.getElementType()),
+      paired, order);
 
+  // 第三步：tt.split 沿最后一维切成两个半宽值。
+  auto split = rewriter.create<triton::SplitOp>(
+      value.getLoc(), halfType, halfType, transposed);
+  halves = {split.getOutLHS(), split.getOutRHS()};
+  return true;
+}
 
+// 判断 `value` 能否尾部广播到 `target`，且沿最后一维的取值不变：源的秩更小
+// （末维是补齐出来的单位维），或源末维就是 1。只有这种形态才能用同一个半宽
+// 值同时代表两半。
+// True when `value` can broadcast into `target` by trailing dimensions and its
+// value is identical along the last axis: either the source ranks lower (the
+// last axis comes from a padded unit dimension) or its last extent is one. Only
+// such shapes may be represented by one half-width value shared by both halves.
+static bool collapseAcrossLastDim(Value value, RankedTensorType target) {
+  auto src = dyn_cast<RankedTensorType>(value.getType());
+  if (!src || src.getRank() > target.getRank())
+    return false;
+  if (!(src.getRank() < target.getRank() || src.getShape().back() == 1))
+    return false;
+  for (int64_t dim = 0; dim < src.getRank(); ++dim)
+    if (src.getShape()[dim] != 1 &&
+        src.getShape()[dim] != target.getShape()[dim])
+      return false;
+  return true;
+}
 
+// 取一个已规划拆半值的两个半宽提升值。半宽来自规划阶段登记的 plannedHalfWidths，
+// 因此类型不必依赖重写期的 splitValues；已经登记过两半的值直接复用。
+// Return the two half-width lifted values of a value planned for halving: the
+// half width comes from `plannedHalfWidths`, filled before any IR was generated,
+// and an already registered pair is reused as-is.
+bool RowLiftBuilder::ensureRowHalves(Value value, SplitValue &halves) {
+  if (auto it = splitValues.find(value); it != splitValues.end()) {
+    halves = it->second;
+    return true;
+  }
+  auto plan = plannedHalfWidths.find(value);
+  if (plan == plannedHalfWidths.end())
+    return false;
+  auto original = dyn_cast<RankedTensorType>(value.getType());
+  if (!original || original.getRank() < 2)
+    return false;
+  // 规划的半宽必须正好是原末维的一半。
+  const int64_t halfWidth = plan->second;
+  if (original.getShape().back() != 2 * halfWidth)
+    return false;
 
+  // 半宽提升类型：行维 + 原形状，末维换成半宽。
+  SmallVector<int64_t> halfShape{static_cast<int64_t>(
+      candidate.rowsPerProgram)};
+  halfShape.append(original.getShape().begin(), original.getShape().end() - 1);
+  halfShape.push_back(halfWidth);
+  auto halfType = RankedTensorType::get(halfShape, original.getElementType());
 
+  // 取值在各列相同的初值可以结构折叠成同一个半宽值，不产生全宽中间值。
+  if (Value half = rebuildHalfOperand(value, halfType)) {
+    halves = {half, half};
+    return true;
+  }
 
+  // 其余形态没有结构化的半宽来源：取已重建的整宽值沿末维拆半，再按需补行维。
+  // 尚未重建的值没有可拆的来源，直接放弃。
+  if (!valueMapping.contains(value))
+    return false;
+  Value full = valueMapping.lookup(value);
+  auto fullType = dyn_cast<RankedTensorType>(full.getType());
+  if (!fullType || fullType.getShape().back() != original.getShape().back())
+    return false;
+  SplitValue raw;
+  if (!splitLastDimension(full, raw))
+    return false;
+  auto rawType = dyn_cast<RankedTensorType>(raw.first.getType());
+  if (!rawType)
+    return false;
+  // 已重建值本身就是提升形态时，拆半结果已经是目标半宽类型。
+  if (raw.first.getType() == halfType) {
+    halves = raw;
+    return true;
+  }
+  // 未提升的整宽值拆半后秩少一维，两半各自在最前面补行维。
+  if (rawType.getRank() + 1 != halfType.getRank())
+    return false;
+  auto lift = [&](Value half) {
+    Value expanded =
+        rewriter.create<triton::ExpandDimsOp>(half.getLoc(), half, 0);
+    return Value(
+        rewriter.create<triton::BroadcastOp>(half.getLoc(), halfType, expanded));
+  };
+  halves = {lift(raw.first), lift(raw.second)};
+  return true;
+}
 
+// 把一个整宽操作数按半宽重建。只有「各列取值相同」的形态（splat 常量、标量
+// splat、沿最后一维不变的广播、只插入单位维的 expand_dims）可以这样折叠，重建
+// 后同一个半宽值同时供两半使用。返回空 Value 表示无法结构折叠。
+// Rebuild a full-width operand at half width.  Only shapes whose value is
+// identical across the columns (a splat constant, a scalar splat, a broadcast
+// that is invariant along the last axis, an expand_dims that only inserts unit
+// dimensions) collapse this way, and the single result is shared by both halves.
+// A null Value means the operand cannot be collapsed.
+Value RowLiftBuilder::rebuildHalfOperand(Value original,
+                                         RankedTensorType halfType) {
+  // 已在拆分表里的值由调用方提供两半，这里不猜。
+  if (splitValues.contains(original))
+    return Value();
+  // 映射值本身已是半宽（同一操作数已被重建过）时直接复用。
+  if (valueMapping.contains(original) &&
+      valueMapping.lookup(original).getType() == halfType)
+    return valueMapping.lookup(original);
 
+  Location loc = original.getLoc();
+  // splat 常量：按半宽形状重新生成同一个常量。
+  if (auto cst = original.getDefiningOp<arith::ConstantOp>()) {
+    auto dense = dyn_cast<DenseElementsAttr>(cst.getValue());
+    if (!dense || !dense.isSplat())
+      return Value();
+    Type element = halfType.getElementType();
+    if (isa<FloatType>(element))
+      return rewriter.create<arith::ConstantOp>(
+          loc, DenseElementsAttr::get(halfType, dense.getSplatValue<APFloat>()));
+    if (isa<IntegerType>(element))
+      return rewriter.create<arith::ConstantOp>(
+          loc, DenseElementsAttr::get(halfType, dense.getSplatValue<APInt>()));
+    return Value();
+  }
+  // 标量 splat：提升后源是 [R] 向量，可以广播到任意宽度。
+  if (auto splat = original.getDefiningOp<triton::SplatOp>()) {
+    Value src = ensureRowDimension(splat.getSrc());
+    return collapseAcrossLastDim(src, halfType)
+               ? broadcastRowValue(src, halfType)
+               : Value();
+  }
+  // 广播：源自身必须沿最后一维退化，两半才能共享同一个值。
+  if (auto bcast = original.getDefiningOp<triton::BroadcastOp>()) {
+    auto srcType = dyn_cast<RankedTensorType>(bcast.getSrc().getType());
+    auto dstType = dyn_cast<RankedTensorType>(bcast.getType());
+    if (!srcType || !dstType)
+      return Value();
+    if (!(srcType.getRank() < dstType.getRank() ||
+          srcType.getShape().back() == 1))
+      return Value();
+    Value src = ensureRowDimension(bcast.getSrc());
+    return collapseAcrossLastDim(src, halfType)
+               ? broadcastRowValue(src, halfType)
+               : Value();
+  }
+  // expand_dims 只插入单位维，取值沿任何轴都不变。
+  if (auto expand = original.getDefiningOp<triton::ExpandDimsOp>()) {
+    Value src = ensureRowDimension(expand.getSrc());
+    return collapseAcrossLastDim(src, halfType)
+               ? broadcastRowValue(src, halfType)
+               : Value();
+  }
+  return Value();
+}
 
+// 按操作种类分派拆分累加器的重建：dot、store 或逐元素算术。
+bool RowLiftBuilder::rewriteSplitOp(Operation *op) {
+  // 只有该能力开启时才可能存在半宽值，否则拒绝以免误用。
+  // The capability is the only reason a value is ever represented by halves.
+  if (!features.splitWideAccumulator)
+    return false;
+  if (auto dot = dyn_cast<triton::DotOp>(op))
+    return rewriteSplitDot(dot);
+  if (auto store = dyn_cast<triton::StoreOp>(op))
+    return rewriteSplitStore(store);
+  return rewriteSplitElementwise(op);
+}
 
+// 把 B 与累加器各拆成两半，分别重建一次 dot。
+bool RowLiftBuilder::rewriteSplitDot(triton::DotOp dot) {
+  auto accumulator = splitValues.find(dot.getC());
+  if (accumulator == splitValues.end())
+    return false;
+  // A 若已被拆半，会连带缩小收缩维，语义不再等价。
+  // A split A operand would also halve the contraction dimension.
+  if (splitValues.contains(dot.getA()))
+    return false;
+  // B 必须是被拆半的访存结果；结构拆半不在值层面重组，因此没有两半就没有
+  // 半宽来源。
+  // B has to be a split memory result.  The structural split does not restructure
+  // values, so without two halves there is no half-width source.
+  auto b = splitValues.find(dot.getB());
+  if (b == splitValues.end())
+    return false;
+  if (!hasRowDimension(dot.getA()) || hasRowDimension(dot.getB()))
+    return false;
 
+  // 累加器的两个半宽必须是同类型的 [R,G,W/2] 三维值。
+  auto accumulatorType =
+      dyn_cast<RankedTensorType>(accumulator->second.first.getType());
+  if (!accumulatorType || accumulatorType.getRank() != 3)
+    return false;
+  if (accumulator->second.second.getType() != accumulatorType)
+    return false;
+
+  // A 展平成 [R*G,K]；B 的两半必须是同形的 [K,W/2]，末维与累加器半宽一致。
+  Value a = flattenDotRows(ensureRowDimension(dot.getA()));
+  auto bType = dyn_cast<RankedTensorType>(b->second.first.getType());
+  if (!bType || bType.getRank() != 2 || b->second.second.getType() != bType ||
+      bType.getShape().back() != accumulatorType.getShape().back())
+    return false;
+
+  int64_t rows = accumulatorType.getShape()[0];
+  int64_t flatRows = rows * accumulatorType.getShape()[1];
+  auto flatType = RankedTensorType::get(
+      {flatRows, accumulatorType.getShape()[2]},
+      accumulatorType.getElementType());
+
+  // 对每个半宽各发一次 dot：A 与 B 的对应半宽、以及累加器的对应半宽。
+  SmallVector<Value> operands0{a, b->second.first,
+                               flattenDotRows(accumulator->second.first)};
+  SmallVector<Value> operands1{a, b->second.second,
+                               flattenDotRows(accumulator->second.second)};
+  SmallVector<Value> halves;
+  for (const SmallVector<Value> &operands : {operands0, operands1}) {
+    Operation *created = rewriter.create(
+        dot.getLoc(), dot->getName().getIdentifier(), operands,
+        TypeRange{flatType}, dot->getAttrs());
+    halves.push_back(
+        reshape(created->getResult(0), accumulatorType.getShape()));
+  }
+  // 结果仍以半宽对的形式登记，后续消费者继续走拆分感知路径。
+  splitValues[dot.getResult()] = {halves[0], halves[1]};
+  return true;
+}
+
+// 把纯逐元素算术按半宽重建两次，所有张量操作数都拆成对应的半宽。
+bool RowLiftBuilder::rewriteSplitElementwise(Operation *op) {
+  // 只接受单结果、无 region 的纯算术指令。
+  if (op->getNumResults() != 1 || op->getNumRegions() != 0)
+    return false;
+  StringRef dialect = op->getName().getDialectNamespace();
+  if (dialect != "arith" && dialect != "math")
+    return false;
+  auto resultType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+  if (!resultType || resultType.getRank() < 2)
+    return false;
+
+  // 结果的提升类型必须能均分，半宽形状即最后一维减半。
+  auto lifted = getLiftedType(resultType);
+  int64_t width = lifted.getShape().back();
+  if (width < 2 || width % 2 != 0)
+    return false;
+  SmallVector<int64_t> halfShape(lifted.getShape());
+  halfShape.back() /= 2;
+  auto halfType = RankedTensorType::get(halfShape, lifted.getElementType());
+
+  // 逐个操作数准备两个半宽副本：标量两侧共用，已拆半的值直接取用，整宽
+  // 张量则折叠成半宽值（各列相同的形态才允许折叠）。元素类型逐操作数计算
+  // （例如 truncf 的输入是 f32、输出是 f16），不能只按结果类型判断。
+  // Every tensor operand must already be split or collapse to the half width;
+  // scalars are shared by both halves.  The element type is derived per operand
+  // (a truncf takes f32 and produces f16), so the result type alone cannot decide
+  // the operand half type.
+  SmallVector<std::pair<Value, Value>> operands;
+  for (Value operand : op->getOperands()) {
+    if (!isa<RankedTensorType>(operand.getType())) {
+      operands.push_back({operand, operand});
+      continue;
+    }
+    auto operandLifted = getLiftedType(cast<RankedTensorType>(operand.getType()));
+    if (operandLifted.getRank() < 2 ||
+        operandLifted.getShape().back() % 2 != 0)
+      return false;
+    SmallVector<int64_t> operandHalfShape(operandLifted.getShape());
+    operandHalfShape.back() /= 2;
+    auto operandHalfType =
+        RankedTensorType::get(operandHalfShape, operandLifted.getElementType());
+    auto split = splitValues.find(operand);
+    if (split != splitValues.end()) {
+      if (split->second.first.getType() != operandHalfType ||
+          split->second.second.getType() != operandHalfType)
+        return false;
+      operands.push_back({split->second.first, split->second.second});
+      continue;
+    }
+    // 整宽操作数只有在「各列取值相同」时才能折叠成一个半宽值；否则两半
+    // 取值不同，结构拆分无法表达。
+    Value half = rebuildHalfOperand(operand, operandHalfType);
+    if (!half)
+      return false;
+    operands.push_back({half, half});
+  }
+
+  // 对两个半宽各重建一次同一条算术指令。
+  SmallVector<Value> results;
+  for (bool first : {true, false}) {
+    SmallVector<Value> halfOperands;
+    for (auto &pair : operands)
+      halfOperands.push_back(first ? pair.first : pair.second);
+    results.push_back(rewriter.create(op->getLoc(),
+                                      op->getName().getIdentifier(),
+                                      halfOperands, TypeRange{halfType},
+                                      op->getAttrs())
+                          ->getResult(0));
+  }
+  splitValues[op->getResult(0)] = {results[0], results[1]};
+  return true;
+}
+
+// 把半宽指针、半宽值与掩码各发出一次写回。结构拆半不重组值：两个半宽值
+// 分别写进各自半宽的指针，没有 join/trans/reshape。
+// Emit one half-width store per half.  The structural split never restructures
+// values: each half is written through its own half-width pointer, with no
+// join/trans/reshape.
+bool RowLiftBuilder::rewriteSplitStore(triton::StoreOp store) {
+  auto fail = [](const char *why) {
+    LLVM_DEBUG(llvm::dbgs() << "split-store: fail " << why << "\n");
+    return false;
+  };
+  auto valueIt = splitValues.find(store.getValue());
+  if (valueIt == splitValues.end())
+    return fail("value not split");
+  auto descriptorIt = splitDescriptors.find(store.getPtr());
+  if (descriptorIt == splitDescriptors.end())
+    return fail("descriptor not planned");
+  SplitDescriptor &descriptor = descriptorIt->second;
+
+  // 两个半宽值必须同形；后续再按半宽指针逐个校验。
+  auto valueType = dyn_cast<RankedTensorType>(valueIt->second.first.getType());
+  if (!valueType || valueIt->second.second.getType() != valueType)
+    return fail("value halves not same type");
+
+  Location loc = store.getLoc();
+  // 带掩码写回需要 maskedStore 能力，与全宽路径一致。
+  if (store.getMask() && !features.maskedStore)
+    return fail("masked store unsupported");
+
+  if (descriptor.expanded) {
+    // 展开档：两半各有一份指针张量，边界检查转成各自的半宽掩码，写回不再
+    // 携带边界检查。
+    ArrayRef<int32_t> boundaryCheck = store.getBoundaryCheck();
+    const LiftedDescriptor *halves[] = {&descriptor.first, &descriptor.second};
+    for (const LiftedDescriptor *half : halves) {
+      if (!half->pointer)
+        return fail("expanded half pointer missing");
+      for (int32_t axis : boundaryCheck)
+        if (axis < 0 || axis >= static_cast<int32_t>(half->tileShape.size()))
+          return fail("boundary axis out of tile rank");
+    }
+    for (auto [index, half] : llvm::enumerate(halves)) {
+      auto pointer = half->pointer;
+      auto pointerType = cast<RankedTensorType>(pointer.getType());
+      if (pointerType.getShape() != valueType.getShape())
+        return fail("expanded pointer shape != value shape");
+      auto element = dyn_cast<triton::PointerType>(pointerType.getElementType());
+      if (!element || element.getPointeeType() != valueType.getElementType())
+        return fail("expanded pointer element mismatch");
+      auto indexType =
+          RankedTensorType::get(pointerType.getShape(), rewriter.getI32Type());
+      Value boundary =
+          buildDescriptorMask(*half, store.getBoundaryCheck(), indexType);
+      // 原始掩码是整宽的，先按半宽折叠，再与边界掩码、有效行掩码合并。
+      Value original;
+      if (store.getMask()) {
+        auto maskType =
+            RankedTensorType::get(pointerType.getShape(), rewriter.getI1Type());
+        original = rebuildHalfOperand(store.getMask(), maskType);
+        if (!original)
+          return fail("mask cannot fold to half width");
+      }
+      bool ok = true;
+      Value mask = mergeMasks(
+          pointer, Value(),
+          {boundary, candidate.runtimeGrid ? validRows : Value(), original},
+          ok);
+      if (!ok)
+        return fail("mask merge failed");
+      Value value =
+          index == 0 ? valueIt->second.first : valueIt->second.second;
+      rewriter.create<triton::StoreOp>(loc, pointer, value, mask,
+                                       ArrayRef<int32_t>{}, store.getCache(),
+                                       store.getEvict());
+    }
+    return true;
+  }
+
+  // 未展开档：两半是半宽块指针，边界检查仍由块指针自己承担，因此不接受
+  // 掩码操作数（整宽掩码没有对应的半宽来源）。
+  if (!descriptor.firstPointer || !descriptor.secondPointer)
+    return fail("block pointers missing");
+  if (store.getMask())
+    return fail("masked store unsupported");
+  Value pointers[] = {descriptor.firstPointer, descriptor.secondPointer};
+  for (auto [index, pointer] : llvm::enumerate(pointers)) {
+    auto pointerType = dyn_cast<triton::PointerType>(pointer.getType());
+    if (!pointerType || pointerType.getPointeeType() != valueType)
+      return fail("block pointer pointee != value type");
+    Value value = index == 0 ? valueIt->second.first : valueIt->second.second;
+    rewriter.create<triton::StoreOp>(loc, pointer, value, Value(),
+                                     store.getBoundaryCheck(), store.getCache(),
+                                     store.getEvict());
+  }
+  return true;
+}
 
 // 在类型最前面插入行维 [R]，标量则变成 [R] 张量。
 //   tensor<M,N> -> tensor<R,M,N>
@@ -1287,6 +2098,11 @@ bool RowLiftBuilder::rewriteTensorPointer(triton::MakeTensorPtrOp makePtr) {
   if (!features.tensorPointer)
     return false;
 
+  // 规划为拆半的描述符先按半宽重建两个描述符（或两个半宽块指针）。
+  auto split = splitDescriptors.find(makePtr.getResult());
+  if (split != splitDescriptors.end())
+    return rewriteSplitTensorPointer(makePtr, split->second);
+
   auto pointerType = cast<triton::PointerType>(makePtr.getType());
   auto blockType = dyn_cast<RankedTensorType>(pointerType.getPointeeType());
   if (!blockType || blockType.getRank() == 0)
@@ -1460,6 +2276,73 @@ static Value shiftIntegerValue(IRRewriter &rewriter, Value base,
   return rewriter.create<arith::AddIOp>(loc, base, shift);
 }
 
+// 把一个已规划拆半的描述符重建为两个半宽描述符。与行无关的块指针留在原始
+// 层级，只产出两个半宽块指针（边界检查仍由它们承担）；与行相关的描述符则
+// 两半各展开成 [R]+半宽 tile 的指针张量，第二半的最后一维偏移后移半宽。
+// Rebuild a descriptor planned for halving.  A row-invariant block pointer stays
+// at its original level and simply yields two half-width block pointers (their
+// boundary checks stay on the pointer); a row-dependent descriptor is expanded
+// once per half into an [R]+half-tile pointer tensor, with the trailing offset of
+// the second half shifted by one half width.
+bool RowLiftBuilder::rewriteSplitTensorPointer(
+    triton::MakeTensorPtrOp makePtr, SplitDescriptor &descriptor) {
+  if (!features.tensorPointer)
+    return false;
+  auto pointerType = dyn_cast<triton::PointerType>(makePtr.getType());
+  auto blockType = pointerType
+                       ? dyn_cast<RankedTensorType>(pointerType.getPointeeType())
+                       : RankedTensorType();
+  if (!blockType || blockType.getRank() == 0)
+    return false;
+  auto tileShape = blockType.getShape();
+  int64_t width = tileShape.back();
+  if (width < 2 || width % 2 != 0)
+    return false;
+  int64_t halfWidth = width / 2;
+
+  // 最后一维的偏移是唯一要移动的部分：第二半整体后移半个 tile 宽。
+  Value lastOffset = getMappedValue(makePtr.getOffsets().back());
+  Value shifted = shiftIntegerValue(rewriter, lastOffset, halfWidth);
+  if (!shifted)
+    return false;
+
+  // 与行相关与否决定两半是「展开」还是「一对半宽块指针」。
+  bool rowDependent = llvm::any_of(makePtr->getOperands(),
+                                   [&](Value v) { return hasRowDimension(v); });
+  if (rowDependent) {
+    if (!expandTensorPointer(makePtr, halfWidth, Value(), descriptor.first) ||
+        !expandTensorPointer(makePtr, halfWidth, shifted, descriptor.second))
+      return false;
+    descriptor.expanded = true;
+    return true;
+  }
+
+  SmallVector<int64_t> halfTile(tileShape.begin(), tileShape.end());
+  halfTile.back() = halfWidth;
+  auto halfBlock = RankedTensorType::get(halfTile, blockType.getElementType());
+  auto halfPointerType = triton::PointerType::get(
+      halfBlock, pointerType.getAddressSpace());
+
+  SmallVector<Value> operands;
+  for (Value v : makePtr->getOperands())
+    operands.push_back(getMappedValue(v));
+  auto build = [&](ArrayRef<Value> ops) {
+    return rewriter
+        .create(makePtr.getLoc(), makePtr->getName().getIdentifier(), ops,
+                TypeRange{halfPointerType}, makePtr->getAttrs())
+        ->getResult(0);
+  };
+  descriptor.firstPointer = build(operands);
+  // 第二半必须换成后移半宽的偏移，否则两半描述符完全相同，会被 CSE 合并成
+  // 同一份 load，高半累加器就拿到了低半的 V。
+  // The second half must use the shifted offset; otherwise both descriptors are
+  // identical, CSE folds them into one load, and the high accumulator reads the
+  // low V half.
+  operands.back() = shifted;
+  descriptor.secondPointer = build(operands);
+  descriptor.expanded = false;
+  return true;
+}
 
 // 把 boundaryCheck 指定的各轴越界判断合并成显式 i1 掩码。
 // 对每个轴计算 0 <= offset + range(0, extent) < shape，再把各轴结果按位与；
@@ -1647,6 +2530,44 @@ bool RowLiftBuilder::emitDescriptorLoad(triton::LoadOp load,
   return true;
 }
 
+// 用拆半描述符发出两次半宽 load。展开档按两个半宽指针张量各发一次；与行无关
+// 的档直接用两个半宽块指针，边界检查仍由块指针承担。
+// Emit one half-width load per half of a split descriptor.  The expanded form
+// uses the two half-width pointer tensors; the row-invariant form uses the two
+// half-width block pointers, whose boundary checks stay on the pointer.
+bool RowLiftBuilder::rewriteSplitDescriptorLoad(triton::LoadOp load,
+                                                SplitDescriptor &descriptor) {
+  if (descriptor.expanded) {
+    Value first, second;
+    if (!emitDescriptorLoad(load, descriptor.first, first) ||
+        !emitDescriptorLoad(load, descriptor.second, second))
+      return false;
+    splitValues[load.getResult()] = {first, second};
+    return true;
+  }
+
+  // 半宽块指针自带边界检查，整宽 mask 没有对应的半宽来源，因此直接拒绝。
+  if (!descriptor.firstPointer || !descriptor.secondPointer || load.getMask())
+    return false;
+  SmallVector<Value> halves;
+  for (Value pointer : {descriptor.firstPointer, descriptor.secondPointer}) {
+    auto pointerType = dyn_cast<triton::PointerType>(pointer.getType());
+    auto resultType =
+        pointerType ? dyn_cast<RankedTensorType>(pointerType.getPointeeType())
+                    : RankedTensorType();
+    if (!resultType)
+      return false;
+    halves.push_back(rewriter
+                         .create<triton::LoadOp>(
+                             load.getLoc(), pointer, Value(), Value(),
+                             load.getBoundaryCheck(), load.getPadding(),
+                             load.getCache(), load.getEvict(),
+                             load.getIsVolatile())
+                         .getResult());
+  }
+  splitValues[load.getResult()] = {halves[0], halves[1]};
+  return true;
+}
 
 // 用展开后的指针张量重建描述符 store，并合并边界掩码与原始 mask。
 bool RowLiftBuilder::rewriteDescriptorStore(
@@ -1731,33 +2652,63 @@ bool RowLiftBuilder::rewriteIfOp(scf::IfOp old) {
        !llvm::hasSingleElement(old.getElseRegion().getBlocks())))
     return false;
 
-  // 结果类型统一补行维；块指针不能作为 scf.if 的结果值。
-  // Every result gains the row dimension.
+  // 结果类型统一补行维；块指针不能作为 scf.if 的结果值。被规划为拆半的
+  // 结果占两项半宽类型，因此两个分支都必须以半宽对 yield。
+  // Every result gains the row dimension, and a result planned for halving
+  // occupies two half-width slots, so both branches have to yield its two halves.
   SmallVector<Type> types;
-  for (Type t : old.getResultTypes()) {
+  SmallVector<int64_t> starts;
+  SmallVector<bool> split;
+  for (auto [index, t] : llvm::enumerate(old.getResultTypes())) {
     // A block pointer cannot be carried by an scf.if result.
     if (isTensorPointer(t))
       return false;
-    types.push_back(getLiftedType(t));
+    starts.push_back(static_cast<int64_t>(types.size()));
+    auto lifted = getLiftedType(t);
+    bool halve = features.splitWideAccumulator &&
+                 plannedSplitValues.contains(old.getResult(index));
+    if (halve) {
+      int64_t width = lifted.getShape().back();
+      if (lifted.getRank() < 2 || width < 2 || width % 2 != 0)
+        return false;
+      SmallVector<int64_t> halfShape(lifted.getShape());
+      halfShape.back() /= 2;
+      auto halfType =
+          RankedTensorType::get(halfShape, lifted.getElementType());
+      types.push_back(halfType);
+      types.push_back(halfType);
+    } else {
+      types.push_back(lifted);
+    }
+    split.push_back(halve);
   }
 
   // 先建出带空分支的 scf.if，再逐分支重建。
   auto replacement = rewriter.create<scf::IfOp>(
       old.getLoc(), types, valueMapping.lookupOrDefault(condition),
       /*withElseRegion=*/!old.getElseRegion().empty());
-  if (!rewriteIfBody(old.getThenRegion(), replacement.getThenRegion()) ||
-      !rewriteIfBody(old.getElseRegion(), replacement.getElseRegion()))
+  if (!rewriteIfBody(old.getThenRegion(), replacement.getThenRegion(), split) ||
+      !rewriteIfBody(old.getElseRegion(), replacement.getElseRegion(), split))
     return false;
 
   // 分支重建完成后插入点会留在分支 block 内，这里移回 if 之后。
   // Body rewriting leaves the insertion point inside the branch blocks.
   rewriter.setInsertionPointAfter(replacement);
-  valueMapping.map(old.getResults(), replacement.getResults());
+  for (auto [index, result] : llvm::enumerate(old.getResults())) {
+    int64_t start = starts[index];
+    if (split[index]) {
+      splitValues[result] = {replacement.getResult(start),
+                             replacement.getResult(start + 1)};
+      continue;
+    }
+    valueMapping.map(result, replacement.getResult(start));
+  }
   return true;
 }
 
 // 重建 scf.if 的一个分支 region，并生成提升后的 yield。
-bool RowLiftBuilder::rewriteIfBody(Region &from, Region &to) {
+bool RowLiftBuilder::rewriteIfBody(Region &from, Region &to,
+                                   ArrayRef<bool> split) {
   if (from.empty())
     return true;
 
@@ -1771,13 +2722,22 @@ bool RowLiftBuilder::rewriteIfBody(Region &from, Region &to) {
     if (!rewrite(&op))
       return false;
 
-  // 重建分支 yield：每个值补行维；已展开的块指针无法作为 yield 值。
+  // 重建分支 yield：每个值补行维；已展开的块指针无法作为 yield 值。被规划
+  // 拆半的值压入两个半宽值，与 if 结果占用的两项类型一致。
   auto yield = cast<scf::YieldOp>(from.front().getTerminator());
   SmallVector<Value> values;
-  for (Value v : yield.getOperands()) {
+  for (auto [index, v] : llvm::enumerate(yield.getOperands())) {
     // An expanded block pointer has no value that can be yielded.
     if (liftedDescriptors.contains(v))
       return false;
+    if (index < split.size() && split[index]) {
+      auto it = splitValues.find(v);
+      if (it == splitValues.end())
+        return false;
+      values.push_back(it->second.first);
+      values.push_back(it->second.second);
+      continue;
+    }
     values.push_back(ensureRowDimension(v));
   }
   rewriter.create<scf::YieldOp>(yield.getLoc(), values);

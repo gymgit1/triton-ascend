@@ -79,6 +79,7 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num
     tt.return
   }
 }
+
 // -----
 
 // A row-invariant scf.if may select between two monotone bound chains: the
@@ -141,6 +142,7 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num
     tt.return
   }
 }
+
 // -----
 
 // A pid-invariant tt.reduce result shifts a monotone bound chain.  Its value is
@@ -198,6 +200,7 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num
     tt.return
   }
 }
+
 // -----
 
 // A decreasing pid-dependent bound has no computable group trip count: the
@@ -245,6 +248,7 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num
     tt.return
   }
 }
+
 // -----
 
 // A loop that still reads its block index from a scalar table is lifted as
@@ -305,6 +309,7 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num
     tt.return
   }
 }
+
 // -----
 
 // A runtime trip count is lifted too.  The bound stays a scalar load because it
@@ -357,6 +362,71 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num
     %cp = tt.splat %C : !tt.ptr<f32> -> tensor<16x16x!tt.ptr<f32>>
     %pc = tt.addptr %cp, %offset : tensor<16x16x!tt.ptr<f32>>, tensor<16x16xi32>
     tt.store %pc, %loop : tensor<16x16x!tt.ptr<f32>>
+    tt.return
+  }
+}
+
+// -----
+
+// A widened accumulator above the byte budget degrades the row count instead of
+// being split; the split capability is off, and a reduce consumer would refuse
+// a split anyway.  Here the 16x512 pointer tensor is already 64KB, so only two
+// rows fit the 128KB per-value budget.
+
+// CHECK: module attributes {{.*}}hacc.coalesce_factor = 2 : i32
+// CHECK-LABEL: tt.func @wide_accumulator_reduced(
+// CHECK-NOT: tt.split
+// CHECK: tt.load {{.*}} : tensor<2x16x16x!tt.ptr<f16>>
+// CHECK: scf.for {{.*}} iter_args{{.*}} -> (tensor<2x16x512xf32>)
+// CHECK: tt.load {{.*}} : tensor<16x512x!tt.ptr<f16>>
+// CHECK: tt.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<32x16xf16> * tensor<16x512xf16> -> tensor<32x512xf32>
+// CHECK: tt.reduce
+// CHECK: tt.store {{.*}} : tensor<2x16x!tt.ptr<f32>>
+module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num_tiles = 64 : i32} {
+  tt.func @wide_accumulator_reduced(%A: !tt.ptr<f16>, %B: !tt.ptr<f16>, %C: !tt.ptr<f32>) {
+    %pid = tt.get_program_id x : i32
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %stride = arith.constant 256 : i32
+    %base = arith.muli %pid, %stride : i32
+    %ub0 = arith.muli %pid, %c2 : i32
+    %ub = arith.addi %ub0, %c1 : i32
+    %r = tt.make_range {start = 0 : i32, end = 16 : i32} : tensor<16xi32>
+    %c = tt.make_range {start = 0 : i32, end = 16 : i32} : tensor<16xi32>
+    %n = tt.make_range {start = 0 : i32, end = 512 : i32} : tensor<512xi32>
+    %r2 = tt.expand_dims %r {axis = 1 : i32} : tensor<16xi32> -> tensor<16x1xi32>
+    %c2d = tt.expand_dims %c {axis = 0 : i32} : tensor<16xi32> -> tensor<1x16xi32>
+    %n2 = tt.expand_dims %n {axis = 0 : i32} : tensor<512xi32> -> tensor<1x512xi32>
+    %sixteen = arith.constant dense<16> : tensor<16x1xi32>
+    %rs = arith.muli %r2, %sixteen : tensor<16x1xi32>
+    %rr = tt.broadcast %rs : tensor<16x1xi32> -> tensor<16x16xi32>
+    %cc = tt.broadcast %c2d : tensor<1x16xi32> -> tensor<16x16xi32>
+    %local16 = arith.addi %rr, %cc : tensor<16x16xi32>
+    %bases16 = tt.splat %base : i32 -> tensor<16x16xi32>
+    %offset16 = arith.addi %bases16, %local16 : tensor<16x16xi32>
+    %ap = tt.splat %A : !tt.ptr<f16> -> tensor<16x16x!tt.ptr<f16>>
+    %pa = tt.addptr %ap, %offset16 : tensor<16x16x!tt.ptr<f16>>, tensor<16x16xi32>
+    %a = tt.load %pa : tensor<16x16x!tt.ptr<f16>>
+    %rrs = tt.broadcast %rs : tensor<16x1xi32> -> tensor<16x512xi32>
+    %n512 = tt.broadcast %n2 : tensor<1x512xi32> -> tensor<16x512xi32>
+    %local512 = arith.addi %rrs, %n512 : tensor<16x512xi32>
+    %bp = tt.splat %B : !tt.ptr<f16> -> tensor<16x512x!tt.ptr<f16>>
+    %pb = tt.addptr %bp, %local512 : tensor<16x512x!tt.ptr<f16>>, tensor<16x512xi32>
+    %zero0 = arith.constant dense<0.0> : tensor<16x512xf32>
+    %loop = scf.for %iv = %c0 to %ub step %c1 iter_args(%acc0 = %zero0) -> (tensor<16x512xf32>) : i32 {
+      %b = tt.load %pb : tensor<16x512x!tt.ptr<f16>>
+      %dot0 = tt.dot %a, %b, %acc0 : tensor<16x16xf16> * tensor<16x512xf16> -> tensor<16x512xf32>
+      scf.yield %dot0 : tensor<16x512xf32>
+    }
+    %red = "tt.reduce"(%loop) <{axis = 1 : i32}> ({
+    ^bb0(%x: f32, %y: f32):
+      %s = arith.addf %x, %y : f32
+      tt.reduce.return %s : f32
+    }) : (tensor<16x512xf32>) -> tensor<16xf32>
+    %cp = tt.splat %C : !tt.ptr<f32> -> tensor<16x!tt.ptr<f32>>
+    %pc = tt.addptr %cp, %r : tensor<16x!tt.ptr<f32>>, tensor<16xi32>
+    tt.store %pc, %red : tensor<16x!tt.ptr<f32>>
     tt.return
   }
 }
