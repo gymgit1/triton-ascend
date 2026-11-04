@@ -33,6 +33,7 @@ add_triton_library(TritonToGraph
   Rules/LoadStoreTransposeRule.cpp
   Rules/RowCoalescingRule.cpp
   Rules/DotRowCoalescing.cpp
+  Rules/QueryRowBatchingRule.cpp
   Rules/TransposePointwiseReorderRule.cpp
   Rules/StoreCoalescingRule.cpp
 

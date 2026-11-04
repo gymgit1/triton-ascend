@@ -66,6 +66,15 @@ enum class GraphOptimizationRuleId : GraphOptimizationRuleMask {
   IntermediatePrecisionBoundaryElision = 8192,
   StoreCoveragePlanning = 16384,
   ContiguousBlockAccessFormation = 32768,
+  // 规则 B（query row batching）：把按下标表选择的稀疏块循环按查询行批量提升，
+  // 每组 R 行共享 K/V tile。它与 RowCoalescing 共用 RowLiftBuilder，但 matcher
+  // 独立，因此两条规则可分别开关；按 RFC #2686 与 IAT 同处 ProgramMapping
+  // 阶段。 Rule B (query row batching) batches R query rows of a table-indexed
+  // sparse block loop so one K/V tile feeds them.  It shares RowLiftBuilder
+  // with RowCoalescing but owns its own matcher, so the two rules stay
+  // independently gated; RFC #2686 places it in the ProgramMapping phase,
+  // alongside IAT.
+  QueryRowBatching = 131072,
 };
 
 enum class GraphOptimizationRulePhase : uint8_t {
@@ -117,6 +126,8 @@ getGraphOptimizationRuleName(GraphOptimizationRuleId rule) {
     return "StoreCoveragePlanningRule";
   case GraphOptimizationRuleId::ContiguousBlockAccessFormation:
     return "ContiguousBlockAccessFormationRule";
+  case GraphOptimizationRuleId::QueryRowBatching:
+    return "QueryRowBatchingRule";
   }
   return "Unknown";
 }
@@ -151,6 +162,11 @@ getGraphOptimizationRulePhase(GraphOptimizationRuleId rule) {
     return GraphOptimizationRulePhase::StoreCoalescing;
   case GraphOptimizationRuleId::ContiguousBlockAccessFormation:
     return GraphOptimizationRulePhase::ContiguousBlockAccessFormation;
+  // 按 RFC #2686，规则 B（query row batching）与 IAT 同处 ProgramMapping 阶段。
+  // Rule B (query row batching) runs in the ProgramMapping phase, alongside
+  // IAT, as specified by RFC #2686.
+  case GraphOptimizationRuleId::QueryRowBatching:
+    return GraphOptimizationRulePhase::ProgramMapping;
   case GraphOptimizationRuleId::RowCoalescing:
     return GraphOptimizationRulePhase::RowCoalescing;
   case GraphOptimizationRuleId::StridedAxisCoalescing:
@@ -161,7 +177,7 @@ getGraphOptimizationRulePhase(GraphOptimizationRuleId rule) {
   return GraphOptimizationRulePhase::Compatibility;
 }
 
-constexpr std::array<GraphOptimizationRuleId, 15>
+constexpr std::array<GraphOptimizationRuleId, 16>
     kGraphOptimizationRuleRegistry = {
         GraphOptimizationRuleId::LoadStoreTranspose,
         GraphOptimizationRuleId::TransposePointwiseReorder,
@@ -178,6 +194,7 @@ constexpr std::array<GraphOptimizationRuleId, 15>
         GraphOptimizationRuleId::IntermediatePrecisionBoundaryElision,
         GraphOptimizationRuleId::StoreCoveragePlanning,
         GraphOptimizationRuleId::ContiguousBlockAccessFormation,
+        GraphOptimizationRuleId::QueryRowBatching,
 };
 
 constexpr bool hasUniqueSingleBitGraphOptimizationRuleIds() {
@@ -227,7 +244,8 @@ constexpr GraphOptimizationRuleMask kKnownGraphOptimizationRuleMask =
     getGraphOptimizationRuleMask(
         GraphOptimizationRuleId::StoreCoveragePlanning) |
     getGraphOptimizationRuleMask(
-        GraphOptimizationRuleId::ContiguousBlockAccessFormation);
+        GraphOptimizationRuleId::ContiguousBlockAccessFormation) |
+    getGraphOptimizationRuleMask(GraphOptimizationRuleId::QueryRowBatching);
 
 constexpr GraphOptimizationRuleMask kDefaultEligibleGraphOptimizationRuleMask =
     kLegacyGraphOptimizationRuleMask |
@@ -236,7 +254,12 @@ constexpr GraphOptimizationRuleMask kDefaultEligibleGraphOptimizationRuleMask =
     getGraphOptimizationRuleMask(
         GraphOptimizationRuleId::PersistentTaskStripMining);
 
+// 规则 B（QueryRowBatching）只注册身份、不默认开启：要让 131072 参与默认
+// 调度，把这一项移到上面的默认可用集。
+// Rule B (QueryRowBatching) is registered but stays opt-in: move this entry into
+// the default-eligible set above to schedule bit 17 by default.
 constexpr GraphOptimizationRuleMask kFixedDefaultOffGraphOptimizationRuleMask =
+    getGraphOptimizationRuleMask(GraphOptimizationRuleId::QueryRowBatching) |
     getGraphOptimizationRuleMask(
         GraphOptimizationRuleId::ResidentLoadForwarding) |
     getGraphOptimizationRuleMask(
@@ -256,7 +279,7 @@ static_assert(kLegacyGraphOptimizationRuleMask == 511,
               "legacy graph optimization rule mask is an ABI contract");
 static_assert(kDefaultGraphOptimizationRuleMask ==
                   kDefaultEligibleGraphOptimizationRuleMask,
-              "IAT and PTSM must remain enabled by default");
+              "the default set must stay equal to the default-eligible set");
 static_assert(kKnownGraphOptimizationRuleMask ==
                   (kDefaultEligibleGraphOptimizationRuleMask |
                    kFixedDefaultOffGraphOptimizationRuleMask),
@@ -317,6 +340,12 @@ struct GraphOptimizationOptions {
   unsigned mappingL0BCapacityBytes = 0;
   unsigned mappingL0CCapacityBytes = 0;
   unsigned l0SafetyPercent = 80;
+  // 启动时实际调度的物理核块数（纯 SIMT 用 AIV，其余用 AIC）。行数策略用它
+  // 保证按 R 合并后仍能铺满一轮核；0 表示未知，关闭 gridX/R >= coreNum 检查。
+  // Physical AI-core blocks the launcher schedules (AIV for pure-SIMT kernels,
+  // AIC otherwise).  The row-count policy keeps one full wave after R-way
+  // coalescing; zero disables the gridX/R >= coreNum check.
+  unsigned coreNum = 0;
   // RowCoalescing changes the launch grid and is valid only for
   // compile_mode="simt_only".  Keep the source selector rather than a
   // second derived force flag so every consumer follows one mode contract.

@@ -46,7 +46,7 @@ namespace mlir {
 namespace triton {
 namespace cfg {
 
-// 行提升公共引擎（从 DotRowCoalescing 中抽出的行提升实现，供该规则复用）。
+// 行提升公共引擎（规则 B「查询行合并」使用，DotRowCoalescing 也复用它）。
 //
 // 本文件把「一个 program 只处理一行查询」的函数体重建为「一个 program
 // 处理 R 行查询」：所有与查询行相关的值在类型最前面插入行维 [R]，循环用
@@ -57,6 +57,7 @@ namespace cfg {
 //   2. tt.reduce 与条件与行号无关的 scf.if：rewriteReduce / rewriteIfOp。
 //   3. Q、O 的 tensor pointer 展开成指针张量：rewriteTensorPointer，以及
 //      描述符 load/store 的重建。
+//   4. 规则 B 的注册与 matcher 在 QueryRowBatchingRule.cpp，本文件不承担。
 //   8. 「入口生成合并版与回退版」由规则层（Rule / ProgramGridTransform）
 //      负责，不属于本文件。
 //

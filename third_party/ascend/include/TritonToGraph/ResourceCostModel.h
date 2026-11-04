@@ -68,6 +68,13 @@ struct ResourceSnapshot {
   uint64_t l0cCapacityBytes = 0;
   unsigned l0SafetyPercent = 80;
 
+  // 启动时实际调度的物理核块数（纯 SIMT kernel 用 AIV，其余用 AIC）。行数
+  // 策略用它保证按 R 合并后仍能铺满一轮核；0 表示未知，关闭该检查。
+  // Physical AI-core blocks the launcher schedules (AIV for pure-SIMT kernels,
+  // AIC otherwise).  The row-count policy keeps one full wave after R-way
+  // coalescing; zero means unknown and disables the check.
+  uint64_t coreNum = 0;
+
   bool isKnown() const;
   // True only when every cube buffer capacity is populated; the candidate
   // L0 checks are enforced only when this holds.

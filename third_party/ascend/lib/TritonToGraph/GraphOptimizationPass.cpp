@@ -62,6 +62,10 @@ namespace {
 constexpr std::array<GraphOptimizationRulePhase, 11> kRulePhases = {
     GraphOptimizationRulePhase::DiagonalMaskRemoval,
     GraphOptimizationRulePhase::ConvertModuloToMask,
+    // 规则 B（query row batching）按 RFC #2686 与 IAT 同处 ProgramMapping
+    // 阶段，随该阶段循环一起调度。
+    // Rule B (query row batching) runs in the ProgramMapping phase, alongside
+    // IAT, as specified by RFC #2686.
     GraphOptimizationRulePhase::ProgramMapping,
     GraphOptimizationRulePhase::PersistentTaskMapping,
     GraphOptimizationRulePhase::LoadStoreTranspose,
@@ -100,9 +104,15 @@ bool isRuleEnabled(GraphOptimizationRuleMask ruleMask,
   return (ruleMask & getGraphOptimizationRuleMask(ruleId)) != 0;
 }
 
-constexpr bool requiresProgramMappingCleanup(GraphOptimizationRuleId ruleId) {
+constexpr bool requiresPostRewriteCleanup(GraphOptimizationRuleId ruleId) {
+  // 规则 B 的行提升只按需构造 64 宽的值，但改写过程中仍会残留个别无人使用的
+  // 全宽广播（例如 8x16x128xf32 的 alpha 广播），若不清理会被下游 materialize
+  // 成整块 UB 占用，直接顶到容量上限，因此 apply 之后要补一次结构化清理。
+  // Rule B leaves unused full-width broadcasts (e.g. 8x16x128xf32 alpha)
+  // behind; without cleanup they are materialized into UB and blow the budget.
   return ruleId == GraphOptimizationRuleId::IndependentAxisTensorize ||
-         ruleId == GraphOptimizationRuleId::PersistentTaskStripMining;
+         ruleId == GraphOptimizationRuleId::PersistentTaskStripMining ||
+         ruleId == GraphOptimizationRuleId::QueryRowBatching;
 }
 
 constexpr bool isPlanHigherPriority(unsigned lhsBenefit, unsigned lhsOrder,
@@ -134,6 +144,7 @@ public:
     this->mappingL0BCapacityBytes = options.mappingL0BCapacityBytes;
     this->mappingL0CCapacityBytes = options.mappingL0CCapacityBytes;
     this->l0SafetyPercent = options.l0SafetyPercent;
+    this->coreNum = options.coreNum;
     this->compileMode = options.compileMode;
   }
 
@@ -172,6 +183,7 @@ GraphOptimizePass::getStableOptions(GraphOptimizationOptions &options) {
   const uint64_t cliMappingL0BCapacityBytes = this->mappingL0BCapacityBytes;
   const uint64_t cliMappingL0CCapacityBytes = this->mappingL0CCapacityBytes;
   const uint64_t cliL0SafetyPercent = this->l0SafetyPercent;
+  const uint64_t cliCoreNum = this->coreNum;
 
   if (cliRuleMask > std::numeric_limits<GraphOptimizationRuleMask>::max() ||
       !isValidGraphOptimizationRuleMask(
@@ -233,6 +245,12 @@ GraphOptimizePass::getStableOptions(GraphOptimizationOptions &options) {
     return failure();
   }
 
+  if (cliCoreNum > std::numeric_limits<unsigned>::max()) {
+    getOperation().emitError()
+        << "graph-optimize core-num is out of range: " << cliCoreNum;
+    return failure();
+  }
+
   const auto compileMode = triton::ascend::parseCompileMode(this->compileMode);
   if (!compileMode) {
     getOperation().emitError()
@@ -257,6 +275,7 @@ GraphOptimizePass::getStableOptions(GraphOptimizationOptions &options) {
   options.mappingL0CCapacityBytes =
       static_cast<unsigned>(cliMappingL0CCapacityBytes);
   options.l0SafetyPercent = static_cast<unsigned>(cliL0SafetyPercent);
+  options.coreNum = static_cast<unsigned>(cliCoreNum);
   options.compileMode = this->compileMode;
   options.independentAxisTensorize.enabledForCompileMode =
       *compileMode != triton::ascend::CompileMode::SimtOnly;
@@ -309,11 +328,17 @@ void GraphOptimizePass::runOnOperation() {
   }
 
   for (triton::FuncOp function : module.getOps<triton::FuncOp>()) {
-    const ResourceSnapshot resources = ResourceSnapshot::fromExplicit(
+    ResourceSnapshot resources = ResourceSnapshot::fromExplicit(
         options.mappingUBCapacityBytes, options.ubSafetyPercent,
         options.reservedUBBytes, options.mappingL0ACapacityBytes,
         options.mappingL0BCapacityBytes, options.mappingL0CCapacityBytes,
         options.l0SafetyPercent);
+    // 物理核数只来自 pass 选项（backend 按 kernel 的执行模式注入），快照里
+    // 保存后由行数策略统一读取，规则自身不再需要单独的查询接口。
+    // The physical core count comes from the pass option (the backend injects it
+    // per kernel execution mode); the snapshot carries it so the row-count
+    // policy reads one resource interface instead of a rule-private query.
+    resources.coreNum = options.coreNum;
     GraphOptimizationContext context(function, resources);
     unsigned rewriteCount = 0;
 
@@ -392,7 +417,7 @@ void GraphOptimizePass::runOnOperation() {
           signalPassFailure();
           return;
         }
-        if (requiresProgramMappingCleanup(appliedRuleId) &&
+        if (requiresPostRewriteCleanup(appliedRuleId) &&
             failed(runStructuralCleanup())) {
           selectedPlan.reset();
           plans.clear();
@@ -582,6 +607,15 @@ void populateBuiltinGraphOptimizationRules(
                     GraphOptimizationRuleId::ContiguousBlockAccessFormation)) {
     rules.push_back(createContiguousBlockAccessFormationRule(
         options.contiguousBlockAccessFormation));
+  }
+  // 规则 B（query row batching）在规则位 131072 置位时注册；它在
+  // ProgramMapping 阶段独立调度，对已经提升过的循环保持幂等。
+  // Rule B (query row batching) is registered when bit 131072 is set; it is
+  // scheduled standalone in the ProgramMapping phase and stays idempotent on an
+  // already-lifted loop.
+  if (isRuleEnabled(options.enabledRuleMask,
+                    GraphOptimizationRuleId::QueryRowBatching)) {
+    rules.push_back(createQueryRowBatchingRule());
   }
   const auto compileMode =
       triton::ascend::parseCompileMode(options.compileMode);
