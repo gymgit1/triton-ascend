@@ -116,6 +116,9 @@ struct RowLiftFeatures {
   // 条件不依赖查询行的 scf.if。
   // scf.if whose condition does not depend on the query row.
   bool loopInvariantIf = false;
+  // Q 和 O 由 tt.make_tensor_ptr 构造。
+  // Q and O are built with tt.make_tensor_ptr.
+  bool tensorPointer = false;
 };
 
 // 单个提升值的字节预算。超过该宽度的值默认被拒绝，由
@@ -204,6 +207,12 @@ struct RowLiftCandidate {
 // a shape before a sandbox clone and verify, and the rewrite path evaluates the
 // same predicate again so both stages cannot drift apart.
 
+// 能否把块指针展开成显式指针张量：pointee 是静态形状的 RankedTensor，
+// offset/shape/stride 的元素都是整数。`enabled` 对应 tensorPointer 能力开关。
+// True when the block pointer can be expanded into an explicit pointer tensor:
+// the pointee is a statically shaped ranked tensor and every index operand is
+// integral.  `enabled` mirrors the tensorPointer capability switch.
+bool canExpandTensorPointer(triton::MakeTensorPtrOp makePtr, bool enabled);
 
 // 能否重建条件与查询行无关的 scf.if：条件为标量 i1 且不依赖 `pid`，每个分支
 // 单 block，结果不携带块指针。
@@ -229,6 +238,17 @@ public:
   bool run(triton::FuncOp fn);
 
 private:
+  // 被展开成显式地址的块指针。形状与偏移都会保留，以便在使用点把 load 的
+  // boundary check 转成掩码。
+  // A block pointer expanded into explicit addresses. Both the shapes and the
+  // offsets are kept so a load's boundary check can be turned into a mask at
+  // its own use site.
+  struct LiftedDescriptor {
+    Value pointer;              // [R]+tile 指针张量
+    SmallVector<Value> shapes;  // 每个 tile 维的 i64 形状
+    SmallVector<Value> offsets; // 每个 tile 维的 i64 偏移
+    SmallVector<int64_t> tileShape;
+  };
 
   // 按操作种类分派单条指令的重建；无法支持时返回 false，整次提升失败。
   // Rebuild one operation according to its kind; false declines the rewrite.
@@ -236,10 +256,47 @@ private:
   // 在 axis+1 上重建 tt.reduce（前插了行维），并原样复用 combine region。
   // Rebuild tt.reduce on axis+1 after the row dimension was inserted.
   bool rewriteReduce(triton::ReduceOp reduce);
+  // 把 tt.make_tensor_ptr 的块指针展开成显式 [R]+tile 指针张量；若该描述符
+  // 已被规划成拆半，则走拆半路径。
+  // Expand a block-pointer descriptor into an explicit [R]+tile pointer tensor,
+  // or take the split path when the descriptor was planned to be halved.
+  bool rewriteTensorPointer(triton::MakeTensorPtrOp makePtr);
+  // 展开一个描述符。`lastExtent` 是最后一维的 tile 宽度（拆半时为半宽），
+  // `lastOffsetOverride` 非空时替换最后一维的偏移（第二半整体后移半宽）。
+  // Expand one descriptor.  `lastExtent` is the trailing tile extent (half the
+  // width when splitting) and a non-null `lastOffsetOverride` replaces the
+  // trailing offset, which is how the second half is shifted by one half width.
+  bool expandTensorPointer(triton::MakeTensorPtrOp makePtr, int64_t lastExtent,
+                           Value lastOffsetOverride,
+                           LiftedDescriptor &descriptor);
+  // 用展开后的指针张量重建描述符 load，并把 boundaryCheck 转成掩码。
+  // Rebuild a descriptor load on the expanded pointer tensor.
+  bool rewriteDescriptorLoad(triton::LoadOp load,
+                             const LiftedDescriptor &descriptor);
+  // 用给定描述符发出一次 load 并交回结果，不做映射登记；拆半路径按两个描述符
+  // 各调用一次，因此结果类型取自描述符的指针形状。
+  // Emit one load for the given descriptor and hand back its result without
+  // registering a mapping.  The split path calls it once per half, so the result
+  // shape comes from the descriptor's pointer shape.
+  bool emitDescriptorLoad(triton::LoadOp load, const LiftedDescriptor &descriptor,
+                          Value &result);
+  // 用展开后的指针张量重建描述符 store，并把 boundaryCheck 转成掩码。
+  // Rebuild a descriptor store on the expanded pointer tensor.
+  bool rewriteDescriptorStore(triton::StoreOp store,
+                              const LiftedDescriptor &descriptor);
   // 把值广播到目标形状：标量做 splat，行提升值补齐缺失的尾部单位维。
   // Broadcast `v` to `target`: a scalar becomes a splat and a row-lifted value
   // gains the missing trailing unit dimensions first.
   Value broadcastFullValue(Value v, RankedTensorType target);
+  // 生成沿某个 tile 轴递增的 i64 索引网格，并广播到目标形状。
+  // Build an i64 index grid that increases along one tile axis.
+  Value expandTileRange(Location loc, int64_t axis, int64_t extent,
+                        RankedTensorType target);
+  // 把 boundaryCheck 指定的各轴越界判断合并成一个显式 i1 掩码。
+  // Turn the boundary checks of the given axes into one explicit i1 mask.
+  Value buildDescriptorMask(const LiftedDescriptor &descriptor,
+                            ArrayRef<int32_t> boundaryCheck,
+                            RankedTensorType target);
   // 重建条件与查询行无关的 scf.if，两个分支都按行提升后的类型重建。
   // Rebuild an scf.if whose condition does not depend on the query row.
   bool rewriteIfOp(scf::IfOp old);
@@ -306,6 +363,10 @@ private:
   // 原始 SSA 值到重建后计算的映射。
   // Original SSA values mapped to the rebuilt computation.
   IRMapping valueMapping;
+  // 已展开为指针张量的块指针，按原始描述符值索引。
+  // Block pointers that were expanded into pointer tensors, keyed by their
+  // original descriptor value.
+  DenseMap<Value, LiftedDescriptor> liftedDescriptors;
   // 在最后一行求值、用于形成共享循环上界的标量值。
   // Scalar values evaluated at the last row to form the shared loop bound.
   IRMapping lastRowMapping;

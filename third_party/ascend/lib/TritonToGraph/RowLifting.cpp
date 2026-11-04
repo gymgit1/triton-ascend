@@ -55,6 +55,8 @@ namespace cfg {
 //   1. 公共组件：本文件即从 DotRowCoalescing 抽出的行提升引擎，各规则
 //      各自维护 matcher，重建逻辑只保留这一份。
 //   2. tt.reduce 与条件与行号无关的 scf.if：rewriteReduce / rewriteIfOp。
+//   3. Q、O 的 tensor pointer 展开成指针张量：rewriteTensorPointer，以及
+//      描述符 load/store 的重建。
 //   8. 「入口生成合并版与回退版」由规则层（Rule / ProgramGridTransform）
 //      负责，不属于本文件。
 //
@@ -661,10 +663,15 @@ bool RowLiftBuilder::rewrite(Operation *op) {
     return rewriteLoop(loop);
 
   // 步骤 2：判断本指令是否与查询行相关。
+  //   descriptor —— 操作数是已展开的块指针，必须走描述符访存路径；
   //   dependent  —— 操作数或嵌套 region 里用到了带行维的值。
-  bool dependent = llvm::any_of(op->getOperands(), [&](Value v) {
-    return hasRowDimension(v);
-  });
+  bool descriptor = llvm::any_of(
+      op->getOperands(),
+      [&](Value v) { return liftedDescriptors.contains(v); });
+  bool dependent =
+      descriptor || llvm::any_of(op->getOperands(), [&](Value v) {
+        return hasRowDimension(v);
+      });
   // 带 region 的指令可能只在 region 内部使用提升值，仅看顶层操作数不足
   // 以判定它与行无关，因此还要扫描所有嵌套 region。
   // An op with regions may only use lifted values in its body, so the top-level
@@ -681,19 +688,40 @@ bool RowLiftBuilder::rewrite(Operation *op) {
     return true;
   }
 
-  // 步骤 3：带 region 的形态无法走通用克隆（通用克隆只复制操作数与结果
-  // 类型，会留下缺失 region 的指令），必须单独重建。
-  // Dispatch the region-bearing shapes that the generic path below cannot
+  // 已展开的块指针只可能被 load/store 消费；其他消费者（例如 tt.advance）
+  // 还没有指针张量等价物，直接拒绝。
+  // An expanded block pointer is consumed by a load or store below; any other
+  // consumer (for example tt.advance) has no pointer tensor equivalent yet.
+  if (descriptor && !isa<triton::LoadOp, triton::StoreOp>(op))
+    return false;
+
+  // 步骤 3：两个带 region 的形态无法走通用克隆（通用克隆只复制操作数与
+  // 结果类型，会留下缺失 region 的指令），必须单独重建。
+  // Dispatch the two region-bearing shapes that the generic path below cannot
   // rebuild: it clones operands and result types only, so it would emit an op
   // whose region is missing.
   if (auto reduce = dyn_cast<triton::ReduceOp>(op))
     return rewriteReduce(reduce);
+  if (auto makePtr = dyn_cast<triton::MakeTensorPtrOp>(op))
+    return rewriteTensorPointer(makePtr);
   // 目前只有 scf.if 能按带 region 的方式重建；其他形态失败关闭，避免生成
   // 缺少 region 的操作。
   if (auto ifOp = dyn_cast<scf::IfOp>(op))
     return rewriteIfOp(ifOp);
   if (op->getNumRegions() != 0)
     return false;
+
+  // 步骤 4a：块指针 load/store 用展开后的指针张量重建，边界检查转掩码。
+  if (auto load = dyn_cast<triton::LoadOp>(op)) {
+    auto it = liftedDescriptors.find(load.getPtr());
+    if (it != liftedDescriptors.end())
+      return rewriteDescriptorLoad(load, it->second);
+  }
+  if (auto store = dyn_cast<triton::StoreOp>(op)) {
+    auto it = liftedDescriptors.find(store.getPtr());
+    if (it != liftedDescriptors.end())
+      return rewriteDescriptorStore(store, it->second);
+  }
 
   // 步骤 4c：dot。只有 A 与查询行相关、B 与行无关时才提升：把 [R,M,K] 展平
   // 成 [R*M,K] 复用普通 dot，结果再 reshape 回 [R,M,N]。
@@ -904,6 +932,14 @@ Value RowLiftBuilder::mergeMasks(Value pointer, Value base, ArrayRef<Value> part
 //   5) 循环末尾用有效行掩码选择「本轮新值 / 上一轮值」；
 //   6) 循环结果写回映射；拆分的累加器以成对结果继续向后传递。
 bool RowLiftBuilder::rewriteLoop(scf::ForOp old) {
+  // 已展开成指针张量的块指针不能作为循环进位值：展开时已删掉描述符，
+  // 循环里没有它的等价物。
+  // A loop carrying an expanded block pointer would need a descriptor value
+  // that the expansion deliberately removed.
+  for (Value arg : old.getInitArgs())
+    if (liftedDescriptors.contains(arg))
+      return false;
+
   // 每个循环从头开始，清空上一个循环遗留的有效行掩码。
   rowActiveMask = Value();
 
@@ -1119,17 +1155,485 @@ Value RowLiftBuilder::broadcastFullValue(Value v, RankedTensorType target) {
   return broadcastRowValue(v, target);
 }
 
+// 生成沿指定 tile 轴递增的索引网格并广播到目标形状，元素宽度跟随目标类型。
+// 地址运算统一用 i32（见 expandTensorPointer 的说明），因此只有目标类型是
+// i64 时才把 [0, extent) 区间扩宽；这样展开路径不再额外产生 i64 中间量。
+// Build the ascending index grid for one tile axis and broadcast it to the target
+// shape, with the element width following the target type.  The address
+// arithmetic uses i32 (see expandTensorPointer), so the [0, extent) range is only
+// widened when the target is i64, which keeps the expansion path free of extra
+// i64 intermediates.
+Value RowLiftBuilder::expandTileRange(Location loc, int64_t axis,
+                                      int64_t extent, RankedTensorType target) {
+  auto elementType = target.getElementType();
+  auto integer = dyn_cast<IntegerType>(elementType);
+  if (!integer)
+    return Value();
+  auto rangeType =
+      RankedTensorType::get({extent}, rewriter.getI32Type());
+  Value range = rewriter.create<triton::MakeRangeOp>(
+      loc, rangeType, 0, static_cast<int32_t>(extent));
+  if (integer.getWidth() > 32)
+    range = rewriter.create<arith::ExtSIOp>(
+        loc, RankedTensorType::get({extent}, elementType), range);
+
+  // 除目标轴外，每个位置插入单位维，使该轴落在行维之后（轴号 = axis+1）；
+  // 按升序插入可以保持各维 extent 与原 block 形状一致。
+  // Insert a unit dimension at every position except the tile axis, which sits
+  // directly behind the leading row dimension. Inserting in ascending order
+  // keeps the extents the same as the original block shape.
+  int64_t kept = axis + 1;
+  for (int64_t position = 0; position < target.getRank(); ++position)
+    if (position != kept)
+      range = rewriter.create<triton::ExpandDimsOp>(loc, range, position);
+  return rewriter.create<triton::BroadcastOp>(loc, target, range);
+}
+
+// 块指针能否展开成显式指针张量的完整判据。规则的 matcher 与
+// rewriteTensorPointer 共用，避免「匹配通过、展开失败」的两处漂移。
+// The complete predicate for descriptor expansion, shared by the rule's matcher
+// and rewriteTensorPointer.
+bool canExpandTensorPointer(triton::MakeTensorPtrOp makePtr, bool enabled) {
+  // 能力未开启时保持原有失败关闭路径。
+  if (!enabled)
+    return false;
+  auto pointerType = dyn_cast<triton::PointerType>(makePtr.getType());
+  if (!pointerType)
+    return false;
+  auto blockType = dyn_cast<RankedTensorType>(pointerType.getPointeeType());
+  if (!blockType || blockType.getRank() == 0)
+    return false;
+  // 显式指针张量要求每个 tile 维都有静态长度。
+  // The explicit pointer tensor needs a static extent per tile dimension.
+  if (llvm::any_of(blockType.getShape(),
+                   [](int64_t extent) { return extent <= 0; }))
+    return false;
+  // offset/shape/stride 都要能扩到 i64 参与地址运算；非整数操作数无法展开。
+  // Every index operand must widen to i64 for the address arithmetic.
+  auto isInteger = [](Value value) {
+    Type type = value.getType();
+    if (auto tensor = dyn_cast<RankedTensorType>(type))
+      type = tensor.getElementType();
+    return isa<IntegerType>(type);
+  };
+  return llvm::all_of(makePtr.getOffsets(), isInteger) &&
+         llvm::all_of(makePtr.getShape(), isInteger) &&
+         llvm::all_of(makePtr.getStrides(), isInteger);
+}
 
 
+// 把块指针描述符展开成显式 [R]+tile 指针张量，并记录形状与偏移供掩码使用。
+//
+// 展开过程就是按原语义显式计算每个 tile 元素的地址：
+//   addr[i0..ik] = base + Σ (offset[d] + i_d) * stride[d]
+// 其中 i_d 是该 tile 维的下标。展开后原来的 boundaryCheck 变成使用点的
+// 显式掩码，块指针本身不再出现在结果 IR 中。
+bool RowLiftBuilder::rewriteTensorPointer(triton::MakeTensorPtrOp makePtr) {
+  // 能力未开启时保持原有失败关闭路径。
+  if (!features.tensorPointer)
+    return false;
+
+  auto pointerType = cast<triton::PointerType>(makePtr.getType());
+  auto blockType = dyn_cast<RankedTensorType>(pointerType.getPointeeType());
+  if (!blockType || blockType.getRank() == 0)
+    return false;
+
+  LiftedDescriptor descriptor;
+  if (!expandTensorPointer(makePtr, blockType.getShape().back(), Value(),
+                           descriptor))
+    return false;
+  liftedDescriptors[makePtr.getResult()] = descriptor;
+  return true;
+}
+
+// 展开一个描述符。`lastExtent` 是最后一维的 tile 宽度（拆半时为半宽），
+// `lastOffsetOverride` 非空时替换最后一维的偏移（第二半整体后移半宽）。
+// Expand one descriptor.  `lastExtent` is the trailing tile extent (half the
+// width when splitting) and a non-null `lastOffsetOverride` replaces the trailing
+// offset, which is how the second half is shifted by one half width.
+bool RowLiftBuilder::expandTensorPointer(triton::MakeTensorPtrOp makePtr,
+                                         int64_t lastExtent,
+                                         Value lastOffsetOverride,
+                                         LiftedDescriptor &descriptor) {
+  auto pointerType = cast<triton::PointerType>(makePtr.getType());
+  auto blockType = dyn_cast<RankedTensorType>(pointerType.getPointeeType());
+  if (!blockType || blockType.getRank() == 0)
+    return false;
+  SmallVector<int64_t> tileShape(blockType.getShape());
+  if (lastExtent > 0)
+    tileShape.back() = lastExtent;
+  // 显式指针张量要求每个 tile 维都有静态长度。
+  // The explicit pointer tensor needs a static extent per tile dimension.
+  if (llvm::any_of(tileShape, [](int64_t extent) { return extent <= 0; }))
+    return false;
+
+  // 提升后的形状 = [R] + 原 tile 形状；索引类型与指针张量类型都按它构造。
+  Location loc = makePtr.getLoc();
+  // 地址运算统一用 i32（与手写 kernel 一致）：!tt.ptr 地址向量的元素宽度决定
+  // 它在 UB 里的常驻体积，[R]+tile 的 i64 地址向量在 D128 上就有 128 KiB，
+  // 还会连带把边界掩码的比较链也拉到 i64 域。手写版读到表值后立刻 trunci 到
+  // i32 再算地址，这里改成同样口径。
+  // Address arithmetic uses i32, like the handwritten kernel: the element width of
+  // the !tt.ptr address vector decides how much UB it occupies resident, and a
+  // [R]+tile i64 vector already costs 128 KiB on D128 while also dragging the
+  // boundary-mask comparisons into the i64 domain.  The handwritten kernel truncates
+  // table values to i32 right after loading them; this path now does the same.
+  auto addressType = rewriter.getI32Type();
+  auto elementPointer =
+      triton::PointerType::get(blockType.getElementType(),
+                               pointerType.getAddressSpace());
+  SmallVector<int64_t> fullShape{candidate.rowsPerProgram};
+  fullShape.append(tileShape.begin(), tileShape.end());
+  auto indexType = RankedTensorType::get(fullShape, addressType);
+  auto pointerTensorType = RankedTensorType::get(fullShape, elementPointer);
+
+  // shape/stride 在 make_tensor_ptr 里是 i64、offset 可能是 i32，地址运算前
+  // 统一收敛到 i32：宽于 32 位的截断，窄于 32 位的符号扩展。
+  // 遇到非整数类型时返回空 Value，由调用方拒绝。
+  // shape/strides are i64 in make_tensor_ptr and offsets may be i32, so every
+  // index is normalised to i32 before the address arithmetic: wider values are
+  // truncated, narrower ones sign-extended.
+  auto toAddressType = [&](Value v) -> Value {
+    Type type = v.getType();
+    Type element = type;
+    auto tensor = dyn_cast<RankedTensorType>(type);
+    if (tensor)
+      element = tensor.getElementType();
+    auto integer = dyn_cast<IntegerType>(element);
+    if (!integer)
+      return Value();
+    if (integer.getWidth() == 32)
+      return v;
+    Type converted = tensor ? Type(RankedTensorType::get(tensor.getShape(),
+                                                         addressType))
+                            : Type(addressType);
+    if (integer.getWidth() > 32)
+      return rewriter.create<arith::TruncIOp>(loc, converted, v);
+    return rewriter.create<arith::ExtSIOp>(loc, converted, v);
+  };
+
+  // 逐维取出 offset/shape/stride，形状与偏移都保存下来，后面把 boundaryCheck
+  // 转掩码时要用。每个值都先收敛到 i32，地址运算统一位宽。
+  SmallVector<Value> offsets, shapes, strides;
+  offsets.reserve(tileShape.size());
+  shapes.reserve(tileShape.size());
+  strides.reserve(tileShape.size());
+  const int64_t lastDim = static_cast<int64_t>(tileShape.size()) - 1;
+  for (int64_t dim = 0; dim < static_cast<int64_t>(tileShape.size()); ++dim) {
+    Value offset =
+        (lastOffsetOverride && dim == lastDim)
+            ? toAddressType(lastOffsetOverride)
+            : toAddressType(getMappedValue(makePtr.getOffsets()[dim]));
+    Value shape = toAddressType(getMappedValue(makePtr.getShape()[dim]));
+    Value stride = toAddressType(getMappedValue(makePtr.getStrides()[dim]));
+    if (!offset || !shape || !stride)
+      return false;
+    offsets.push_back(offset);
+    shapes.push_back(shape);
+    strides.push_back(stride);
+  }
+
+  // 地址分两段构造，与手工参考实现同构：除最后一维外的贡献
+  // (offset + range) * stride 先累加成一个「末维为 1」的基址张量，最后一维的
+  // 区间再在完整形状上补加。只有这种形态才会被适配器识别成 strided 子视图；
+  // 原来的「一次 addptr + 全秩下标」会被判成逐元素间接访问
+  // (indirect_load/store)，后端无法对其切分 UB，直接 ub overflow。
+  // The address is built in two stages exactly like the handwritten reference:
+  // every axis but the last accumulates (offset + range) * stride into a base
+  // tensor whose trailing dim is 1, and the trailing range is added at full
+  // rank.  Only this shape is recognized as a strided subview; the flat form
+  // degrades to per-element indirect access, which the backend cannot tile.
+  SmallVector<int64_t> baseShape(fullShape.begin(), fullShape.end());
+  baseShape.back() = 1;
+  auto baseIndexType = RankedTensorType::get(baseShape, addressType);
+  auto basePointerType = RankedTensorType::get(baseShape, elementPointer);
+  Value baseAddress;
+  for (int64_t dim = 0; dim + 1 < static_cast<int64_t>(tileShape.size()); ++dim) {
+    Value index = rewriter.create<arith::AddIOp>(
+        loc, broadcastFullValue(offsets[dim], baseIndexType),
+        expandTileRange(loc, dim, tileShape[dim], baseIndexType));
+    Value term = rewriter.create<arith::MulIOp>(
+        loc, index, broadcastFullValue(strides[dim], baseIndexType));
+    baseAddress =
+        baseAddress
+            ? Value(rewriter.create<arith::AddIOp>(loc, baseAddress, term))
+            : term;
+  }
+
+  // 基址先落到「末维为 1」的形状，与该形状的地址相加，再广播到指针张量形状。
+  Value base =
+      broadcastFullValue(getMappedValue(makePtr.getBase()), basePointerType);
+  Value basePointer = baseAddress
+                          ? Value(rewriter.create<triton::AddPtrOp>(
+                                loc, basePointerType, base, baseAddress))
+                          : base;
+  Value pointer = broadcastFullValue(basePointer, pointerTensorType);
+
+  // 最后一维的区间（含该轴偏移）在完整形状上直接加在指针上。
+  Value lastIndex = rewriter.create<arith::AddIOp>(
+      loc, broadcastFullValue(offsets.back(), indexType),
+      expandTileRange(loc, lastDim, tileShape.back(), indexType));
+  Value lastTerm = rewriter.create<arith::MulIOp>(
+      loc, lastIndex, broadcastFullValue(strides.back(), indexType));
+
+  // 登记描述符；最终指针张量供使用点的 load/store 取用。
+  descriptor.pointer = rewriter.create<triton::AddPtrOp>(
+      loc, pointerTensorType, pointer, lastTerm);
+  descriptor.shapes = shapes;
+  descriptor.offsets = offsets;
+  descriptor.tileShape = tileShape;
+  return true;
+}
+
+// 把一个整数值整体加一个常量；张量形式先生成同形 splat 常量再相加。
+// Shift an integer value by a constant, splatting the constant for a tensor.
+static Value shiftIntegerValue(IRRewriter &rewriter, Value base,
+                               int64_t amount) {
+  if (!base)
+    return Value();
+  Location loc = base.getLoc();
+  Type type = base.getType();
+  Type element = type;
+  if (auto tensor = dyn_cast<RankedTensorType>(type))
+    element = tensor.getElementType();
+  auto integer = dyn_cast<IntegerType>(element);
+  if (!integer)
+    return Value();
+  Value shift = rewriter.create<arith::ConstantOp>(
+      loc, rewriter.getIntegerAttr(integer, amount));
+  if (isa<RankedTensorType>(type))
+    shift = rewriter.create<triton::SplatOp>(loc, type, shift);
+  return rewriter.create<arith::AddIOp>(loc, base, shift);
+}
 
 
+// 把 boundaryCheck 指定的各轴越界判断合并成显式 i1 掩码。
+// 对每个轴计算 0 <= offset + range(0, extent) < shape，再把各轴结果按位与；
+// 没有指定边界检查时返回空 Value。
+Value RowLiftBuilder::buildDescriptorMask(
+    const LiftedDescriptor &descriptor, ArrayRef<int32_t> boundaryCheck,
+    RankedTensorType indexType) {
+  if (boundaryCheck.empty())
+    return Value();
+
+  Location loc = descriptor.pointer.getLoc();
+  Value mask;
+  for (int32_t axis : boundaryCheck) {
+    // 逐轴先在「只沿该轴变化」的窄形状上做越界比较，最后再把 i1 谓词广播成整块
+    // 掩码。整块形状的索引网格是 UB 里最大的一类临时量（[R, G, 128] 的 i32 网格
+    // 就有 64 KiB），而越界判定本来只沿一个 tile 轴变化；先窄后宽与先宽后窄语义
+    // 完全相同，却省掉每个轴一份整块索引网格和一份整块比较结果。手工优化版正是
+    // 这个形态：在 1x1x64 上比较，只 broadcast 一次 i1。
+    // Compare along a narrow single-axis shape and broadcast the predicate once.
+    // A full-shape index grid ([R, G, 128] of i32 is 64 KiB) is one of the largest
+    // UB temporaries, while an out-of-bounds test only varies along one tile axis.
+    // Narrowing first is exactly equivalent and drops one full-shape grid and one
+    // full-shape comparison result per axis.  The hand-written kernel has this
+    // form: compare on 1x1x64 and broadcast the i1 once.
+    const int64_t rank = static_cast<int64_t>(indexType.getRank());
+    if (axis + 1 >= rank)
+      return Value();
+    // 比较要落在「至多一个非 1 维」的形状上，行维也必须压成 1：离散掩码判定只
+    // 接受单轴变化的 cmpi，凡是出现两个及以上非 1 维的比较一律判为离散掩码，
+    // 访存随后被迫降级成逐元素的 indirect_load（i64 索引网格 + 逐元素谓词）。
+    // 手工优化版的三片谓词都只有一个非 1 维，最后才 andi/broadcast 回整块。
+    // A comparison has to live on a shape with at most one non-unit dimension, so
+    // the row dimension must narrow to 1 as well: discrete-mask detection only
+    // accepts single-axis comparisons, and any comparison with two or more
+    // non-unit dimensions is classified as a discrete mask, which downgrades the
+    // access to per-element indirect_load (i64 index grid plus element predicates).
+    // All three predicates of the hand-written kernel have exactly one non-unit
+    // dimension, and are andi/broadcast to the full shape only afterwards.
+    // 例外：该轴的偏移或形状本身逐行变化时谓词必须逐行变化，压成 1 既无法广播
+    // 也表达不出逐行越界，这种轴退回保留行维的旧形态。
+    // Exception: when the offset or shape of this axis itself varies per row the
+    // predicate must vary per row too, so such an axis keeps the old form.
+    auto narrowable = [&](Value v) {
+      auto tensor = dyn_cast<RankedTensorType>(v.getType());
+      if (!tensor)
+        return true;
+      for (int64_t dim = 0; dim < tensor.getRank(); ++dim)
+        if (dim != axis + 1 && tensor.getShape()[dim] != 1)
+          return false;
+      return true;
+    };
+    SmallVector<int64_t> narrow(indexType.getShape().begin(),
+                                indexType.getShape().end());
+    if (descriptor.tileShape[axis] > 1 &&
+        narrowable(descriptor.offsets[axis]) &&
+        narrowable(descriptor.shapes[axis])) {
+      narrow.assign(rank, 1);
+    } else {
+      for (int64_t dim = 1; dim < rank; ++dim)
+        narrow[dim] = 1;
+    }
+    narrow[axis + 1] = descriptor.tileShape[axis];
+    auto narrowType = RankedTensorType::get(narrow, indexType.getElementType());
+
+    // 该轴的逐元素下标网格（窄形状）。
+    Value index = rewriter.create<arith::AddIOp>(
+        loc, broadcastFullValue(descriptor.offsets[axis], narrowType),
+        expandTileRange(loc, axis, descriptor.tileShape[axis], narrowType));
+    Value zero = rewriter.create<triton::SplatOp>(
+        loc, narrowType,
+        rewriter.create<arith::ConstantOp>(
+            loc, rewriter.getIntegerAttr(
+                     cast<IntegerType>(indexType.getElementType()), 0)));
+    // 下界：index >= 0；上界：index < shape（shape 来自描述符展开时保存的值）。
+    Value lower = rewriter.create<arith::CmpIOp>(
+        loc, arith::CmpIPredicate::sge, index, zero);
+    Value upper = rewriter.create<arith::CmpIOp>(
+        loc, arith::CmpIPredicate::slt, index,
+        broadcastFullValue(descriptor.shapes[axis], narrowType));
+    Value axisNarrow = rewriter.create<arith::AndIOp>(loc, lower, upper);
+    auto maskType =
+        RankedTensorType::get(indexType.getShape(), rewriter.getI1Type());
+    Value axisMask =
+        rewriter.create<triton::BroadcastOp>(loc, maskType, axisNarrow);
+    // 各轴的越界条件同时成立才算有效。
+    mask = mask ? Value(rewriter.create<arith::AndIOp>(loc, mask, axisMask))
+                : axisMask;
+  }
+  return mask;
+}
+
+// 用展开后的指针张量重建描述符 load，掩码由边界检查与原始 mask 合并而来。
+bool RowLiftBuilder::rewriteDescriptorLoad(
+    triton::LoadOp load, const LiftedDescriptor &descriptor) {
+  Value result;
+  if (!emitDescriptorLoad(load, descriptor, result))
+    return false;
+  valueMapping.map(load.getResult(), result);
+  return true;
+}
+
+// 用给定描述符发出一次 load 并把结果交回；结果形状取自指针张量，因此拆半
+// 路径按两个半宽描述符各调用一次即可得到两个半宽值。
+// Emit one load for the given descriptor and hand back its result.  The result
+// shape follows the pointer tensor, so the split path calls this once per half.
+bool RowLiftBuilder::emitDescriptorLoad(triton::LoadOp load,
+                                        const LiftedDescriptor &descriptor,
+                                        Value &result) {
+  // 块指针上的 mask 操作数需要与 store 侧相同的行维展开，因此同样受
+  // maskedStore 能力控制。
+  // A mask operand on a block pointer needs the same row expansion as the
+  // store side, so it stays gated behind maskedStore.
+  if (load.getMask())
+    return false;
+  // 边界检查轴号必须落在 tile 维度内。
+  ArrayRef<int32_t> boundaryCheck = load.getBoundaryCheck();
+  for (int32_t axis : boundaryCheck)
+    if (axis < 0 || axis >= static_cast<int32_t>(descriptor.tileShape.size()))
+      return false;
+
+  Location loc = load.getLoc();
+  auto pointerType = cast<RankedTensorType>(descriptor.pointer.getType());
+  auto resultType = RankedTensorType::get(
+      pointerType.getShape(),
+      cast<RankedTensorType>(load.getType()).getElementType());
+  auto indexType =
+      RankedTensorType::get(pointerType.getShape(), rewriter.getI32Type());
+
+  // boundaryCheck 转成显式掩码，并与原始 mask（及运行期有效行掩码）合并。
+  bool ok = true;
+  Value mask = combineMemoryMask(
+      descriptor.pointer, load.getMask(),
+      buildDescriptorMask(descriptor, boundaryCheck, indexType), ok);
+  if (!ok)
+    return false;
+
+  // 有掩码时必须给出 other 值：优先用原 other，其次按 padding 选项生成
+  // NaN 或 0，并广播到提升后的结果形状。拆半描述符的结果比提升后的原值窄，
+  // 此时只能结构折叠（各列相同的 other），全宽 other 无法表达。
+  Value other;
+  if (mask) {
+    if (load.getOther()) {
+      // 先按类型判断再生成 IR：拆半路径的结果比提升后的整宽值窄，此时直接按
+      // 半宽折叠，不能先无条件提升出一个全宽临时值。
+      // Decide from the types before emitting anything: on the split path the
+      // result is narrower than the lifted full width, so fold straight to half
+      // width instead of materialising a full-width temporary first.
+      if (getLiftedType(load.getOther().getType()) == resultType) {
+        other = broadcastRowValue(ensureRowDimension(load.getOther()),
+                                  resultType);
+      } else {
+        other = rebuildHalfOperand(load.getOther(), resultType);
+        if (!other) {
+          Value lifted = ensureRowDimension(load.getOther());
+          if (lifted.getType() == resultType)
+            other = lifted;
+        }
+      }
+      if (!other)
+        return false;
+    } else {
+      Value padding;
+      if (load.getPadding() == triton::PaddingOption::PAD_NAN) {
+        auto floatType = dyn_cast<FloatType>(resultType.getElementType());
+        if (!floatType)
+          return false;
+        padding = rewriter.create<arith::ConstantOp>(
+            loc, rewriter.getFloatAttr(
+                     floatType, APFloat::getNaN(floatType.getFloatSemantics())));
+      } else {
+        padding = rewriter.create<arith::ConstantOp>(
+            loc, rewriter.getZeroAttr(resultType.getElementType()));
+      }
+      other = rewriter.create<triton::SplatOp>(loc, resultType, padding);
+    }
+  }
+
+  // 用指针张量发出普通 load；边界检查已转成掩码，因此不再携带。
+  result = rewriter
+               .create<triton::LoadOp>(
+                   loc, descriptor.pointer, mask, other, ArrayRef<int32_t>{},
+                   load.getPadding(), load.getCache(), load.getEvict(),
+                   load.getIsVolatile())
+               .getResult();
+  return true;
+}
 
 
+// 用展开后的指针张量重建描述符 store，并合并边界掩码与原始 mask。
+bool RowLiftBuilder::rewriteDescriptorStore(
+    triton::StoreOp store, const LiftedDescriptor &descriptor) {
+  // O 与 lse 的带掩码写回：mask 操作数属于行维展开的一部分，受
+  // maskedStore 能力控制。
+  // O and lse are written back under a mask, so the mask operand is part of
+  // the row expansion when the capability is enabled.
+  if (store.getMask())
+    return false;
+  // 边界检查轴号必须落在 tile 维度内。
+  ArrayRef<int32_t> boundaryCheck = store.getBoundaryCheck();
+  for (int32_t axis : boundaryCheck)
+    if (axis < 0 || axis >= static_cast<int32_t>(descriptor.tileShape.size()))
+      return false;
 
+  Location loc = store.getLoc();
+  auto pointerType = cast<RankedTensorType>(descriptor.pointer.getType());
+  auto indexType =
+      RankedTensorType::get(pointerType.getShape(), rewriter.getI32Type());
 
+  // 边界掩码 + 原始 mask 合并为一次写回的掩码。
+  bool ok = true;
+  Value mask = combineMemoryMask(
+      descriptor.pointer, store.getMask(),
+      buildDescriptorMask(descriptor, boundaryCheck, indexType), ok);
+  if (!ok)
+    return false;
 
+  // 被写入的值必须与指针张量同形（已补上行维）。
+  Value value = ensureRowDimension(store.getValue());
+  auto valueType = dyn_cast<RankedTensorType>(value.getType());
+  if (!valueType || valueType.getShape() != pointerType.getShape())
+    return false;
 
-
+  // 用指针张量发出 store；边界检查已转成掩码，因此不再携带。
+  rewriter.create<triton::StoreOp>(
+      loc, descriptor.pointer, value, mask,
+      rewriter.getDenseI32ArrayAttr({}), store.getCache(), store.getEvict());
+  return true;
+}
 
 // scf.if 能否按「所有提升行走同一分支」重建的完整判据：条件必须是标量与行
 // 无关，分支各只有一个 block，结果不能是块指针。规则 matcher 与 rewriteIfOp
@@ -1213,12 +1717,15 @@ bool RowLiftBuilder::rewriteIfBody(Region &from, Region &to) {
     if (!rewrite(&op))
       return false;
 
-  // 重建分支 yield：每个值补行维。
+  // 重建分支 yield：每个值补行维；已展开的块指针无法作为 yield 值。
   auto yield = cast<scf::YieldOp>(from.front().getTerminator());
   SmallVector<Value> values;
-  for (Value v : yield.getOperands())
+  for (Value v : yield.getOperands()) {
+    // An expanded block pointer has no value that can be yielded.
+    if (liftedDescriptors.contains(v))
+      return false;
     values.push_back(ensureRowDimension(v));
-
+  }
   rewriter.create<scf::YieldOp>(yield.getLoc(), values);
   return true;
 }
