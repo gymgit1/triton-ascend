@@ -1,4 +1,4 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — driver accept/reject ===
+// === #2686 SelectedBlockScanRule (bit 65536) — driver accept/reject ===
 //
 // STATUS: landed 2026-10-31 — all four RUN lines are green.  The REJECT line
 // must STAY green: an out-of-range bit must keep being rejected so nobody
@@ -10,17 +10,18 @@
 //
 // Bit arithmetic: 65536 = 1 << 16 = SelectedBlockScan.  1048576 = 1 << 20 is
 // out of range on purpose (bit index 20 is past the registry).
-// 68607 = 3071 | 65536 = the default rule set plus the new bit, i.e. what a
-// production run with `rule_mask=65536`-style opt-in actually passes down
-// (_graph_optimize_kwargs only forwards rule_mask when it differs from the
-// default 3071: third_party/ascend/backend/compiler.py:289-300).
+// 68607 = 3071 | 65536 = the legacy rule set plus the new bit.  The current
+// default is 199679 (= 3071 | 65536 | 131072): _graph_optimize_kwargs forwards
+// rule_mask only when it differs from DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK
+// (third_party/ascend/backend/compiler.py, _graph_optimize_kwargs).
 
 // RUN: triton-opt --split-input-file --verify-each %s -graph-optimize='rule-mask=65536' -o - | FileCheck %s
 // RUN: triton-opt --split-input-file --verify-each %s -graph-optimize='rule-mask=68607' -o - | FileCheck %s --check-prefix=COMBINED
 // RUN: not triton-opt %s -graph-optimize='rule-mask=1048576' -o /dev/null 2>&1 | FileCheck %s --check-prefix=REJECT
 
-// The new bit must also be accepted on the real kernel IR (exit 0).  Rule A has
-// no separate Rule B gate -- it always runs Rule B's real implementation (the
+// The new bit must also be accepted on the real kernel IR (exit 0).  The scan
+// rewrite has no separate row-lift gate -- it always runs the row lift's real
+// implementation (the
 // QueryRowBatching.h materialize entry) -- so bit 65536 alone must produce
 // exactly the same IR as the joint 65536|131072 run below.
 // RUN: triton-opt %S/Inputs/nsa_fwd_const_ns.mlir -graph-optimize='rule-mask=65536' -o /dev/null
@@ -28,8 +29,8 @@
 // RUN: triton-opt %S/Inputs/nsa_fwd_const_ns.mlir -graph-optimize='rule-mask=196608' -o %t.joint
 // RUN: diff %t.rulea %t.joint
 
-// Joint A + Rule B path: 65536 | 131072 = 196608.  Rule A rewrites the
-// sparse loop and materializes Rule B's contract inside its own sandbox, so
+// Joint scan + row lift path: 65536 | 131072 = 196608.  The scan rewrite replaces the
+// sparse loop and materializes the row lift's contract inside its own sandbox, so
 // the output must carry the dynamic grid contract and the lifted dot shapes.
 // The row count is now derived from the resource constraints alone: this run
 // passes no L0 budget, so the per-value byte budget caps the 8 KiB f32
@@ -67,3 +68,16 @@ tt.func @graph_optimize_reject_unknown_bit() {
 // JOINT: hacc.program_grid_transforms
 // JOINT-SAME: factor = 16
 // JOINT: tensor<256x128xbf16>
+
+// -----
+
+// Static-grid joint commit: with hacc.grid_num_tiles on the module, the row lift takes
+// its static path, so apply() must copy the three coalesce attributes and must
+// NOT publish program_grid_transforms (that combination would divide the grid
+// while the kernel still assumes the original one).
+// RUN: triton-opt %S/Inputs/nsa_fwd_static_grid.mlir -graph-optimize='rule-mask=196608' -o - | FileCheck %s --check-prefix=STATICGRID
+// the three attributes live on the module line, in name order
+// STATICGRID: hacc.coalesce_axis = 0 : i32
+// STATICGRID: hacc.coalesce_factor = 16 : i32
+// STATICGRID: hacc.coalesce_grid_ceil_div = 1 : i32
+// STATICGRID-NOT: hacc.program_grid_transforms

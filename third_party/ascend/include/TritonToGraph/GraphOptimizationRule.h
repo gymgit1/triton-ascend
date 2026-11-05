@@ -100,8 +100,7 @@ std::unique_ptr<GraphOptimizationRule>
 createRowCoalescingRule(bool enableLegacy = true);
 std::unique_ptr<GraphOptimizationRule> createDiagonalMaskRemovalRule();
 std::unique_ptr<GraphOptimizationRule> createConvertModuloToMaskRule();
-std::unique_ptr<GraphOptimizationRule>
-createSelectedBlockScanRule(const SelectedBlockScanRuleOptions &options);
+std::unique_ptr<GraphOptimizationRule> createSelectedBlockScanRule();
 
 std::unique_ptr<GraphOptimizationRule> createIndependentAxisTensorizeRule(
     const IndependentAxisTensorizeRuleOptions &options);

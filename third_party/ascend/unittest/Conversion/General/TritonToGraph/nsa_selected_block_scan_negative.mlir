@@ -1,4 +1,4 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — NEGATIVE cases ===
+// === #2686 SelectedBlockScanRule (bit 65536) — NEGATIVE cases ===
 //
 // STATUS: post-implementation form; every RUN line below is green.  What the
 // file now covers: (b) K/V anchored on the grid axis instead of the
@@ -8,7 +8,7 @@
 // (c) hole below is visible rather than silently renumbered away.
 //
 // (g) is GONE (deleted 2026-11-02, not renumbered): it used to pin a refusal for
-// the bwd dq additive form (Inputs/nsa_bwd_dq_const_ns.mlir).  Rule A now
+// the bwd dq additive form (Inputs/nsa_bwd_dq_const_ns.mlir).  The scan rewrite now
 // ACCEPTS that shape -- the additive branch (single iter_arg carried state,
 // tt.addptr + explicit-mask tiles, exp -> where -> *w -> (do v - delta) ->
 // dot(ds, trans(k), acc)) landed -- so the fixture is a POSITIVE case whose
@@ -16,20 +16,20 @@
 // BWDREW.  Nothing about it belongs in this file any more: "declines and is
 // byte-identical" is the opposite of the current contract.
 //
-// What "must hold" means here, precisely: with the escape hatch OPEN (so Rule B
-// cannot be the reason nothing happened), Rule A's own matcher must still
-// decline these shapes, therefore the output must be BYTE-IDENTICAL to the
-// rule-off run, and triton-opt must not print a single line on stderr.  Both
-// halves are asserted:
+// What "must hold" means here, precisely: the output must be BYTE-IDENTICAL to
+// the rule-off run, and triton-opt must not print a single line on stderr.
+// Every fixture below is a shape the scan rewrite's matcher rejects, so the pass declines
+// before the row lift is ever consulted; the two halves are asserted as:
 //   * diff  -> "no change"            (repo precedent row-coalescing-dot-fallback.mlir:1-7)
 //   * FileCheck -> "the pre-rewrite pattern is really there", so the diff cannot
 //     pass because the fixture silently stopped containing the shape.
-// Why force-apply and not just rule-mask=65536: without it Rule A hands its
-// sandbox to Rule B's real implementation, which declines these shapes on its
-// own account, so the "no change" assertion would prove nothing about Rule A's
-// matcher.  The escape hatch is written out as
-// `selected-block-scan-force-apply=true`, like every other bool option in this
-// repo, instead of as a bare bool leaning on MLIR's implicit true.
+// Isolation note: the scan rewrite never commits alone (the plan factory always hands its
+// sandbox to the row lift's real materialize entry), so "no change" is a joint verdict
+// and cannot by itself prove which of the two matchers declined.  The former
+// test-only escape hatch that isolated the scan rewrite is gone (2026-11-05); what keeps
+// this group specific is that each fixture pins a defect the scan rewrite's parser owns
+// (the FileCheck below shows the pre-rewrite shape really is there), and Rule
+// B's matcher rejects the sparse gather form on its own account as well.
 //
 // The `echo -n` + `diff` pair is the "no diagnostics on the decline path" check:
 // an unsupported rewrite must leave the input AND its diagnostics untouched.
@@ -41,7 +41,7 @@
 // ---------- (c) BS is not a power of two -----------------------------------
 // BS = 48 is not a power of two, so "one index-table entry == BS consecutive
 // tokens" (the weight semantics) is not expressible and the rewrite must
-// decline (SelectedBlockScanRule.cpp:927, isPowerOfTwo(blockSize)).
+// decline (matchSelectedBlockScan's isPowerOfTwo(tileBlockSize) guard).
 //
 // Why this fixture is legal HERE: a 128x48 tile has a non-power-of-two element
 // count (6144) that OpTrait::impl::verifyTensorSize rejects -- but this fork's
@@ -53,12 +53,11 @@
 // The sibling guard is unreachable for any legal BS: after isPowerOfTwo(:927)
 // and BN = max(64, BS)(:929), `scanTileWidth % blockSize != 0`(:930) can never
 // fire.  The BS < 64 positive side (R = BN/BS = 2) is group F of
-// nsa_selected_block_scan.mlir.
 // RUN: triton-opt %S/Inputs/nsa_fwd_const_ns_bs48.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.bs48.ctl
-// RUN: triton-opt %S/Inputs/nsa_fwd_const_ns_bs48.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.bs48
+// RUN: triton-opt %S/Inputs/nsa_fwd_const_ns_bs48.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o %t.bs48
 // RUN: diff %t.bs48.ctl %t.bs48
 // RUN: FileCheck %s --check-prefix=BS48 < %t.bs48
-// RUN: triton-opt %S/Inputs/nsa_fwd_const_ns_bs48.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o /dev/null 2> %t.bs48.err
+// RUN: triton-opt %S/Inputs/nsa_fwd_const_ns_bs48.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o /dev/null 2> %t.bs48.err
 // RUN: diff %t.empty %t.bs48.err
 
 // BS48-LABEL: tt.func public @parallel_nsa_fwd_kernel(
@@ -70,15 +69,13 @@
 // BS48: "tt.reduce"(
 
 // ---------- (a) varlen: the joint gate still declines it -------------------
-// (2026-11-03) Rule A now RECOGNIZES the varlen dispatch: the row position
+// (2026-11-03) The scan rewrite now RECOGNIZES the varlen dispatch: the row position
 // (token_indices_q) and the K/V base (cu_seqlens) are loop-invariant scalar
 // loads, which is exactly what matchRowPosition / checkAddressOperand accept
 // after the varlen relaxation.  What must still hold is the JOINT contract:
-// with only Rule A's bit enabled and no escape hatch, the function is left
-// BYTE-IDENTICAL because Rule B declines varlen and A must never land alone
-// (A alone trades O(NS) block reads for an O(TK) token scan).  The rewritten
-// shape under the escape hatch is asserted separately as group VARLENREW in
-// nsa_selected_block_scan.mlir.
+// with only the scan rewrite's bit enabled the function is left BYTE-IDENTICAL,
+// because the row lift declines varlen and the scan rewrite must never land alone
+// (it trades O(NS) block reads for an O(TK) token scan).
 // RUN: triton-opt %S/Inputs/nsa_fwd_varlen.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.varlen.ctl
 // RUN: triton-opt %S/Inputs/nsa_fwd_varlen.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o %t.varlen
 // RUN: diff %t.varlen.ctl %t.varlen
@@ -102,10 +99,10 @@
 // Downstream reason: Rules/DotRowCoalescing.cpp:294-306 (a lifted,
 // pid-dependent dot B operand must be refused).
 // RUN: triton-opt %S/Inputs/nsa_fwd_const_ns_rhs_grid.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.rhs.ctl
-// RUN: triton-opt %S/Inputs/nsa_fwd_const_ns_rhs_grid.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.rhs
+// RUN: triton-opt %S/Inputs/nsa_fwd_const_ns_rhs_grid.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o %t.rhs
 // RUN: diff %t.rhs.ctl %t.rhs
 // RUN: FileCheck %s --check-prefix=RHSGRID < %t.rhs
-// RUN: triton-opt %S/Inputs/nsa_fwd_const_ns_rhs_grid.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o /dev/null 2> %t.rhs.err
+// RUN: triton-opt %S/Inputs/nsa_fwd_const_ns_rhs_grid.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o /dev/null 2> %t.rhs.err
 // RUN: diff %t.empty %t.rhs.err
 
 // RHSGRID-LABEL: tt.func public @parallel_nsa_fwd_kernel(
@@ -118,17 +115,17 @@
 // ---------- (d) the index-table address is not the induction variable ------
 // The per-iteration table entry is addressed as table[P + i_h*S + (i + 1)]:
 // the offset operand of the scalar tt.addptr is arith.addi(%iv, %c1_i32), so
-// the baseline reads table[1..S+1).  Rule A's rewrite reads the whole table
+// the baseline reads table[1..S+1).  The scan rewrite reads the whole table
 // once as table[0, S) and then indexes it by the iteration number, which is
 // the same slot only when that offset is exactly the induction variable; an
 // a*iv+b form (scale != 1 or bias != 0) therefore pins the wrong slots and is
 // refused (matcher A2/B1).  Measured before the fix: the rewrite went through
 // and dropped the +1 (163 diff lines, empty stderr).
 // RUN: triton-opt %S/Inputs/nsa_fwd_const_ns_affine_offset.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.aff.ctl
-// RUN: triton-opt %S/Inputs/nsa_fwd_const_ns_affine_offset.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.aff
+// RUN: triton-opt %S/Inputs/nsa_fwd_const_ns_affine_offset.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o %t.aff
 // RUN: diff %t.aff.ctl %t.aff
 // RUN: FileCheck %s --check-prefix=AFFOFF < %t.aff
-// RUN: triton-opt %S/Inputs/nsa_fwd_const_ns_affine_offset.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o /dev/null 2> %t.aff.err
+// RUN: triton-opt %S/Inputs/nsa_fwd_const_ns_affine_offset.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o /dev/null 2> %t.aff.err
 // RUN: diff %t.empty %t.aff.err
 
 // AFFOFF-LABEL: tt.func public @parallel_nsa_fwd_kernel(
@@ -144,16 +141,16 @@
 // token side carries a diagonal = 1 shift.  The rewrite rebuilds the token
 // positions itself as token_start + [0, BN) with no offset, so the shift would
 // be dropped (and with it one token per block moves in/out of the causal
-// window).  Rule A now requires the token side to be exactly
+// window).  The scan rewrite now requires the token side to be exactly
 // splat(token_offset) + tt.make_range{start = 0, end = BS} over the same SSA
 // value as a tile token offset (matcher A8 site 3 / B2); any extra arithmetic
 // is refused instead of normalized.  Measured before the fix: rewrite went
 // through, +1 gone (164 diff lines, empty stderr).
 // RUN: triton-opt %S/Inputs/nsa_fwd_const_ns_mask_diagonal.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.maskd.ctl
-// RUN: triton-opt %S/Inputs/nsa_fwd_const_ns_mask_diagonal.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.maskd
+// RUN: triton-opt %S/Inputs/nsa_fwd_const_ns_mask_diagonal.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o %t.maskd
 // RUN: diff %t.maskd.ctl %t.maskd
 // RUN: FileCheck %s --check-prefix=MASKD < %t.maskd
-// RUN: triton-opt %S/Inputs/nsa_fwd_const_ns_mask_diagonal.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o /dev/null 2> %t.maskd.err
+// RUN: triton-opt %S/Inputs/nsa_fwd_const_ns_mask_diagonal.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o /dev/null 2> %t.maskd.err
 // RUN: diff %t.empty %t.maskd.err
 
 // MASKD-LABEL: tt.func public @parallel_nsa_fwd_kernel(
@@ -174,15 +171,15 @@
 // whose width/stride agreement is broken.  blockSize is read off the
 // token-offset multiplier, and the rewrite then pins the tile token extent to
 // BN = 64 unconditionally, so it would widen the tile and change how many
-// tokens a selected block accumulates.  Rule A now requires the pointee
+// tokens a selected block accumulates.  The scan rewrite now requires the pointee
 // shape[tokenAxis] of both tile pointers to equal blockSize (matcher A4/B3).
 // Measured before the fix: rewrite went through, '<tensor<128x32xbf16>>'
 // became '<tensor<128x64xbf16>>' (162 diff lines, empty stderr).
 // RUN: triton-opt %S/Inputs/nsa_fwd_const_ns_tile_width.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.tilew.ctl
-// RUN: triton-opt %S/Inputs/nsa_fwd_const_ns_tile_width.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.tilew
+// RUN: triton-opt %S/Inputs/nsa_fwd_const_ns_tile_width.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o %t.tilew
 // RUN: diff %t.tilew.ctl %t.tilew
 // RUN: FileCheck %s --check-prefix=TILEW < %t.tilew
-// RUN: triton-opt %S/Inputs/nsa_fwd_const_ns_tile_width.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o /dev/null 2> %t.tilew.err
+// RUN: triton-opt %S/Inputs/nsa_fwd_const_ns_tile_width.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o /dev/null 2> %t.tilew.err
 // RUN: diff %t.empty %t.tilew.err
 
 // TILEW-LABEL: tt.func public @parallel_nsa_fwd_kernel(
@@ -205,10 +202,10 @@
 // The remainder is a dead op -- it exists only to state H > 1, as it does in the
 // real kernel before folding.
 // RUN: triton-opt %S/Inputs/nsa_fwd_h1_dyn_ns_headsplit.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.headsplit.ctl
-// RUN: triton-opt %S/Inputs/nsa_fwd_h1_dyn_ns_headsplit.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.headsplit
+// RUN: triton-opt %S/Inputs/nsa_fwd_h1_dyn_ns_headsplit.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o %t.headsplit
 // RUN: diff %t.headsplit.ctl %t.headsplit
 // RUN: FileCheck %s --check-prefix=HEADSPLIT < %t.headsplit
-// RUN: triton-opt %S/Inputs/nsa_fwd_h1_dyn_ns_headsplit.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o /dev/null 2> %t.headsplit.err
+// RUN: triton-opt %S/Inputs/nsa_fwd_h1_dyn_ns_headsplit.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o /dev/null 2> %t.headsplit.err
 // RUN: diff %t.empty %t.headsplit.err
 
 // HEADSPLIT-LABEL: tt.func public @parallel_nsa_fwd_kernel(
@@ -224,10 +221,10 @@
 // every load it rebuilds: one scalar index read plus the two K/V tiles. The
 // extra load here would be dropped silently (parseIndexTable: load census).
 // RUN: triton-opt %S/Inputs/nsa_fwd_extra_loop_load.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.extra.ctl
-// RUN: triton-opt %S/Inputs/nsa_fwd_extra_loop_load.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.extra
+// RUN: triton-opt %S/Inputs/nsa_fwd_extra_loop_load.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o %t.extra
 // RUN: diff %t.extra.ctl %t.extra
 // RUN: FileCheck %s --check-prefix=EXTRA < %t.extra
-// RUN: triton-opt %S/Inputs/nsa_fwd_extra_loop_load.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o /dev/null 2> %t.extra.err
+// RUN: triton-opt %S/Inputs/nsa_fwd_extra_loop_load.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o /dev/null 2> %t.extra.err
 // RUN: diff %t.empty %t.extra.err
 
 // EXTRA-LABEL: tt.func public @parallel_nsa_fwd_kernel(
@@ -239,10 +236,10 @@
 // A masked entry load is not the pattern: the vector read the rewrite emits
 // has no per-iteration predicate to carry (hasLoadShape: Unmasked).
 // RUN: triton-opt %S/Inputs/nsa_fwd_masked_index_load.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.idxmask.ctl
-// RUN: triton-opt %S/Inputs/nsa_fwd_masked_index_load.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.idxmask
+// RUN: triton-opt %S/Inputs/nsa_fwd_masked_index_load.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o %t.idxmask
 // RUN: diff %t.idxmask.ctl %t.idxmask
 // RUN: FileCheck %s --check-prefix=IDXMASK < %t.idxmask
-// RUN: triton-opt %S/Inputs/nsa_fwd_masked_index_load.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o /dev/null 2> %t.idxmask.err
+// RUN: triton-opt %S/Inputs/nsa_fwd_masked_index_load.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o /dev/null 2> %t.idxmask.err
 // RUN: diff %t.empty %t.idxmask.err
 
 // IDXMASK-LABEL: tt.func public @parallel_nsa_fwd_kernel(
@@ -254,10 +251,10 @@
 // body with two conditions has no expression in the scan form (parseBlockGuard
 // requires exactly one scf.if at loop-body top level).
 // RUN: triton-opt %S/Inputs/nsa_fwd_two_guards.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.twoguards.ctl
-// RUN: triton-opt %S/Inputs/nsa_fwd_two_guards.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.twoguards
+// RUN: triton-opt %S/Inputs/nsa_fwd_two_guards.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o %t.twoguards
 // RUN: diff %t.twoguards.ctl %t.twoguards
 // RUN: FileCheck %s --check-prefix=TWOGUARDS < %t.twoguards
-// RUN: triton-opt %S/Inputs/nsa_fwd_two_guards.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o /dev/null 2> %t.twoguards.err
+// RUN: triton-opt %S/Inputs/nsa_fwd_two_guards.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o /dev/null 2> %t.twoguards.err
 // RUN: diff %t.empty %t.twoguards.err
 
 // The dead second guard is folded by canonicalize, so assert the shape the rule
@@ -273,10 +270,10 @@
 // vector by the iteration number. addptr(root, iv) has no row offset, so
 // table[0, S) is not a row of the table and parseTableAddress refuses.
 // RUN: triton-opt %S/Inputs/nsa_fwd_flat_index_table.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.flat.ctl
-// RUN: triton-opt %S/Inputs/nsa_fwd_flat_index_table.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.flat
+// RUN: triton-opt %S/Inputs/nsa_fwd_flat_index_table.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o %t.flat
 // RUN: diff %t.flat.ctl %t.flat
 // RUN: FileCheck %s --check-prefix=FLAT < %t.flat
-// RUN: triton-opt %S/Inputs/nsa_fwd_flat_index_table.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o /dev/null 2> %t.flat.err
+// RUN: triton-opt %S/Inputs/nsa_fwd_flat_index_table.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o /dev/null 2> %t.flat.err
 // RUN: diff %t.empty %t.flat.err
 
 // FLAT-LABEL: tt.func public @parallel_nsa_fwd_kernel(
@@ -289,10 +286,10 @@
 // by the causal predicates and the tensor mask; two reaching program ids make
 // that choice ambiguous and the matcher refuses to pick.
 // RUN: triton-opt %S/Inputs/nsa_fwd_ambiguous_pid.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.twopid.ctl
-// RUN: triton-opt %S/Inputs/nsa_fwd_ambiguous_pid.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.twopid
+// RUN: triton-opt %S/Inputs/nsa_fwd_ambiguous_pid.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o %t.twopid
 // RUN: diff %t.twopid.ctl %t.twopid
 // RUN: FileCheck %s --check-prefix=TWOPID < %t.twopid
-// RUN: triton-opt %S/Inputs/nsa_fwd_ambiguous_pid.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o /dev/null 2> %t.twopid.err
+// RUN: triton-opt %S/Inputs/nsa_fwd_ambiguous_pid.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o /dev/null 2> %t.twopid.err
 // RUN: diff %t.empty %t.twopid.err
 
 // CSE merges the two identical program-id ops, so assert the shape the rule
@@ -307,10 +304,10 @@
 // verbatim); the online-softmax template has no transpose step, so a body that
 // carries one cannot be rebuilt and checkLoopVocabulary refuses it.
 // RUN: triton-opt %S/Inputs/nsa_fwd_fwd_trans.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.fwdtrans.ctl
-// RUN: triton-opt %S/Inputs/nsa_fwd_fwd_trans.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.fwdtrans
+// RUN: triton-opt %S/Inputs/nsa_fwd_fwd_trans.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o %t.fwdtrans
 // RUN: diff %t.fwdtrans.ctl %t.fwdtrans
 // RUN: FileCheck %s --check-prefix=FWDTRANS < %t.fwdtrans
-// RUN: triton-opt %S/Inputs/nsa_fwd_fwd_trans.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o /dev/null 2> %t.fwdtrans.err
+// RUN: triton-opt %S/Inputs/nsa_fwd_fwd_trans.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o /dev/null 2> %t.fwdtrans.err
 // RUN: diff %t.empty %t.fwdtrans.err
 
 // The dead transpose is folded away, so assert the shape the rule refused.
@@ -323,10 +320,10 @@
 // The rewriter re-emits the tile load with other = 0 (the baseline's padding),
 // so a non-zero padding cannot be reproduced (hasLoadShape: MaskedZeroOther).
 // RUN: triton-opt %S/Inputs/nsa_bwd_nonzero_other.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.other.ctl
-// RUN: triton-opt %S/Inputs/nsa_bwd_nonzero_other.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.other
+// RUN: triton-opt %S/Inputs/nsa_bwd_nonzero_other.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o %t.other
 // RUN: diff %t.other.ctl %t.other
 // RUN: FileCheck %s --check-prefix=OTHER < %t.other
-// RUN: triton-opt %S/Inputs/nsa_bwd_nonzero_other.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o /dev/null 2> %t.other.err
+// RUN: triton-opt %S/Inputs/nsa_bwd_nonzero_other.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o /dev/null 2> %t.other.err
 // RUN: diff %t.empty %t.other.err
 
 // OTHER-LABEL: tt.func public @parallel_nsa_bwd_kernel_dq(
@@ -338,10 +335,10 @@
 // S would materialize an arbitrarily wide read; the i_h*S addend and the trip
 // count are raised together so the cap is what refuses.
 // RUN: triton-opt %S/Inputs/nsa_fwd_big_s.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.bigs.ctl
-// RUN: triton-opt %S/Inputs/nsa_fwd_big_s.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.bigs
+// RUN: triton-opt %S/Inputs/nsa_fwd_big_s.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o %t.bigs
 // RUN: diff %t.bigs.ctl %t.bigs
 // RUN: FileCheck %s --check-prefix=BIGS < %t.bigs
-// RUN: triton-opt %S/Inputs/nsa_fwd_big_s.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o /dev/null 2> %t.bigs.err
+// RUN: triton-opt %S/Inputs/nsa_fwd_big_s.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o /dev/null 2> %t.bigs.err
 // RUN: diff %t.empty %t.bigs.err
 
 // BIGS-LABEL: tt.func public @parallel_nsa_fwd_kernel(
@@ -352,10 +349,10 @@
 // A constant trip count is the special case NS == S, and the matcher cross-checks
 // the two derivations of the table width (checkCrossStageAgreements).
 // RUN: triton-opt %S/Inputs/nsa_fwd_trip_mismatch.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.trip.ctl
-// RUN: triton-opt %S/Inputs/nsa_fwd_trip_mismatch.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.trip
+// RUN: triton-opt %S/Inputs/nsa_fwd_trip_mismatch.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o %t.trip
 // RUN: diff %t.trip.ctl %t.trip
 // RUN: FileCheck %s --check-prefix=TRIP < %t.trip
-// RUN: triton-opt %S/Inputs/nsa_fwd_trip_mismatch.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o /dev/null 2> %t.trip.err
+// RUN: triton-opt %S/Inputs/nsa_fwd_trip_mismatch.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o /dev/null 2> %t.trip.err
 // RUN: diff %t.empty %t.trip.err
 
 // TRIP-LABEL: tt.func public @parallel_nsa_fwd_kernel(
@@ -367,10 +364,10 @@
 // with maxnumf, the normaliser with addf. A different combiner is a different
 // recurrence even when every shape matches.
 // RUN: triton-opt %S/Inputs/nsa_fwd_min_combiner.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.minc.ctl
-// RUN: triton-opt %S/Inputs/nsa_fwd_min_combiner.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.minc
+// RUN: triton-opt %S/Inputs/nsa_fwd_min_combiner.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o %t.minc
 // RUN: diff %t.minc.ctl %t.minc
 // RUN: FileCheck %s --check-prefix=MINC < %t.minc
-// RUN: triton-opt %S/Inputs/nsa_fwd_min_combiner.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o /dev/null 2> %t.minc.err
+// RUN: triton-opt %S/Inputs/nsa_fwd_min_combiner.mlir -graph-optimize='rule-mask=65536' -canonicalize -cse -o /dev/null 2> %t.minc.err
 // RUN: diff %t.empty %t.minc.err
 
 // MINC-LABEL: tt.func public @parallel_nsa_fwd_kernel(

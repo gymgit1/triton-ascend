@@ -1,4 +1,4 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — NEGATIVE case ===
+// === #2686 SelectedBlockScanRule (bit 65536) — NEGATIVE case ===
 // Provenance: nsa_fwd.py -> ast_to_ttir -> make_ttir() (the TTIR graph-optimize
 // sees: inliner/rewrite_tensor_descriptor/combine/canonicalize/reorder_broadcast/
 // cse/licm/symbol_dce/loop_unroll already applied).  Identical to
@@ -11,7 +11,7 @@
 // built from (i_s + [0, BS) + 1) <= i_t -- the spelling a causal attention
 // with diagonal = 1 lowers to.  The tile reads, the block predicate and the
 // carried-state recurrence are untouched.
-// Rule A must decline: the rewrite recomputes the token positions as
+// The scan rewrite must decline: the rewrite recomputes the token positions as
 // token_start + [0, BN) with no offset, so the diagonal shift would be
 // silently dropped.  That keeps one extra token per block inside the causal
 // window (and drops one at the other end), i.e. it changes the softmax.

@@ -1,4 +1,4 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — REAL bwd dq fixture ===
+// === #2686 SelectedBlockScanRule (bit 65536) — REAL bwd dq fixture ===
 // Provenance: fla/ops/nsa/parallel.py::parallel_nsa_bwd_kernel_dq -> ast_to_ttir
 // -> make_ttir() (the TTIR graph-optimize sees).  This copy is that IR modulo
 // (a) all loc() dropped (re-printed by triton-opt, which does not print debug
@@ -15,7 +15,7 @@
 // an explicit mask (never tt.make_tensor_ptr), a single tt.store (the dq
 // output) and no tt.reduce anywhere in the loop.
 //
-// Rule A used to DECLINE this shape (v0 contract); it was then pinned as a
+// The scan rewrite used to DECLINE this shape (v0 contract); it was then pinned as a
 // negative case, section (g) of nsa_selected_block_scan_negative.mlir.  The
 // additive branch landed and was accepted on 2026-11-02, so this file is now a
 // POSITIVE fixture:

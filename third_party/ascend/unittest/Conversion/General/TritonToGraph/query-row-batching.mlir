@@ -1,7 +1,7 @@
 // RUN: triton-opt --split-input-file --verify-each %s -graph-optimize='rule-mask=131072' -canonicalize -cse -o %t
 // RUN: FileCheck %s < %t
 // A second rule run must not lift rows twice.  The canonicalizer needs its own
-// second round to fold the duplicated scf.if, which is unrelated to rule B, so
+// second round to fold the duplicated scf.if, which is unrelated to the row lift, so
 // the idempotency check drives the rule and CSE only.
 // RUN: triton-opt --split-input-file --verify-each %t -graph-optimize='rule-mask=131072' -cse -o %t.twice
 // RUN: diff %t %t.twice
@@ -9,7 +9,7 @@
 // RUN: triton-opt --split-input-file %s -canonicalize -cse -o %t.control
 // RUN: diff %t.control %t.disabled
 
-// Rule B is Ascend 950 only: the same candidates must stay untouched elsewhere.
+// The row lift is Ascend 950 only: the same candidates must stay untouched elsewhere.
 // RUN: sed 's/Ascend950PR_9579/Ascend910B2/g' %s > %t.a2.mlir
 // RUN: triton-opt --split-input-file %t.a2.mlir -canonicalize -cse -o %t.a2.control
 // RUN: triton-opt --split-input-file --verify-each %t.a2.mlir -graph-optimize='rule-mask=131072' -canonicalize -cse -o %t.a2
@@ -26,8 +26,8 @@
 // CORENUM-NOT: hacc.coalesce_factor = 8 : i32
 // CORENUM: hacc.coalesce_factor = 2 : i32
 
-// Rule B lifts the query-row axis of the loop that rule A handed over.  The
-// matcher no longer judges whether the loop is sequential.  It accepts a
+// The row lift rewrites the query-row axis of the loop the scan rewrite handed
+// over.  The matcher no longer judges whether the loop is sequential.  It accepts a
 // pid-dependent upper bound only when the bound is provably non-decreasing over
 // the whole pid range, so the last row of the group supplies the loop trip
 // count and the per-row copy becomes the active mask.
@@ -252,7 +252,7 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num
 // -----
 
 // A loop that still reads its block index from a scalar table is lifted as
-// well: rule A owns the sequentialization, so rule B no longer infers "has A
+// well: the scan rewrite owns the sequentialization, so the row lift no longer infers "has A
 // run?" from an in-loop table read.  The table pointer is lifted with the query
 // rows, so every row reads its own index lane under the per-row active mask.
 

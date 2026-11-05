@@ -1,4 +1,4 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — bwd dq, BOTH tile spellings ===
+// === #2686 SelectedBlockScanRule (bit 65536) — bwd dq, BOTH tile spellings ===
 //
 // The additive (bwd dq) carried-state form reads one K tile and one V tile per
 // iteration.  Its two address spellings must both match:
@@ -14,9 +14,10 @@
 // bwd dq kernel: `selected-block-scan: stage tiles declined`, function
 // byte-identical.  These RUN lines pin both spellings down.
 //
-// The GATED pair (3rd/4th RUN) locks in that Rule A needs no Rule B bit: Rule A
-// always runs Rule B's real implementation (QueryRowBatching.h), so offering
-// only bit 65536 must give the same IR as 65536|131072 -- the standalone Rule B
+// The GATED pair (3rd/4th RUN) locks in that the scan rewrite needs no row-lift
+// bit: it always runs the row lift's real implementation (QueryRowBatching.h), so
+// offering
+// only bit 65536 must give the same IR as 65536|131072 -- the standalone row lift
 // scheduled by 131072 finds nothing left to lift in the joint result.
 
 // RUN: triton-opt %S/Inputs/nsa_bwd_dq_mptr.mlir -graph-optimize='rule-mask=196608' -o - | FileCheck %s --check-prefix=MPTR

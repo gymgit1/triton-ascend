@@ -1,4 +1,4 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — NEGATIVE: the forward
+// === #2686 SelectedBlockScanRule (bit 65536) — NEGATIVE: the forward
 // loop body contains a tt.trans.
 //
 // The additive (bwd dq) template replays the transpose it finds verbatim, so

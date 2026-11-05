@@ -1,4 +1,4 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — NEGATIVE: the table row
+// === #2686 SelectedBlockScanRule (bit 65536) — NEGATIVE: the table row
 // is wider than the 4096-slot ceiling.
 //
 // S drives the width of the vector read the rewrite emits before the loop, so an

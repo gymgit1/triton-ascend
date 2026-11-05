@@ -1,4 +1,4 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — REAL kernel fixture ===
+// === #2686 SelectedBlockScanRule (bit 65536) — REAL kernel fixture ===
 // Provenance: nsa_fwd.py -> ast_to_ttir -> make_ttir() (the TTIR graph-optimize
 // sees).  Identical to Inputs/nsa_fwd_const_ns.mlir except for the single
 // documented mutation.
@@ -7,10 +7,10 @@
 // MUTATION (synthetic, 2 SSA operands): the token offset of both the K tile
 // and the V tile is program_id.x (= the query position) instead of the
 // index-table entry, i.e. the RHS is grid-anchored dense read.
-// Rule A must decline: the address chain no longer goes through the scanned
+// The scan rewrite must decline: the address chain no longer goes through the scanned
 // block index, and DotRowCoalescing.cpp:294-306 refuses to lift a dependent dot
 // B operand.
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — REAL kernel fixture ===
+// === #2686 SelectedBlockScanRule (bit 65536) — REAL kernel fixture ===
 // Provenance: nsa_fwd.py -> ast_to_ttir -> make_ttir() (the TTIR graph-optimize
 // sees: inliner/rewrite_tensor_descriptor/combine/canonicalize/reorder_broadcast/
 // cse/licm/symbol_dce/loop_unroll already applied).  This copy is the same IR

@@ -1,4 +1,4 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — NEGATIVE: the score dot
+// === #2686 SelectedBlockScanRule (bit 65536) — NEGATIVE: the score dot
 // does not start from zero.
 //
 // The rewrite re-emits the score dot with a zero C operand (a fresh matmul), so a

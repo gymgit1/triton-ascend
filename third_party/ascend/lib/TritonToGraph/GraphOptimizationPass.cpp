@@ -151,7 +151,6 @@ public:
     this->l0SafetyPercent = options.l0SafetyPercent;
     this->coreNum = options.coreNum;
     this->compileMode = options.compileMode;
-    this->selectedBlockScanForceApply = options.selectedBlockScan.forceApply;
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {
@@ -294,7 +293,6 @@ GraphOptimizePass::getStableOptions(GraphOptimizationOptions &options) {
       *compileMode != triton::ascend::CompileMode::SimtOnly;
   options.storeCoalescing.enabledForCompileMode =
       *compileMode != triton::ascend::CompileMode::SimtOnly;
-  options.selectedBlockScan.forceApply = this->selectedBlockScanForceApply;
   return success();
 }
 
@@ -625,7 +623,7 @@ void populateBuiltinGraphOptimizationRules(
   // standalone rule.
   if (isRuleEnabled(options.enabledRuleMask,
                     GraphOptimizationRuleId::SelectedBlockScan)) {
-    rules.push_back(createSelectedBlockScanRule(options.selectedBlockScan));
+    rules.push_back(createSelectedBlockScanRule());
   }
   // 规则 B（query row batching）在规则位 131072 置位时注册（该位已进入默认
   // mask）；它在 ProgramMapping 阶段独立调度，通常已经被规则 A 的 materialize

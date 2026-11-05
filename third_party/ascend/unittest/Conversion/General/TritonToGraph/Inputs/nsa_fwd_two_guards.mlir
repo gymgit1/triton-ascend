@@ -1,4 +1,4 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — NEGATIVE: a second
+// === #2686 SelectedBlockScanRule (bit 65536) — NEGATIVE: a second
 // scf.if at loop-body top level.
 //
 // The rewrite turns the single guarded region into a per-token weight, so a

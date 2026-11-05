@@ -1,4 +1,4 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — NEGATIVE: the addptr
+// === #2686 SelectedBlockScanRule (bit 65536) — NEGATIVE: the addptr
 // tile load pads with a non-zero "other".
 //
 // The rewriter re-emits the tile load with other = 0 (the baseline's padding

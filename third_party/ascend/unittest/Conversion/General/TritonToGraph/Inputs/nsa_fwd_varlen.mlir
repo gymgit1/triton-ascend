@@ -1,4 +1,4 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — REAL kernel fixture ===
+// === #2686 SelectedBlockScanRule (bit 65536) — REAL kernel fixture ===
 // Provenance: nsa_fwd.py -> ast_to_ttir -> make_ttir() (the TTIR graph-optimize
 // sees: inliner/rewrite_tensor_descriptor/combine/canonicalize/reorder_broadcast/
 // cse/licm/symbol_dce/loop_unroll already applied).  This copy is the same IR
@@ -9,7 +9,7 @@
 // Shapes: H=4 HQ=64 G=16 K=V=128 S=16 BS=64 BK=BV=128, dtype bf16.
 // NOT a lit test: lit.cfg.py excludes Inputs/ (unittest/lit.cfg.py:38).
 // Variant: varlen (USE_OFFSETS=1) — extra scalar loads of token_indices/offsets.
-// Negative case: RFC puts varlen out of scope for Rule A.
+// Negative case: RFC puts varlen out of scope for the scan rewrite.
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
   tt.func public @parallel_nsa_fwd_kernel(%arg0: !tt.ptr<bf16>, %arg1: !tt.ptr<bf16>, %arg2: !tt.ptr<bf16>, %arg3: !tt.ptr<bf16>, %arg4: !tt.ptr<f32>, %arg5: f32, %arg6: !tt.ptr<i64>, %arg7: !tt.ptr<i64>, %arg8: !tt.ptr<i64>, %arg9: !tt.ptr<i64>, %arg10: i32) attributes {noinline = false} {
     %cst = arith.constant dense<0.000000e+00> : tensor<16xf32>

@@ -366,15 +366,6 @@ struct ResidentLoadForwardingRuleOptions {};
 struct IntermediatePrecisionBoundaryElisionRuleOptions {};
 struct StoreCoveragePlanningRuleOptions {};
 struct ContiguousBlockAccessFormationRuleOptions {};
-struct SelectedBlockScanRuleOptions {
-  // 规则 A 与规则 B 之间没有独立的开关：A 始终通过 QueryRowBatching.h 的
-  // materialize 入口执行 B，收不收由 B 自己决定。
-  // forceApply 只是测试用的逃生门，让 A 在没有 B 的情况下单独落地。
-  // There is no separate Rule A/Rule B enable flag: Rule A always runs Rule B
-  // through the QueryRowBatching.h materialize entry and lets Rule B decide.
-  // forceApply is only a test escape hatch that lands A without B.
-  bool forceApply = false;
-};
 
 struct GraphOptimizationOptions {
   // A zero mask intentionally disables every native GraphOptimizationRule.
@@ -411,7 +402,6 @@ struct GraphOptimizationOptions {
       intermediatePrecisionBoundaryElision;
   StoreCoveragePlanningRuleOptions storeCoveragePlanning;
   ContiguousBlockAccessFormationRuleOptions contiguousBlockAccessFormation;
-  SelectedBlockScanRuleOptions selectedBlockScan;
 };
 
 std::unique_ptr<OperationPass<ModuleOp>>

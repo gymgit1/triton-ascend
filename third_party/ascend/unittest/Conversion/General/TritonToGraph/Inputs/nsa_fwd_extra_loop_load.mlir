@@ -1,4 +1,4 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — NEGATIVE: an extra
+// === #2686 SelectedBlockScanRule (bit 65536) — NEGATIVE: an extra
 // tensor load inside the gather loop.
 //
 // The rewrite replaces the whole gather loop, so it can only accept a body

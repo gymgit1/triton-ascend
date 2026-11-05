@@ -1,4 +1,4 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — NEGATIVE: the tile-max
+// === #2686 SelectedBlockScanRule (bit 65536) — NEGATIVE: the tile-max
 // reduce combines with min instead of max.
 //
 // The online-softmax recurrence is recognised by its combine ops: the running

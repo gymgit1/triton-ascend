@@ -1,16 +1,16 @@
-// #2686 Rule A+B JOINT golden standard (provenance)
+// #2686 SelectedBlockScanRule + QueryRowBatchingRule JOINT golden standard (provenance)
 //   source   : Inputs/nsa_fwd_const_ns.mlir  (the real NSA fwd kernel IR after
 //              the early TTIR pipeline; Ascend950PR_9579, locs already dropped)
 //   produced : triton-opt <source> -graph-optimize='rule-mask=196608' -o <this>
 //              i.e. SelectedBlockScanRule (bit 65536) + QueryRowBatchingRule
 //              (bit 131072) committed jointly.
-//   target   : Ascend950PR_9579 (NOT Ascend910_95: isAscend950() gates Rule B and
+//   target   : Ascend950PR_9579 (NOT Ascend910_95: isAscend950() gates the row lift and
 //              the graph-optimize run below silently no-ops on 910_95)
 //   locs     : none (no --mlir-print-debuginfo).  Never cite line numbers from a
 //              loc-free fixture; cite the loc-bearing IR under .tmp-analysis.
 //   note     : this artifact carries hacc.program_grid_transforms on purpose --
 //              it is the launch-contract flavour of the joint rewrite.  The
-//              in-kernel flavour (flat pid + `if active`) is NOT what Rule B
+//              in-kernel flavour (flat pid + `if active`) is NOT what the row lift
 //              emits here; see .issue2686-notes/15-v3-realignment.md 0.1.
 module attributes {hacc.program_grid_transforms = {extent_source = "runtime_original_grid", hidden_argument_order = ["originalGridX", "originalGridY"], hidden_argument_types = ["i32", "i32"], hidden_extent_axes = [0, 1], transforms = [{axis = 0 : i64, factor = 8 : i64, grid_stride_abi_verified = false, kind = "ceil_div", order = 0 : i64, persistent_coverage = false}], version = 2 : i64}, hacc.target = #hacc.target<"Ascend950PR_9579">} {
   tt.func public @parallel_nsa_fwd_kernel(%arg0: !tt.ptr<bf16>, %arg1: !tt.ptr<bf16>, %arg2: !tt.ptr<bf16>, %arg3: !tt.ptr<bf16>, %arg4: !tt.ptr<f32>, %arg5: f32, %arg6: !tt.ptr<i64>, %arg7: !tt.ptr<i64>, %arg8: i32, %arg9: i32, %arg10: i32) attributes {noinline = false} {

@@ -1,4 +1,4 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — REAL H=1 fixture ===
+// === #2686 SelectedBlockScanRule (bit 65536) — REAL H=1 fixture ===
 // Provenance: nsa_fwd.py -> ast_to_ttir -> make_ttir() (the TTIR graph-optimize
 // sees).  This copy is that IR modulo all loc() dropped (re-printed by
 // triton-opt); the module target stays the Ascend950PR_9579 spelling.

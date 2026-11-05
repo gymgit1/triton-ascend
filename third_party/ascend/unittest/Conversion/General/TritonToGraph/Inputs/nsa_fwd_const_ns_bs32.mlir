@@ -1,4 +1,4 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — REAL kernel fixture ===
+// === #2686 SelectedBlockScanRule (bit 65536) — REAL kernel fixture ===
 // Provenance: nsa_fwd.py -> ast_to_ttir -> make_ttir() (the TTIR graph-optimize
 // sees: inliner/rewrite_tensor_descriptor/combine/canonicalize/reorder_broadcast/
 // cse/licm/symbol_dce/loop_unroll already applied).  Identical to
@@ -17,7 +17,7 @@
 // S, the constant trip count (16) and the carried-state shapes are unchanged.
 // The IR is legal: every tensor has a power-of-two element count (128x32 =
 // 4096, 16x32 = 512).
-// Rule A must ACCEPT: BS is a power of two, so BN = max(64, BS) = 64 is a whole
+// The scan rewrite must ACCEPT: BS is a power of two, so BN = max(64, BS) = 64 is a whole
 // multiple of BS and R = BN / BS = 2.  With BS < 64 one index-table entry covers
 // R = 2 BN-wide tiles, so the per-token weight count has to be evaluated per
 // sub-tile (R x S = 2x16) and reshaped back to BN tokens, instead of being taken

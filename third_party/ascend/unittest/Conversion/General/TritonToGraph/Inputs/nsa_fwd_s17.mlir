@@ -1,4 +1,4 @@
-// #2686 Rule A: S = 17 (a NON power-of-two index-table row) (provenance)
+// #2686 SelectedBlockScanRule: S = 17 (a NON power-of-two index-table row) (provenance)
 //   source   : the pre-optimization NSA fwd kernel
 //              (.tmp-analysis/ir/snapshots/nsa_fwd.py.20261103T1555, the only
 //              surviving copy of the new-fla baseline) compiled with S=17,

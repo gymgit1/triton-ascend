@@ -1,4 +1,4 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — REAL bwd dq fixture ===
+// === #2686 SelectedBlockScanRule (bit 65536) — REAL bwd dq fixture ===
 // Provenance: fla/ops/nsa/parallel.py::parallel_nsa_bwd_kernel_dq -> ast_to_ttir
 // -> make_ttir() (the TTIR graph-optimize sees: inliner/rewrite_tensor_descriptor/
 // combine/canonicalize/reorder_broadcast/cse/licm/symbol_dce/loop_unroll already

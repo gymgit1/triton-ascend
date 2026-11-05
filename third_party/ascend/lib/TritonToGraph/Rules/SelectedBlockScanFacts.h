@@ -20,15 +20,21 @@
  * SOFTWARE.
  */
 
-// The facts of SelectedBlockScanRule (Rule A, #2686, bit 65536): what the rule
-// matches on, the candidate that aggregates them, and the four entry points its
-// three translation units share.
+// The facts of SelectedBlockScanRule (#2686, rule bit 65536): what the scan
+// rewrite matches on, the candidate that aggregates the facts, and the four
+// entry points its three translation units share.
+//
+// Naming used across these files: "the scan rewrite" is this rule (rule bit
+// 65536, SelectedBlockScanRule); "the row lift" is QueryRowBatchingRule (rule
+// bit 131072), which the scan rewrite always materializes in its own sandbox.
+// The letters A/B from RFC #2686 survive only in option help and design docs.
 //
 // No logic and no IR walking live here. The matcher, the rewriter and the
 // driver shell are separate translation units and each documents its own
 // sections; ScanCandidate is the only value that crosses from one to the next.
 //
-// The matcher is seven parsers, one fact each, with no shared mutable state:
+// The matcher is six parsers plus validateScan, one fact each, with no shared
+// mutable state:
 //
 //   parseLoop        (fn)                    -> LoopFact
 //   parseRowPosition (fn, loop)              -> RowFact          (matcher only)
@@ -254,7 +260,7 @@ bool budgetOverflow(triton::FuncOp sandboxFunction,
                     const ResourceSnapshot &resources, llvm::StringRef form,
                     triton::FuncOp liveFunction);
 
-// Canonicalize/CSE/LICM pass over the private sandbox, so the joint Rule B
+// Canonicalize/CSE/LICM pass over the private sandbox, so the joint row-lift
 // consult judges exactly the body that apply() commits. Implemented in
 // SelectedBlockScanBuild.cpp.
 LogicalResult runSandboxStructuralCleanup(ModuleOp sandbox);

@@ -1,4 +1,4 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — PRODUCTION bwd dq fixture ===
+// === #2686 SelectedBlockScanRule (bit 65536) — PRODUCTION bwd dq fixture ===
 // Provenance: Q3TritonKernel/src/kernels/fla/ops/nsa/nsa_bwd_dq.py
 // ::parallel_nsa_bwd_kernel_dq -> ast_to_ttir -> make_ttir() (the TTIR that
 // graph-optimize sees; the two decorators @triton.heuristics/@triton.autotune

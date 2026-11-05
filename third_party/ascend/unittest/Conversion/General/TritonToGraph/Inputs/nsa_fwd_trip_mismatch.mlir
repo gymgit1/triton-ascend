@@ -1,4 +1,4 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — NEGATIVE: the constant
+// === #2686 SelectedBlockScanRule (bit 65536) — NEGATIVE: the constant
 // trip count disagrees with the table width.
 //
 // A constant trip count is the special case NS == S: the matcher states S from

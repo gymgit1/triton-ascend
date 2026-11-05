@@ -1,4 +1,4 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — REAL kernel fixture ===
+// === #2686 SelectedBlockScanRule (bit 65536) — REAL kernel fixture ===
 // Provenance: nsa_fwd.py -> ast_to_ttir -> make_ttir() (the TTIR graph-optimize
 // sees: inliner/rewrite_tensor_descriptor/combine/canonicalize/reorder_broadcast/
 // cse/licm/symbol_dce/loop_unroll already applied).  This copy is the same IR

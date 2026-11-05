@@ -1,4 +1,4 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — REAL varlen fixture ===
+// === #2686 SelectedBlockScanRule (bit 65536) — REAL varlen fixture ===
 // Provenance: nsa_fwd.py -> ast_to_ttir -> make_ttir() (the TTIR graph-optimize
 // sees).  This copy is that IR modulo all loc() dropped (re-printed by
 // triton-opt); the module target stays the Ascend950PR_9579 spelling.
@@ -8,8 +8,8 @@
 // 2 cu_seqlens_k + 1 block_counts = SEVEN loop-invariant scalar loads before the
 // loop.  The skeleton budget used to be six (the varlen prefix only), so this
 // shape was rejected before parseIndexTable ever ran.
-// POSITIVE case for Rule A's matcher.  The JOINT A+B gate still declines it
-// because Rule B does not lift varlen (see the VARLEN group and negative (a)).
+// POSITIVE case for the scan rewrite's matcher.  The JOINT A+B gate still declines it
+// because the row lift does not lift varlen (see the VARLEN group and negative (a)).
 // NOT a lit test: lit.cfg.py excludes Inputs/ (unittest/lit.cfg.py:38).
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
   tt.func public @parallel_nsa_fwd_kernel(%arg0: !tt.ptr<bf16>, %arg1: !tt.ptr<bf16>, %arg2: !tt.ptr<bf16>, %arg3: !tt.ptr<bf16>, %arg4: !tt.ptr<f32>, %arg5: f32, %arg6: !tt.ptr<i64>, %arg7: !tt.ptr<i32>, %arg8: !tt.ptr<i32>, %arg9: !tt.ptr<i32>, %arg10: !tt.ptr<i32>, %arg11: i32, %arg12: i32) attributes {noinline = false} {

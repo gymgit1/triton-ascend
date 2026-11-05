@@ -1,4 +1,4 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — NEGATIVE case ===
+// === #2686 SelectedBlockScanRule (bit 65536) — NEGATIVE case ===
 // Provenance: nsa_fwd.py -> ast_to_ttir -> make_ttir() (the TTIR graph-optimize
 // sees: inliner/rewrite_tensor_descriptor/combine/canonicalize/reorder_broadcast/
 // cse/licm/symbol_dce/loop_unroll already applied).  Identical to
@@ -10,7 +10,7 @@
 // entry is addressed as table[P + i_h*S + (i + 1)] instead of
 // table[P + i_h*S + i], i.e. the scalar tt.addptr offset is
 // arith.addi(%iv, %c1_i32).  The table base and its row offset are untouched.
-// Rule A must decline: the rewrite reads the whole table once as table[0, S)
+// The scan rewrite must decline: the rewrite reads the whole table once as table[0, S)
 // and then indexes it by the iteration number, which is only the same slot
 // when the baseline offset is exactly the induction variable.  Rewriting this
 // input would read table[0..S) where the kernel reads table[1..S+1).

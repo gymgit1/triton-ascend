@@ -19,17 +19,16 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
-// SelectedBlockScanRule, Rule A (#2686, rule bit 65536): the rewriter.
+// SelectedBlockScanRule (#2686, rule bit 65536): the rewriter.
 //
 // Emits the sequential scan on the caller's private sandbox clone; the live
-// function is only touched by apply(), after the joint Rule B gate and the
+// function is only touched by apply(), after the joint row-lift gate and the
 // budget gate both accepted the sandbox. Sections: [0] scaffolding, [1]
-// prologue, [2] weights, [3] loop + scores, [4] bodies, [5] entry, [6] budget
-// gate.
+// prologue, [2] weights, [3] online-softmax body, [4] additive body, [5] entry,
+// [6] budget gate.
 
 #include "TritonToGraph/GraphOptimizationRule.h"
-#include "TritonToGraph/ProgramGridTransform.h"
-#include "TritonToGraph/QueryRowBatching.h"
+#include "TritonToGraph/ResourceCostModel.h"
 #include "TritonToGraph/RowLifting.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -38,33 +37,24 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Diagnostics.h"
-#include "mlir/IR/IRMapping.h"
-#include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
-#include "mlir/IR/Verifier.h"
-#include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/ADT/APFloat.h"
-#include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/Support/Debug.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/Support/raw_ostream.h"
 
-#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
-#include <memory>
 #include <optional>
-
-#define DEBUG_TYPE "graph-optimize"
 
 using namespace mlir;
 using namespace triton;
 using namespace cfg;
 
-// The joint Rule A + Rule B gate is documented in SelectedBlockScanRule.cpp;
+// The joint scan + row-lift gate is documented in SelectedBlockScanRule.cpp;
 // the rewriter only has to leave the sandbox in a state that gate can accept.
 
 #include "SelectedBlockScanFacts.h"
@@ -211,6 +201,9 @@ buildScanPrologue(IRRewriter &rewriter, ScanCandidate &candidate, Type i32,
   Value ids = rewriter.create<triton::LoadOp>(
       loc, tablePtrVec, triton::CacheModifier::NONE,
       triton::EvictionPolicy::NORMAL, false);
+  // A wider table entry is truncated to i32. The matcher accepts any width
+  // >= 32, so this assumes block numbers stay below 2^31, which S <= 4096
+  // (kMaxTableLength) makes safe in practice.
   Value idsI32 = ids;
   if (cast<RankedTensorType>(ids.getType()).getElementType() != i32)
     idsI32 = rewriter.create<arith::TruncIOp>(loc, tensorTy({TW}, i32), ids);
@@ -439,29 +432,7 @@ struct ScanBodyInputs {
   const ScanPrologue *prologue = nullptr;
 };
 
-static void buildMakeTensorPtrTile(IRRewriter &rewriter, Location loc,
-                                   MptrTiles &mptr, int64_t BN,
-                                   Value tokenStart,
-                                   const ScanPrologue &prologue, Value &bK,
-                                   Value &bV);
-static void buildOnlineSoftmaxBody(IRRewriter &rewriter, Location loc,
-                                   OnlineSoftmaxRecurrence &online,
-                                   const ScanBodyInputs &in, BlockArgument oArg,
-                                   BlockArgument mArg, BlockArgument lArg,
-                                   Type oType);
-static void buildAdditiveBody(IRRewriter &rewriter, Location loc,
-                              AdditiveRecurrence &additive,
-                              const ScanBodyInputs &in, BlockArgument accArg,
-                              Type stateType);
-static Value buildAddPtrTileLoad(IRRewriter &rewriter, Location loc,
-                                 const AddPtrTile &tile,
-                                 triton::LoadOp original, Value tokensI32,
-                                 int64_t BN);
-
-// The top-level builder: shared prologue and new loop, per-token weights,
-// the scores dot, the template dispatch and the commit.
-
-// ---- [4] The online-softmax (fwd) scan body ----
+// ---- [3] The online-softmax (fwd) scan body ----
 
 // The fwd template's tile read: rebuild the two make_tensor_ptr views at
 // the scan tile's token start and load them unconditionally.
@@ -650,10 +621,14 @@ static Value buildAddPtrTileLoad(IRRewriter &rewriter, Location loc,
   Value mask = rewriter.create<arith::AndIOp>(
       loc, rewriter.create<triton::BroadcastOp>(loc, maskType, freeBound),
       broadcastRow(rewriter, loc, tokenMask, maskType, 0));
-  // other = 0, the baseline's padding value for masked-off elements.
-  Attribute zero = rewriter.getFloatAttr(elemType, 0.0);
+  // other = 0, the baseline's padding value for masked-off elements. Pick the
+  // attribute kind first: getFloatAttr() on an integer element type is a hard
+  // error in MLIR, so it must not be evaluated speculatively.
+  Attribute zero;
   if (elemType.isIntOrIndex())
     zero = rewriter.getIntegerAttr(elemType, 0);
+  else
+    zero = rewriter.getFloatAttr(elemType, 0.0);
   Value other = splatConstant(rewriter, loc, {F, BN}, zero);
   return rewriter.create<triton::LoadOp>(
       loc, tilePtr, mask, other, original.getCache(), original.getEvict(),
@@ -735,6 +710,8 @@ namespace cfg {
 
 // ---- [5] Entry: emit the whole scan form ----
 
+// The top-level builder: shared prologue and new loop, per-token weights,
+// the scores dot, the template dispatch and the commit.
 bool buildSelectedBlockScan(IRRewriter &rewriter, ScanCandidate &candidate) {
   scf::ForOp oldLoop = candidate.loop.forOp;
   Location loc = oldLoop.getLoc();
@@ -780,7 +757,8 @@ bool buildSelectedBlockScan(IRRewriter &rewriter, ScanCandidate &candidate) {
   scf::ForOp scan = rewriter.create<scf::ForOp>(
       loc, prologue.c0, prologue.scanUpperBound, prologue.c1, inits);
   // A loop with no iter args has no body block, and then there is no terminator
-  // to drop either.
+  // to drop either.  (In this tree the freshly built scf.for body is empty, so
+  // Block::getTerminator() may only be called when it is not.)
   if (!scan.getBody()->empty())
     rewriter.eraseOp(scan.getBody()->getTerminator());
   rewriter.setInsertionPointToStart(scan.getBody());
@@ -845,7 +823,7 @@ bool buildSelectedBlockScan(IRRewriter &rewriter, ScanCandidate &candidate) {
 // ---- [6] On-chip budget gate ----
 //
 // 改写会放大循环体（整表向量读、K/V 每轮无条件载入、扫描 mask），所以量改写后的
-// 沙箱：UB 用 getSafeUBBudget + estimatePeakLiveBytes（规则 B 的口径），L0 用
+// 沙箱：UB 用 getSafeUBBudget + estimatePeakLiveBytes（行提升的口径），L0 用
 // #2841 的 exceedsCubeBudgets；容量为 0 时查询自己关闭。超预算就在线上函数上
 // 报一条 warning 并返回 true，调用方拒绝改写（apply() 仍不可失败）。
 bool budgetOverflow(triton::FuncOp sandboxFunction,
@@ -858,14 +836,20 @@ bool budgetOverflow(triton::FuncOp sandboxFunction,
     // The static peak counts one copy of each UB tensor while the backend
     // multi-buffers loop-carried UB buffers, so the predicate budgets the
     // replicated demand (see the measured numbers on kUBBufferReplication).
+    // Fail closed and divide, like QueryRowBatchingRule's fitsQueryRowBudgets:
+    // an unknown or overflowing estimate is not proof that the rewrite fits,
+    // and the division form cannot wrap the product.
+    const bool fits = estimate.known && !estimate.overflow &&
+                      estimate.peakLiveBytes <= *safeUB / kUBBufferReplication;
     const uint64_t demand =
         estimate.known ? estimate.peakLiveBytes * kUBBufferReplication : 0;
     if (::getenv("TRITON_GRAPH_UB_DEBUG"))
       llvm::errs() << "graph-ub[rule]: form=" << form
                    << " liftedPeak=" << estimate.peakLiveBytes
-                   << " known=" << estimate.known << " demand=" << demand
+                   << " known=" << estimate.known
+                   << " overflow=" << estimate.overflow << " demand=" << demand
                    << " ubBudget=" << *safeUB << "\n";
-    if (estimate.known && demand > *safeUB) {
+    if (!fits) {
       liveFunction.emitWarning()
           << "selected-block-scan: " << form << " needs " << demand
           << " bytes of UB, budget " << *safeUB << "; declining";
@@ -881,8 +865,8 @@ bool budgetOverflow(triton::FuncOp sandboxFunction,
   return false;
 }
 
-// Tidy the private sandbox before the joint consult, so Rule B judges exactly
-// the body apply() commits. `make_ttir` in backend/compiler.py places
+// Tidy the private sandbox before the joint consult, so the row lift judges
+// exactly the body apply() commits. `make_ttir` in backend/compiler.py places
 // add_graph_optimize last, with no canonicalize/CSE after it, so without this
 // cleanup the rewrite would leave splat(constant) and a few dead ops behind
 // for the downstream lowering.

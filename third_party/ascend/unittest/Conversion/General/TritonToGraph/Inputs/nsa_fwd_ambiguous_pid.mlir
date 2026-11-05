@@ -1,4 +1,4 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — NEGATIVE: the table row
+// === #2686 SelectedBlockScanRule (bit 65536) — NEGATIVE: the table row
 // base depends on two axis-0 program ids.
 //
 // parseTableRowPosition must decide which single query position the row belongs

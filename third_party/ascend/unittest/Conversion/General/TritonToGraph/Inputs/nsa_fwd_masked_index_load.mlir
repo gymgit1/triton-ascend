@@ -1,4 +1,4 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — NEGATIVE: the scalar
+// === #2686 SelectedBlockScanRule (bit 65536) — NEGATIVE: the scalar
 // index-table read carries a mask.
 //
 // The rewrite merges the per-iteration scalar reads into one vector read and

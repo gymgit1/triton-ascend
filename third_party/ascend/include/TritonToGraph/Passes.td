@@ -99,8 +99,6 @@ def GraphOptimize : Pass<"graph-optimize", "mlir::ModuleOp"> {
            "Physical AI-core blocks the launcher schedules (AIV for pure-SIMT kernels, AIC otherwise); zero disables the gridX/R >= coreNum row-count constraint">,
     Option<"compileMode", "compile-mode", "std::string", "\"simd_simt_template\"",
            "Compilation mode; legacy elementwise RowCoalescing is enabled only for simt_only">,
-    Option<"selectedBlockScanForceApply", "selected-block-scan-force-apply", "bool", "false",
-           "Test-only: force the selected-block-scan rewrite, bypassing the joint Rule A + Rule B gate. Not reachable from the Python backend.">,
   ];
 }
 

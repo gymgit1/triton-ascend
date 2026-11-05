@@ -1,4 +1,4 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — NEGATIVE: H > 1 layout
+// === #2686 SelectedBlockScanRule (bit 65536) — NEGATIVE: H > 1 layout
 // with no i_h*S slot addend.
 //
 // Same IR as nsa_fwd_h1_dyn_ns.mlir (S is read off the pid row-offset

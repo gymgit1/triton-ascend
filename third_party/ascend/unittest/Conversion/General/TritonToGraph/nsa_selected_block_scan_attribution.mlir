@@ -1,11 +1,11 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — attribution guard ===
+// === #2686 SelectedBlockScanRule (bit 65536) — attribution guard ===
 //
-// What this file proves: for every fixture Rule A is pointed at, both the
+// What this file proves: for every fixture the scan rewrite is pointed at, both the
 // "graph-optimize enabled but no rule" baseline (rule-mask=0) and the 11
 // baseline-bundle rules (rule-mask=3071, i.e. the default mask 199679 minus the
-// #2686 Rule A/B bits) leave the IR byte-for-byte unchanged.
-// Therefore any diff produced by Rule A (rule-mask=65536 plus the escape hatch)
-// is attributable to Rule A alone -- the same "isolate the rule so nothing can
+// #2686 scan/row-lift bits) leave the IR byte-for-byte unchanged.
+// Therefore any diff a rewrite in the #2686 slot produces is attributable to
+// it alone -- the same "isolate the rule so nothing can
 // be blamed on another graph rule" contract that
 // unittest/Conversion/General/TritonToGraph/convert_modulo_to_mask.mlir:8-9
 // states in prose.
@@ -71,9 +71,9 @@
 // RUN: FileCheck %s --check-prefix=I64IV < %t.i64.on
 
 // The additive (bwd dq) fixture joined the attributed set on 2026-11-02, when
-// Rule A's additive branch made it a POSITIVE case (group G of
-// nsa_selected_block_scan.mlir, prefix BWDREW): the diff Rule A produces there
-// must still be attributable to Rule A alone, so the 11 baseline rules have to
+// the scan rewrite's additive branch made it a POSITIVE case (group G of
+// nsa_selected_block_scan.mlir, prefix BWDREW): the diff the scan rewrite produces there
+// must still be attributable to the scan rewrite alone, so the 11 baseline rules have to
 // leave the pre-rewrite additive loop exactly as they find it.
 // BWDPRE below pins that pre-rewrite shape (scalar per-iteration table read,
 // one iter_arg, scf.if, addptr + masked K/V tiles, three dots, tt.trans) so the
@@ -98,7 +98,7 @@
 // ---------------------------------------------------------------------------
 // CONST — Inputs/nsa_fwd_const_ns.mlir : the POSITIVE case, untouched
 // ---------------------------------------------------------------------------
-// No program-grid contract, no coalesce factor: Rule A must not publish one
+// No program-grid contract, no coalesce factor: the scan rewrite must not publish one
 // and nothing else did either.
 // CONST-NOT: hacc.coalesce_factor
 // CONST-NOT: hacc.program_grid_transforms
@@ -110,7 +110,7 @@
 // (o, m, l) — the online-softmax (Form 1) carrying state.
 // CONST: scf.for %{{.*}} = %c0_i32 to %c16_i32 step %c1_i32 iter_args(%{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}) -> (tensor<16x128xf32>, tensor<16xf32>, tensor<16xf32>)
 
-// (1) per-iteration scalar index-table load — the op Rule A exists to delete
+// (1) per-iteration scalar index-table load — the op the scan rewrite exists to delete
 // CONST: %[[IDXPTR:.*]] = tt.addptr %{{.*}}, %{{.*}} : !tt.ptr<i64>, i32
 // CONST: %[[IDX:.*]] = tt.load %[[IDXPTR]] : !tt.ptr<i64>
 // CONST: %[[IDX32:.*]] = arith.trunci %[[IDX]] : i64 to i32
@@ -138,7 +138,7 @@
 // ---------------------------------------------------------------------------
 // Varlen signature: the trip count comes from a scalar i64 load and the
 // induction variable is i64; block_indices/token_indices/offsets are four extra
-// scalar loads before the loop.  RFC §6 puts varlen out of scope for Rule A.
+// scalar loads before the loop.  RFC §6 puts varlen out of scope for the scan rewrite.
 // VARLEN-LABEL: tt.func public @parallel_nsa_fwd_kernel(
 // VARLEN-COUNT-4: tt.load %{{.*}} : !tt.ptr<i64>
 // VARLEN: %[[NS:.*]] = tt.load %{{.*}} : !tt.ptr<i64>
@@ -169,7 +169,7 @@
 // K and V tile token offsets are program_id.x, i.e. the RHS is anchored on the
 // grid axis instead of the index table.  The scalar load and the scf.if are
 // still there (so the loop still looks like a gather loop) but the address
-// chain no longer goes through %TOK — exactly the shape Rule A must decline.
+// chain no longer goes through %TOK — exactly the shape the scan rewrite must decline.
 // RHSGRID-LABEL: tt.func public @parallel_nsa_fwd_kernel(
 // RHSGRID: %[[PIDX:.*]] = tt.get_program_id x : i32
 // RHSGRID: %{{.*}} = scf.if %{{.*}} -> (tensor<16x128xf32>, tensor<16xf32>, tensor<16xf32>)
@@ -198,7 +198,7 @@
 // BS32 — Inputs/nsa_fwd_const_ns_bs32.mlir : positive case (R = 2), untouched
 // ---------------------------------------------------------------------------
 // The only fixture with R = BN/BS > 1: BS = 32, so BN = max(64, BS) = 64 is two
-// blocks wide.  Rule A is pointed at this file in nsa_selected_block_scan.mlir
+// blocks wide.  The scan rewrite is pointed at this file in nsa_selected_block_scan.mlir
 // group F, so the default rules must leave it alone -- that is what the diff
 // above asserts.  Pre-rewrite shape: 32-wide tile views, token offset
 // idx * 32, one scf.if and the per-iteration scalar table read.
@@ -221,7 +221,7 @@
 // verifyTensorSize power-of-two rule)
 // ---------------------------------------------------------------------------
 // BS = 48, not a power of two: BN % BS == 0 (the "one block index == BS tokens"
-// weight semantics) cannot hold, so Rule A must decline even though everything
+// weight semantics) cannot hold, so the scan rewrite must decline even though everything
 // else about the loop is matchable.
 // BS48-LABEL: tt.func public @parallel_nsa_fwd_kernel(
 // BS48: %[[TOK48:.*]] = arith.muli %{{.*}}, %c48_i32 : i32
@@ -235,7 +235,7 @@
 // BWDPRE — Inputs/nsa_bwd_dq_const_ns.mlir : POSITIVE case (additive), untouched
 // by the 11 baseline rules
 // ---------------------------------------------------------------------------
-// Pre-rewrite shape of the bwd dq additive kernel, i.e. exactly what Rule A's
+// Pre-rewrite shape of the bwd dq additive kernel, i.e. exactly what the scan rewrite's
 // additive branch consumes: constant-trip-count i32 loop with ONE iter_arg (the
 // 16x128 f32 dq accumulator), a per-iteration SCALAR index-table read plus its
 // i64 block/token arithmetic, the scf.if guard, K/V read with tt.addptr and an

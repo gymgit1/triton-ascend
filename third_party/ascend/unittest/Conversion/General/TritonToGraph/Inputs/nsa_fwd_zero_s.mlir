@@ -1,4 +1,4 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — NEGATIVE: the table row
+// === #2686 SelectedBlockScanRule (bit 65536) — NEGATIVE: the table row
 // length is zero.
 //
 // S comes from the i_h*S addend of the row base; with S == 0 there is no row to

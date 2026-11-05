@@ -1,4 +1,4 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — NEGATIVE case ===
+// === #2686 SelectedBlockScanRule (bit 65536) — NEGATIVE case ===
 // Provenance: nsa_fwd.py -> ast_to_ttir -> make_ttir() (the TTIR graph-optimize
 // sees: inliner/rewrite_tensor_descriptor/combine/canonicalize/reorder_broadcast/
 // cse/licm/symbol_dce/loop_unroll already applied).  Identical to
@@ -12,7 +12,7 @@
 // instead of 64, while the token offset still advances by BS = 64 per
 // iteration.  The IR is legal and parses; only the width/stride agreement on
 // the token axis is broken.
-// Rule A must decline: blockSize is read off the token-offset multiplier (64)
+// The scan rewrite must decline: blockSize is read off the token-offset multiplier (64)
 // and the rewrite then pins the tile token extent to BN = 64 unconditionally.
 // Widening a 32-token tile to 64 changes how many tokens a selected block
 // accumulates, i.e. both the weights and the value sum.

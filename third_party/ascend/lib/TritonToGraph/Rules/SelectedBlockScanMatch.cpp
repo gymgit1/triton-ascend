@@ -19,19 +19,17 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
-// SelectedBlockScanRule, Rule A (#2686, rule bit 65536): the matcher.
+// SelectedBlockScanRule (#2686, rule bit 65536): the matcher.
 //
 // This translation unit only decides whether the gather loop is the selected-
 // block scan pattern and what its parameters are; it never mutates IR. A miss
 // is std::nullopt, silently and without diagnostics.
 //
-// Sections: [0] IR primitives, [1] facts, [2] seven parsers, [3] validateScan,
+// Sections: [0] IR primitives, [1] facts, [2] six parsers, [3] validateScan,
 // [4] assembly. The contract and the pipeline are documented once, in
 // SelectedBlockScanFacts.h; this file follows the same order.
 
 #include "TritonToGraph/GraphOptimizationRule.h"
-#include "TritonToGraph/ProgramGridTransform.h"
-#include "TritonToGraph/QueryRowBatching.h"
 #include "TritonToGraph/RowLifting.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -40,7 +38,6 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Diagnostics.h"
-#include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/ADT/APFloat.h"
@@ -49,7 +46,6 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
 
-#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <variant>
@@ -60,8 +56,8 @@ using namespace mlir;
 using namespace triton;
 using namespace cfg;
 
-// The joint Rule A + Rule B gate lives in SelectedBlockScanRule.cpp: Rule A
-// never consults a read-only Rule B matcher, it materializes Rule B's rewrite
+// The joint gate lives in SelectedBlockScanRule.cpp: the scan rewrite never
+// consults a read-only row-lift matcher, it materializes the row lift's rewrite
 // inside its own sandbox, so neither rewrite can land without the other.
 
 #include "SelectedBlockScanFacts.h"
@@ -73,13 +69,6 @@ namespace {
 // ===========================================================================
 
 // ---- [0.1] Constants ----
-
-static std::optional<int64_t> getConstantIntValue(Value v) {
-  APInt value;
-  if (matchPattern(v, m_ConstantInt(&value)))
-    return value.getSExtValue();
-  return std::nullopt;
-}
 
 static bool isPowerOfTwo(int64_t v) { return v > 0 && (v & (v - 1)) == 0; }
 
@@ -148,9 +137,9 @@ constexpr unsigned kMaxDependenceDepth = 4096;
 
 // What a dependence walk treats as a root.
 struct Dependence {
-  // An operation cut out of the walk. Rule A cuts the per-iteration index load:
-  // it is the mechanism the rewrite removes, so nothing downstream depends on
-  // the program id *through* it.
+  // An operation cut out of the walk. The scan rewrite cuts the per-iteration
+  // index load: it is the mechanism the rewrite removes, so nothing downstream
+  // depends on the program id *through* it.
   Operation *cut = nullptr;
   // When set, a scalar load outside that loop is an opaque per-program
   // constant. That is the varlen spelling: the in-sequence row position and the
@@ -218,8 +207,13 @@ static bool reachesLoopInteriorLoad(Value v, scf::ForOp loop) {
 }
 
 static bool isDefinedOutsideLoop(Value v, scf::ForOp loop) {
-  Operation *op = v.getDefiningOp();
-  return !op || !loop->isAncestor(op);
+  // A block argument (the induction variable or a loop-carried value) has no
+  // defining op but is still produced by the loop, so it is not invariant.
+  if (auto arg = dyn_cast<BlockArgument>(v)) {
+    Operation *owner = arg.getOwner()->getParentOp();
+    return owner != loop.getOperation() && !loop->isAncestor(owner);
+  }
+  return !loop->isAncestor(v.getDefiningOp());
 }
 
 // ---- [0.3] Peeling ----
@@ -303,8 +297,8 @@ static Value peelSingleBroadcast(Value v) {
 // ---- [0.4] Shapes ----
 
 // The only two load shapes both templates accept: unmasked (the scalar index
-// read, and the mptr tiles, where the boundary check does the masking), or an
-// explicit mask with other = 0 (the addptr tile spelling). Volatile is never
+// read and the mptr tiles, whose boundary check the tile parser verifies), or
+// an explicit mask with other = 0 (the addptr tile spelling). Volatile is never
 // re-emitted.
 enum class LoadShape { Unmasked, MaskedZeroOther };
 
@@ -322,6 +316,24 @@ static bool hasLoadShape(triton::LoadOp load, LoadShape shape) {
   return false;
 }
 
+// A widened mptr tile is only safe when the view itself zero-fills past the
+// tensor extent: the extra lanes then read 0, which the weights neutralize.
+// PAD_NAN would poison the accumulator instead (0 * NaN is NaN), and a token
+// axis outside the boundary check would read past the row instead of padding.
+static bool isZeroPaddedTokenBoundary(MptrTiles &tiles) {
+  triton::LoadOp loads[2] = {tiles.kLoad, tiles.vLoad};
+  unsigned axes[2] = {tiles.kTokenAxis, tiles.vTokenAxis};
+  for (unsigned i = 0; i < 2; ++i) {
+    triton::LoadOp load = loads[i];
+    if (load.getPadding() == triton::PaddingOption::PAD_NAN)
+      return false;
+    if (!llvm::is_contained(load.getBoundaryCheck(),
+                            static_cast<int32_t>(axes[i])))
+      return false;
+  }
+  return true;
+}
+
 // A fresh matmul of the guarded region: a dot whose accumulator is zero, i.e. a
 // product rather than an accumulation into the carried state.
 static triton::DotOp matchFreshDot(Value v, Region &thenRegion) {
@@ -330,24 +342,6 @@ static triton::DotOp matchFreshDot(Value v, Region &thenRegion) {
       !isZeroSplatConstant(dot.getC()))
     return nullptr;
   return dot;
-}
-
-// The single combiner op of a canonical two-argument reduce region, or nullptr
-// for anything else.
-static Operation *getReduceCombiner(triton::ReduceOp reduce) {
-  if (reduce.getNumOperands() != 1 || reduce->getNumResults() != 1)
-    return nullptr;
-  if (reduce.getCombineOp().empty())
-    return nullptr;
-  Operation *combiner = nullptr;
-  for (Operation &op : reduce.getCombineOp().front().without_terminator()) {
-    if (op.getNumResults() == 0)
-      continue;
-    if (combiner)
-      return nullptr;
-    combiner = &op;
-  }
-  return combiner;
 }
 
 // Recognize idx * BS by value: muli(x, BS) or shli(x, log2(BS)), with x a cast
@@ -524,8 +518,8 @@ struct TilesMatch {
 // ---- [2.1] The loop ----
 //
 // One scf.for at the function body's top level, all-tensor iter args, lb 0 and
-// step 1: Rule B requires the same shape and the rewrite assumes no other loop
-// nest. The carried arity selects the recurrence template (3 fwd, 1 bwd).
+// step 1: the row lift requires the same shape and the rewrite assumes no other
+// loop nest. The carried arity selects the recurrence template (3 fwd, 1 bwd).
 static std::optional<LoopFact> parseLoop(triton::FuncOp fn) {
   LoopFact fact;
   unsigned forOps = 0;
@@ -701,7 +695,10 @@ static Value matchRowPosition(Value v, Value pid, scf::ForOp loop) {
       // the varlen dispatch derives Q_OFFSET = TK - TQ from the cu_seqlens
       // loads before the loop, and the rewrite only needs ONE loop-invariant
       // scalar shared by the causal mask, the table row and the scan bound.
-      if (!isDefinedOutsideLoop(offset, loop))
+      // The addend being invariant is not enough: the add itself has to be,
+      // otherwise the rewriter hoists a loop-interior value into the prologue.
+      if (!isDefinedOutsideLoop(offset, loop) ||
+          !isDefinedOutsideLoop(stripped, loop))
         return Value();
       return stripped;
     }
@@ -923,7 +920,7 @@ static triton::ReduceOp matchRowReduce(Value v, Region &thenRegion,
   if (!reduce || reduce.getAxis() != 1 ||
       reduce->getParentRegion() != &thenRegion)
     return nullptr;
-  Operation *combiner = getReduceCombiner(reduce);
+  Operation *combiner = reduce.getSingleCombiner();
   if (!combiner || combiner->getName().getStringRef() != combinerName)
     return nullptr;
   return reduce;
@@ -1177,6 +1174,8 @@ static std::optional<RecurrenceMatch> parseRecurrence(const LoopFact &loop,
   for (unsigned i = 0; i < numCarried; ++i)
     if (elseYield->getOperand(i) != forOp.getRegionIterArgs()[i])
       return std::nullopt;
+  if (branch->getNumResults() != numCarried)
+    return std::nullopt;
   auto latchYield = dyn_cast<scf::YieldOp>(forOp.getBody()->getTerminator());
   if (!latchYield || latchYield->getNumOperands() != numCarried)
     return std::nullopt;
@@ -1485,6 +1484,15 @@ static std::optional<TilesMatch> parseTiles(const LoopFact &loop,
     tiles = parseMptrTiles(forOp, row.rawIndex, kLoad, vLoad);
   if (!tiles)
     return std::nullopt;
+  // The online-softmax template widens the tile to BN = max(64, BS) and reads
+  // it unconditionally, so every lane past the baseline's BS-wide window exists
+  // only because the view masks it. The additive template keeps BN == BS and
+  // re-reads the baseline's own addresses, so only the widened form needs this.
+  if (!additive) {
+    MptrTiles *mptr = std::get_if<MptrTiles>(&tiles->fact);
+    if (!mptr || !isZeroPaddedTokenBoundary(*mptr))
+      return std::nullopt;
+  }
   // The tile width contract: BS must be a power of two so a block number owns
   // BS consecutive tokens, and BN = max(64, BS) then divides BS by construction
   // (64 % BS == 0 for BS <= 64, BS % BS == 0 above it), so there is nothing
@@ -1545,9 +1553,9 @@ static bool isScoreTile(Type type, RankedTensorType accType,
 }
 
 // Everything inside the gather loop must be either rebuilt or safely deletable,
-// so no unrecognized op may carry effects: a store, atomic or call would be
-// silently dropped. tt.trans is only rebuilt by the additive template, so it
-// stays unrecognized for the online-softmax form.
+// so no unrecognized op may carry effects: a store, atomic, call or device-side
+// tt.assert would be silently dropped. tt.trans is only rebuilt by the additive
+// template, so it stays unrecognized for the online-softmax form.
 static bool hasSupportedVocabulary(scf::ForOp loop, bool additive) {
   bool supported = true;
   loop->walk([&](Operation *op) {
@@ -1556,7 +1564,7 @@ static bool hasSupportedVocabulary(scf::ForOp loop, bool additive) {
     if (isa<triton::AddPtrOp, triton::LoadOp, triton::MakeTensorPtrOp,
             triton::DotOp, triton::MakeRangeOp, triton::SplatOp,
             triton::ExpandDimsOp, triton::BroadcastOp, triton::ReduceOp,
-            triton::ReduceReturnOp, triton::AssertOp>(op))
+            triton::ReduceReturnOp>(op))
       return;
     if (additive && isa<triton::TransOp>(op))
       return;
@@ -1641,8 +1649,33 @@ static bool validateScan(const LoopFact &loop, const RowFact &row,
   if (!hasSupportedVocabulary(forOp, additive))
     return false;
 
-  if (!additive)
-    return true;
+  // The online-softmax template reuses the carried state's types verbatim
+  // (o/m/l) and hard-codes the score tile to [G, BN] f32, so those are
+  // preconditions of the rewrite, not only of the additive form.
+  if (!additive) {
+    const auto &online = std::get<OnlineSoftmaxRecurrence>(recurrence.fact);
+    auto stateOf = [&](unsigned arg) {
+      return dyn_cast<RankedTensorType>(forOp.getInitArgs()[arg].getType());
+    };
+    RankedTensorType mType = stateOf(online.mArg);
+    RankedTensorType lType = stateOf(online.lArg);
+    RankedTensorType oType = stateOf(online.oArg);
+    if (!mType || !lType || !oType || mType.getRank() != 1 ||
+        lType.getRank() != 1 || oType.getRank() != 2 ||
+        !mType.getElementType().isF32() || !lType.getElementType().isF32() ||
+        !oType.getElementType().isF32())
+      return false;
+    // G is the m row count and the rewriter derives every [G, ...] tile from
+    // it, so the o/l row counts have to agree with it as well.
+    if (lType.getShape()[0] != mType.getShape()[0] ||
+        oType.getShape()[0] != mType.getShape()[0])
+      return false;
+    auto scoreType = dyn_cast<RankedTensorType>(scoreDot.getType());
+    return scoreType && scoreType.getRank() == 2 &&
+           scoreType.getElementType().isF32() &&
+           scoreType.getShape()[0] == mType.getShape()[0] &&
+           scoreType.getShape()[1] == blockSize;
+  }
 
   // [3.7] The additive form is spelling independent but its two tiles must
   // describe the same token block: the builder re-emits one token-range bound

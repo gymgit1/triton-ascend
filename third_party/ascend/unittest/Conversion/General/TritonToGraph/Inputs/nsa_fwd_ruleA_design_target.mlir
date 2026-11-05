@@ -1,11 +1,11 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — design target ===
+// === #2686 SelectedBlockScanRule (bit 65536) — design target ===
 //
 // What this is: the compiled gold standard for the rewritten form -- the
 // Rule-A-only reference implementation of the NSA forward kernel, run through the
 // same early TTIR pipeline that graph-optimize sees.  It is the artifact the
 // rewrite is checked against, so the FileCheck assertions in
 // nsa_selected_block_scan.mlir (prefix REWRITTEN / NOSCALAR) can be validated
-// without running Rule A at all.
+// without running the scan rewrite at all.
 // NOT a lit test: lit.cfg.py excludes Inputs/ (unittest/lit.cfg.py:38).
 // Provenance of this copy: re-printed once by `triton-opt <file> -o <new>` WITHOUT
 // --mlir-print-debuginfo.  It is the SAME IR, LOCATIONS DROPPED -- not a

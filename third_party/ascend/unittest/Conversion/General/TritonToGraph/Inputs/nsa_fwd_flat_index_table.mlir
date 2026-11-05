@@ -1,4 +1,4 @@
-// === #2686 Rule A (SelectedBlockScanRule, bit 65536) — NEGATIVE: the index
+// === #2686 SelectedBlockScanRule (bit 65536) — NEGATIVE: the index
 // table is read flat, with no row base.
 //
 // The rewrite needs the row base: it re-creates `root + rowOffset` outside the
