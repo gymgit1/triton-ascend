@@ -7,7 +7,7 @@
 // i.e. the production varlen dispatch: 2 token_indices_q + 2 cu_seqlens_q +
 // 2 cu_seqlens_k + 1 block_counts = SEVEN loop-invariant scalar loads before the
 // loop.  The skeleton budget used to be six (the varlen prefix only), so this
-// shape was rejected before matchIndexTable ever ran.
+// shape was rejected before parseIndexTable ever ran.
 // POSITIVE case for Rule A's matcher.  The JOINT A+B gate still declines it
 // because Rule B does not lift varlen (see the VARLEN group and negative (a)).
 // NOT a lit test: lit.cfg.py excludes Inputs/ (unittest/lit.cfg.py:38).

@@ -14,7 +14,7 @@
 // tl.make_block_ptr, so the loop reads them through tt.make_tensor_ptr plus
 // boundaryCheck.  Inputs/nsa_bwd_dq_const_ns.mlir came from fla/ops/nsa/
 // parallel.py, which spells the same two loads as a two-level tt.addptr chain
-// with an explicit mask.  The additive (bwd dq) branch of matchTiles used to
+// with an explicit mask.  The additive (bwd dq) branch of parseTiles used to
 // accept only the addptr spelling ("The additive form: no mptr at all"), so the
 // rule matched that fixture and never the real kernel.  Both spellings are
 // covered now; this file is the must-match mptr one.

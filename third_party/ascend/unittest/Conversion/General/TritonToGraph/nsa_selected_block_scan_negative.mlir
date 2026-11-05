@@ -194,3 +194,185 @@
 // TILEW: tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32>
 // TILEW: arith.select %{{.*}}, %{{.*}}, %{{.*}} : tensor<16x32xi1>, tensor<16x32xf32>
 // TILEW: "tt.reduce"(
+
+// ---------- (h) the layout says H > 1 but the row base has no i_h*S term ----
+// nsa_fwd_h1_dyn_ns.mlir is accepted because H == 1 folds the i_h*S slot addend
+// away, which makes the pid row-offset multiplier equal to S.  The same IR with
+// an `i_bh % H` remainder (H = 2) present is the opposite layout: there the
+// multiplier is H*S, so a vector read of that width would run past the row into
+// the next head.  S cannot be recovered from the IR in that case, so the matcher
+// must decline (loopCarriesHeadSplit in deriveTableLength) instead of guessing.
+// The remainder is a dead op -- it exists only to state H > 1, as it does in the
+// real kernel before folding.
+// RUN: triton-opt %S/Inputs/nsa_fwd_h1_dyn_ns_headsplit.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.headsplit.ctl
+// RUN: triton-opt %S/Inputs/nsa_fwd_h1_dyn_ns_headsplit.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.headsplit
+// RUN: diff %t.headsplit.ctl %t.headsplit
+// RUN: FileCheck %s --check-prefix=HEADSPLIT < %t.headsplit
+// RUN: triton-opt %S/Inputs/nsa_fwd_h1_dyn_ns_headsplit.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o /dev/null 2> %t.headsplit.err
+// RUN: diff %t.empty %t.headsplit.err
+
+// HEADSPLIT-LABEL: tt.func public @parallel_nsa_fwd_kernel(
+// The gather loop, its scalar table read and the guarded region must all
+// survive: canonicalize drops the dead `remsi` that states H > 1, so assert the
+// shape the rule refused to rewrite instead.
+// HEADSPLIT: scf.for
+// HEADSPLIT: tt.load %{{.*}} : !tt.ptr<i64>
+// HEADSPLIT: scf.if
+
+// ---------- (i) an extra tensor load inside the gather loop ---------------
+// The rewrite replaces the whole loop body, so it can only accept bodies whose
+// every load it rebuilds: one scalar index read plus the two K/V tiles. The
+// extra load here would be dropped silently (parseIndexTable: load census).
+// RUN: triton-opt %S/Inputs/nsa_fwd_extra_loop_load.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.extra.ctl
+// RUN: triton-opt %S/Inputs/nsa_fwd_extra_loop_load.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.extra
+// RUN: diff %t.extra.ctl %t.extra
+// RUN: FileCheck %s --check-prefix=EXTRA < %t.extra
+// RUN: triton-opt %S/Inputs/nsa_fwd_extra_loop_load.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o /dev/null 2> %t.extra.err
+// RUN: diff %t.empty %t.extra.err
+
+// EXTRA-LABEL: tt.func public @parallel_nsa_fwd_kernel(
+// EXTRA: scf.for
+// EXTRA: tt.load %{{.*}} : !tt.ptr<i64>
+// EXTRA: scf.if
+
+// ---------- (j) the scalar index read carries a mask ----------------------
+// A masked entry load is not the pattern: the vector read the rewrite emits
+// has no per-iteration predicate to carry (hasLoadShape: Unmasked).
+// RUN: triton-opt %S/Inputs/nsa_fwd_masked_index_load.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.idxmask.ctl
+// RUN: triton-opt %S/Inputs/nsa_fwd_masked_index_load.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.idxmask
+// RUN: diff %t.idxmask.ctl %t.idxmask
+// RUN: FileCheck %s --check-prefix=IDXMASK < %t.idxmask
+// RUN: triton-opt %S/Inputs/nsa_fwd_masked_index_load.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o /dev/null 2> %t.idxmask.err
+// RUN: diff %t.empty %t.idxmask.err
+
+// IDXMASK-LABEL: tt.func public @parallel_nsa_fwd_kernel(
+// IDXMASK: tt.load %{{.*}}, %{{.*}} : !tt.ptr<i64>
+// IDXMASK: scf.if
+
+// ---------- (k) a second scf.if in the gather loop ------------------------
+// The rewrite replaces the single guarded region with a per-token weight, so a
+// body with two conditions has no expression in the scan form (parseBlockGuard
+// requires exactly one scf.if at loop-body top level).
+// RUN: triton-opt %S/Inputs/nsa_fwd_two_guards.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.twoguards.ctl
+// RUN: triton-opt %S/Inputs/nsa_fwd_two_guards.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.twoguards
+// RUN: diff %t.twoguards.ctl %t.twoguards
+// RUN: FileCheck %s --check-prefix=TWOGUARDS < %t.twoguards
+// RUN: triton-opt %S/Inputs/nsa_fwd_two_guards.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o /dev/null 2> %t.twoguards.err
+// RUN: diff %t.empty %t.twoguards.err
+
+// The dead second guard is folded by canonicalize, so assert the shape the rule
+// refused to rewrite: the gather loop with its scalar table read and the one
+// guarded region.
+// TWOGUARDS-LABEL: tt.func public @parallel_nsa_fwd_kernel(
+// TWOGUARDS: scf.for
+// TWOGUARDS: tt.load %{{.*}} : !tt.ptr<i64>
+// TWOGUARDS: scf.if
+
+// ---------- (l) the index table is read flat (no row base) ----------------
+// The rewrite re-creates `root + rowOffset` outside the loop and indexes that
+// vector by the iteration number. addptr(root, iv) has no row offset, so
+// table[0, S) is not a row of the table and parseTableAddress refuses.
+// RUN: triton-opt %S/Inputs/nsa_fwd_flat_index_table.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.flat.ctl
+// RUN: triton-opt %S/Inputs/nsa_fwd_flat_index_table.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.flat
+// RUN: diff %t.flat.ctl %t.flat
+// RUN: FileCheck %s --check-prefix=FLAT < %t.flat
+// RUN: triton-opt %S/Inputs/nsa_fwd_flat_index_table.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o /dev/null 2> %t.flat.err
+// RUN: diff %t.empty %t.flat.err
+
+// FLAT-LABEL: tt.func public @parallel_nsa_fwd_kernel(
+// FLAT: scf.for
+// FLAT: tt.addptr %arg6, %{{.*}} : !tt.ptr<i64>
+// FLAT: scf.if
+
+// ---------- (m) the row base depends on two axis-0 program ids ------------
+// One query position has to be chosen, because the same SSA value is required
+// by the causal predicates and the tensor mask; two reaching program ids make
+// that choice ambiguous and the matcher refuses to pick.
+// RUN: triton-opt %S/Inputs/nsa_fwd_ambiguous_pid.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.twopid.ctl
+// RUN: triton-opt %S/Inputs/nsa_fwd_ambiguous_pid.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.twopid
+// RUN: diff %t.twopid.ctl %t.twopid
+// RUN: FileCheck %s --check-prefix=TWOPID < %t.twopid
+// RUN: triton-opt %S/Inputs/nsa_fwd_ambiguous_pid.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o /dev/null 2> %t.twopid.err
+// RUN: diff %t.empty %t.twopid.err
+
+// CSE merges the two identical program-id ops, so assert the shape the rule
+// refused to rewrite instead of the duplicated op.
+// TWOPID-LABEL: tt.func public @parallel_nsa_fwd_kernel(
+// TWOPID: tt.get_program_id x : i32
+// TWOPID: scf.for
+// TWOPID: tt.load %{{.*}} : !tt.ptr<i64>
+
+// ---------- (n) the forward loop body contains a tt.trans -----------------
+// tt.trans belongs to the additive template's vocabulary (it replays the order
+// verbatim); the online-softmax template has no transpose step, so a body that
+// carries one cannot be rebuilt and checkLoopVocabulary refuses it.
+// RUN: triton-opt %S/Inputs/nsa_fwd_fwd_trans.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.fwdtrans.ctl
+// RUN: triton-opt %S/Inputs/nsa_fwd_fwd_trans.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.fwdtrans
+// RUN: diff %t.fwdtrans.ctl %t.fwdtrans
+// RUN: FileCheck %s --check-prefix=FWDTRANS < %t.fwdtrans
+// RUN: triton-opt %S/Inputs/nsa_fwd_fwd_trans.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o /dev/null 2> %t.fwdtrans.err
+// RUN: diff %t.empty %t.fwdtrans.err
+
+// The dead transpose is folded away, so assert the shape the rule refused.
+// FWDTRANS-LABEL: tt.func public @parallel_nsa_fwd_kernel(
+// FWDTRANS: scf.for
+// FWDTRANS: tt.load %{{.*}} : !tt.ptr<i64>
+// FWDTRANS: scf.if
+
+// ---------- (o) the addptr tile pads with a non-zero "other" --------------
+// The rewriter re-emits the tile load with other = 0 (the baseline's padding),
+// so a non-zero padding cannot be reproduced (hasLoadShape: MaskedZeroOther).
+// RUN: triton-opt %S/Inputs/nsa_bwd_nonzero_other.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.other.ctl
+// RUN: triton-opt %S/Inputs/nsa_bwd_nonzero_other.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.other
+// RUN: diff %t.other.ctl %t.other
+// RUN: FileCheck %s --check-prefix=OTHER < %t.other
+// RUN: triton-opt %S/Inputs/nsa_bwd_nonzero_other.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o /dev/null 2> %t.other.err
+// RUN: diff %t.empty %t.other.err
+
+// OTHER-LABEL: tt.func public @parallel_nsa_bwd_kernel_dq(
+// OTHER: scf.for
+// OTHER: scf.if
+
+// ---------- (p) the table row is wider than the 4096-slot ceiling ---------
+// S drives the width of the vector read emitted before the loop, so an unbounded
+// S would materialize an arbitrarily wide read; the i_h*S addend and the trip
+// count are raised together so the cap is what refuses.
+// RUN: triton-opt %S/Inputs/nsa_fwd_big_s.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.bigs.ctl
+// RUN: triton-opt %S/Inputs/nsa_fwd_big_s.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.bigs
+// RUN: diff %t.bigs.ctl %t.bigs
+// RUN: FileCheck %s --check-prefix=BIGS < %t.bigs
+// RUN: triton-opt %S/Inputs/nsa_fwd_big_s.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o /dev/null 2> %t.bigs.err
+// RUN: diff %t.empty %t.bigs.err
+
+// BIGS-LABEL: tt.func public @parallel_nsa_fwd_kernel(
+// BIGS: scf.for
+// BIGS: tt.load %{{.*}} : !tt.ptr<i64>
+
+// ---------- (q) the constant trip count disagrees with S ------------------
+// A constant trip count is the special case NS == S, and the matcher cross-checks
+// the two derivations of the table width (checkCrossStageAgreements).
+// RUN: triton-opt %S/Inputs/nsa_fwd_trip_mismatch.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.trip.ctl
+// RUN: triton-opt %S/Inputs/nsa_fwd_trip_mismatch.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.trip
+// RUN: diff %t.trip.ctl %t.trip
+// RUN: FileCheck %s --check-prefix=TRIP < %t.trip
+// RUN: triton-opt %S/Inputs/nsa_fwd_trip_mismatch.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o /dev/null 2> %t.trip.err
+// RUN: diff %t.empty %t.trip.err
+
+// TRIP-LABEL: tt.func public @parallel_nsa_fwd_kernel(
+// TRIP: scf.for
+// TRIP: tt.load %{{.*}} : !tt.ptr<i64>
+
+// ---------- (t) the tile-max reduce combines with min, not max ------------
+// The recurrence is recognised by its combine ops: the running maximum reduces
+// with maxnumf, the normaliser with addf. A different combiner is a different
+// recurrence even when every shape matches.
+// RUN: triton-opt %S/Inputs/nsa_fwd_min_combiner.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.minc.ctl
+// RUN: triton-opt %S/Inputs/nsa_fwd_min_combiner.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.minc
+// RUN: diff %t.minc.ctl %t.minc
+// RUN: FileCheck %s --check-prefix=MINC < %t.minc
+// RUN: triton-opt %S/Inputs/nsa_fwd_min_combiner.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o /dev/null 2> %t.minc.err
+// RUN: diff %t.empty %t.minc.err
+
+// MINC-LABEL: tt.func public @parallel_nsa_fwd_kernel(
+// MINC: "tt.reduce"
+// MINC: arith.minnumf

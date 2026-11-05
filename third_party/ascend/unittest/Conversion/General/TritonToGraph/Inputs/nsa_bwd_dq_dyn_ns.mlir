@@ -11,7 +11,7 @@
 //     tt.addptr %root, arith.addi(%rowOffset, %iv)
 // instead of the dense spelling tt.addptr %rowBase, %iv, where %rowBase =
 // tt.addptr %root, %rowOffset is hoisted out of the loop.  Both spellings are
-// the same address; matchIndexTable used to insist that the offset be exactly
+// the same address; parseIndexTable used to insist that the offset be exactly
 // the induction variable and therefore rejected this one, which left the
 // block_counts production path of the bwd dq kernel silently unmatchable.
 // POSITIVE case for the folded spelling.

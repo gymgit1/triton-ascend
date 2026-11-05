@@ -9,7 +9,7 @@
 //   * two-level tt.addptr + explicit mask — what fla/ops/nsa/parallel.py emits.
 //     Fixture: %S/Inputs/nsa_bwd_dq_const_ns.mlir.
 //
-// matchTiles() used to accept only the second one ("The additive form: no mptr
+// parseTiles() used to accept only the second one ("The additive form: no mptr
 // at all"), so the rule matched the fixture and silently declined on every real
 // bwd dq kernel: `selected-block-scan: stage tiles declined`, function
 // byte-identical.  These RUN lines pin both spellings down.

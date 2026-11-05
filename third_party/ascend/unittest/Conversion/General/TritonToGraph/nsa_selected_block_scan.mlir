@@ -153,7 +153,7 @@
 // Rule A used to DECLINE that shape -- it was section (g) of
 // nsa_selected_block_scan_negative.mlir, i.e. the fixture used to pin a refusal.
 // The additive branch (matcher classification by the number of iter_args,
-// matchAddPtrTile, and the exp -> where -> *w -> (do v - delta) -> truncf ->
+// parseAddPtrTile, and the exp -> where -> *w -> (do v - delta) -> truncf ->
 // dot(ds, trans(k), acc) builder) landed and was accepted on 2026-11-02, so the
 // fixture moves HERE: (g) is deleted from the negative file and BWDREW below is
 // the fingerprint of the rewritten additive form.  BWDREW re-asserts what
@@ -461,7 +461,7 @@
 //     tt.addptr %root, arith.addi(%rowOffset, %iv)
 // The dense kernels keep it as a separate SSA value instead:
 //     tt.addptr %rowBase, %iv      (%rowBase = tt.addptr %root, %rowOffset)
-// The address is the same, but matchIndexTable used to insist that the offset be
+// The address is the same, but parseIndexTable used to insist that the offset be
 // exactly the induction variable, so this spelling was rejected -- which left the
 // block_counts production path of the bwd dq kernel silently unmatchable.
 // Inputs/nsa_bwd_dq_dyn_ns.mlir is exactly that IR.  The rewrite re-creates the
@@ -498,7 +498,7 @@
 // loop-invariant scalar loads before the loop are 2 token_indices_q + 2
 // cu_seqlens_q + 2 cu_seqlens_k + 1 block_counts = 7, not the 6 of the pure
 // varlen prefix.  The skeleton budget used to be six and rejected the whole
-// dispatch before matchIndexTable ran.  Inputs/nsa_fwd_varlen_bc.mlir is that IR.
+// dispatch before parseIndexTable ran.  Inputs/nsa_fwd_varlen_bc.mlir is that IR.
 // RUN: triton-opt %S/Inputs/nsa_fwd_varlen_bc.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.varlenbc.ctl
 // RUN: triton-opt %S/Inputs/nsa_fwd_varlen_bc.mlir -graph-optimize='rule-mask=65536 selected-block-scan-force-apply=true' -canonicalize -cse -o %t.varlenbc
 // RUN: FileCheck %s --check-prefix=VARLENBCREW < %t.varlenbc
