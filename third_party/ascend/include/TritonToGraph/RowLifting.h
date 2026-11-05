@@ -57,6 +57,15 @@ bool dependsOnValue(Value v, Value pid);
 // dependent even though the dependence is not carried by a top-level operand.
 bool isPidInvariant(Value value, Value pid);
 
+// 读取整数常量（符号扩展）；不是常量时返回 nullopt。
+// Reads an integer constant with sign extension; nullopt when it is not one.
+std::optional<int64_t> getConstantIntValue(Value v);
+
+// 单个元素的存储字节数：指针按 8 字节，未知元素类型返回 0。
+// Storage bytes of one element: pointers take eight bytes, an unknown element
+// type returns 0.
+int64_t getElementStorageBytes(Type element);
+
 // 标量表达式在 `pid` 取 `[0, grid - 1]` 时的有符号取值范围。`grid` 非正
 // 表示运行期范围，此时按整个非负 i32 区间证明。
 // Signed range of a scalar expression over `pid` taken from `[0, grid - 1]`.
@@ -83,7 +92,7 @@ std::optional<IntegerBounds> inferMonotonicBounds(Value value, Value pid,
 // 「单调但无范围」处理，不单独区分 pid 无关）。
 // 与 pid 有关的链只要语法上单调非降即可通过：末行上界由运行期重新求值得到，
 // 证明器不必给出数值范围；范围放不进表达式位宽时也按「单调」接受，只有需要
-// 按 hi 定表宽的下标表提升才要求 `inferMonotonicBounds` 返回具体范围。
+// 按上界算出具体宽度的调用方才要求 `inferMonotonicBounds` 返回具体范围。
 // Boolean form of the bound proof for callers that only need "the last row
 // supplies the maximum".  A pid-invariant value is constant across the lifted
 // rows, so a bound produced by a `tt.reduce` of invariant sources, or by an
@@ -91,8 +100,9 @@ std::optional<IntegerBounds> inferMonotonicBounds(Value value, Value pid,
 // A pid-dependent chain only has to be syntactically monotone non-decreasing:
 // the last row's bound is re-evaluated at run time, so no numeric range is
 // needed; a range that does not fit the expression's bit width still counts as
-// monotone, and only index-table lifting (which sizes its table from `hi`)
-// requires the concrete range returned by `inferMonotonicBounds`.
+// monotone, and only callers that size something from the proven `hi`
+// (DotRowCoalescing) require the concrete range returned by
+// `inferMonotonicBounds`.
 bool isMonotoneInPid(Value value, Value pid, int64_t grid);
 
 // 引擎尚未支持的各类模式的开关。所有开关默认关闭，未置位的能力会保持
@@ -117,11 +127,6 @@ struct RowLiftFeatures {
   // A row-dependent load in the loop body, rebuilt under the per-row active
   // mask so a row whose scan already ended never touches memory.
   bool maskedLoad = false;
-  // 循环体内的标量下标表读被提升为每个 program 一次带掩码的 [R,S] 向量
-  // 读，循环体只负责从中提取 [R] 列。
-  // A scalar index-table read in the loop body is hoisted into one masked
-  // [R,S] vector read per program; the body only extracts its [R] column.
-  bool tableRead = false;
   // 输出累加器过宽，需要沿宽度拆成两半。
   // The output accumulator is too wide and must be split along its width.
   bool splitWideAccumulator = false;
@@ -232,15 +237,13 @@ struct RowLiftCandidate {
   Operation *anchor = nullptr;
   int64_t rowsPerProgram = 1;
   bool runtimeGrid = false;
-  // 静态启动网格；运行期范围为 0。静态值让下标表读能在编译期确定列宽。
-  // Static launch grid, or zero for a runtime extent.  A static value is what
-  // lets the index-table read pick its column extent at compile time.
+  // 静态启动网格；运行期范围为 0。非 0 时逐行有效位可按静态网格裁剪，
+  // 行数决策也用它做 `grid/R >= coreNum` 的核数约束。
+  // Static launch grid, or zero for a runtime extent.  A static value lets the
+  // per-row validity mask be trimmed against the launch grid and is what the
+  // row-count decision uses for its `grid/R >= coreNum` constraint.
   int64_t grid = 0;
   RowLiftFeatures features;
-  // 最宽的原始 dot M 维，供单值预算与拆分判据按「提升后的 M」换算。
-  // Widest original dot M dimension, used to derive the lifted M dimension that
-  // the per-value budget and the split predicate are expressed in.
-  int64_t maxDotRows = 1;
   // 单个提升进位值的字节预算，超过即由 splitWideAccumulator 能力对半拆分。
   // 规则 B 用「提升后的 M × 每个值一行一个向量寄存器」重新设定它，于是末维
   // 超过一个向量寄存器的累加器会被对半拆开，阈值不再是写死的列数。
@@ -258,15 +261,6 @@ struct RowLiftCandidate {
 // These predicates only inspect the IR.  A rule's matcher uses them to decline
 // a shape before a sandbox clone and verify, and the rewrite path evaluates the
 // same predicate again so both stages cannot drift apart.
-
-// 能否把循环内所有标量表读提升成每个 program 一次带掩码的 [R,S] 读：表读必须
-// 是 `load(base + iv)` 且地址单用户，base 是整数元素标量指针并在提升后带行维，
-// 上界可证且静态列宽不超过 kMaxTableColumns。没有标量表读时返回 true，因为
-// 这种循环不需要列宽。
-// True when every scalar table read in `loop` can be hoisted into one masked
-// [R,S] read per program.  A loop without scalar table reads needs no column
-// extent and passes.
-bool canHoistTableReads(scf::ForOp loop, const RowLiftCandidate &candidate);
 
 // 能否把块指针展开成显式指针张量：pointee 是静态形状的 RankedTensor，
 // offset/shape/stride 的元素都是整数。`enabled` 对应 tensorPointer 能力开关。
@@ -394,25 +388,6 @@ private:
   // No row dimension is inserted, because the split path hands in half-width
   // masks.
   Value mergeMasks(Value pointer, Value base, ArrayRef<Value> parts, bool &ok);
-  // 循环外提升的标量下标表读：每个 program 一次带掩码的 [R,S] 向量读，
-  // 每次迭代只提取对应的 [R] 列。
-  // A scalar index table read hoisted out of the loop: one masked [R,S]
-  // vector read per program, with its [R] column extracted per iteration.
-  struct TableRead {
-    Value table;    // [R,S] 值，被掩码排除的位置为 0
-    Value zero;     // [R,S] 全零，用于清掉未选中的列
-    Value columns;  // [S] 表列下标
-  };
-
-  // 为 `old` 规划循环外下标表读；返回 false 表示拒绝整个循环的提升。
-  // Plan the hoisted reads for `old`; false declines the whole loop.
-  bool planTableRead(scf::ForOp old);
-  // 用 one-hot 选择与行求和，从 [R,S] 表中取出第 `iv` 列。
-  // Extract column `iv` of the [R,S] table with a one-hot select and row sum.
-  Value extractTableColumn(const TableRead &read, Value iv);
-  // 用整数 add 组合子在 `axis` 上求和。
-  // Sum `value` along `axis` with an integer add combiner.
-  Value sumAlongAxis(Location loc, Value value, int64_t axis);
   // `iv < ub` 广播到所有提升行；循环体内每个与行相关的访存都在它下面重建。
   // `iv < ub` splatted over the lifted rows; every row-dependent memory
   // access in the loop body is rebuilt under it.
@@ -545,16 +520,9 @@ private:
   // Scalar values evaluated at the last row to form the shared loop bound.
   IRMapping lastRowMapping;
   Value validRows;
-  // 循环外读取一次的标量下标表，按原始循环体读取的列地址索引。
-  // Scalar index tables read once before the loop, keyed by the column address
-  // the original body loaded from.
-  DenseMap<Value, TableRead> columnTables;
-  // 重建后循环的归纳变量（供下标表列提取使用）与由它导出的逐行有效掩码；
-  // 掩码为空表示当前循环尚未生成。
-  // Induction variable of the rebuilt loop (used by index-table column
-  // extraction) and the per-row validity mask derived from it; an empty mask
-  // means the current loop has not materialised one yet.
-  Value loopInductionVar;
+  // 重建后循环的逐行有效掩码；为空表示当前循环尚未生成。
+  // Per-row validity mask of the rebuilt loop; an empty mask means the current
+  // loop has not materialised one yet.
   Value rowActiveMask;
   // 循环进位值中的哪些要被拆半，在重建函数体之前就已确定：描述符可能位于
   // 循环之外，必须先拆再展开。

@@ -47,8 +47,6 @@ namespace mlir {
 namespace triton {
 namespace cfg {
 
-// 行提升公共引擎（规则 A「顺序扫描」与规则 B「下标表合并」共用）。
-//
 // 本文件把「一个 program 只处理一行查询」的函数体重建为「一个 program
 // 处理 R 行查询」：所有与查询行相关的值在类型最前面插入行维 [R]，循环用
 // 末行的上界作为组内共享 trip count，组内各行的差异由逐行有效掩码表达。
@@ -58,8 +56,8 @@ namespace cfg {
 //   2. tt.reduce 与条件与行号无关的 scf.if：rewriteReduce / rewriteIfOp。
 //   3. Q、O 的 tensor pointer 展开成指针张量：rewriteTensorPointer，以及
 //      描述符 load/store 的重建。
-//   4. 下标表改成每行一份地读：planTableRead 在循环外做一次带掩码的 [R,S]
-//      整表读，循环内 extractTableColumn 只提取 [R] 列切片。
+//   4. 下标表改成每行一份地读：循环体内与行相关的 load 在逐行有效掩码下
+//      各自读取自己那一份（步骤 4b），不做整表提升。
 //   5. O 与 lse 的带掩码写回：maskedStore 能力 + rewriteDescriptorStore，
 //      循环内保持压平形状，不出现逐轮 reshape。
 //   6. 输出累加器过宽时沿宽度拆成两半：planWideAccumulatorSplits 与四个
@@ -70,12 +68,6 @@ namespace cfg {
 // 约定：RowLiftFeatures 中的能力开关全部默认关闭，未置位的能力走原有的
 // 失败关闭路径；DotRow 规则不置位任何新开关，因此其输出与基线指令序列
 // 逐字节一致。
-
-// 循环外下标表读的列宽上限。整张表每个 program 只物化一次，列数按上界
-// 取 2 的幂，这里限制它不应超过 1024；行数已由单值字节预算约束。
-// A hoisted index table is materialised once per program, so cap its column
-// extent; the row count is already bounded by the per-value byte budget.
-constexpr int64_t kMaxTableColumns = 1024;
 
 // 判断 v 是否等于 pid 或由 pid 的顶层计算链产生；不深入 region。
 bool dependsOnValue(Value v, Value pid) {
@@ -127,8 +119,8 @@ bool isPidInvariant(Value value, Value pid) {
   return !hasPidDependency(value, pid, visited);
 }
 
-// 读取整数常量；不是常量时返回 nullopt。
-static std::optional<int64_t> getConstantIntValue(Value v) {
+// 读取整数常量；不是常量时返回 nullopt。规则 matcher 与重写路径共用。
+std::optional<int64_t> getConstantIntValue(Value v) {
   APInt value;
   if (matchPattern(v, m_ConstantInt(&value)))
     return value.getSExtValue();
@@ -141,8 +133,8 @@ static std::optional<int64_t> getConstantIntValue(Value v) {
 //   Monotone  —— 已证明关于 pid 单调非降，但没有可用的数值范围。幅度未知的
 //                项（例如对已加载 tile 做 tt.reduce 得到的标量）与范围放不进
 //                表达式位宽，都归入此态；
-//   Bounded   —— 给出了具体数值范围，末行取值可作循环上界；下标表提升要按
-//                hi 定表宽，也只接受此态。
+//   Bounded   —— 给出了具体数值范围，末行取值可作循环上界；需要按上界算出
+//                具体宽度的调用方只接受此态。
 // 行提升只需要「末行取值是组内最大」这一单调性，末行上界是在运行期用原表达式
 // 重新求值得到的，不依赖证明器算出的数值，所以 Monotone 已经够用。
 // A pid-independent term only shifts the chain by a constant, which keeps the
@@ -150,8 +142,8 @@ static std::optional<int64_t> getConstantIntValue(Value v) {
 // loaded tile, for instance).  That case and a range that does not fit the
 // expression's bit width are both reported as `Monotone`: row lifting only needs
 // the last row's value to be the group maximum, which is re-evaluated from the
-// original expression at run time.  Only index-table lifting needs `Bounded`,
-// because it sizes the per-row table from the proven `hi`.
+// original expression at run time.  Only callers that have to size something
+// from the proven `hi` (DotRowCoalescing) ask for `Bounded`.
 enum class BoundKind { None, Monotone, Bounded };
 
 struct BoundProof {
@@ -175,9 +167,10 @@ static BoundProof proveBound(Value value, Value pid, int64_t grid);
 // Narrow a bounded result to the bit width of the expression it came from.
 // A range that does not fit the expression's width cannot be used as a numeric
 // bound, but the chain is still syntactically monotone, so the result degrades
-// to `Monotone` instead of failing: only index-table lifting needs the range.
+// to `Monotone` instead of failing: row lifting only needs monotonicity, and
+// only callers that size something from `hi` (DotRowCoalescing) need the range.
 // 把有界证明收窄到表达式位宽；范围放不进该位宽时退化为「单调但无范围」，
-// 供行提升使用；需要数值范围的调用方（下标表提升）自行要求 Bounded。
+// 供行提升使用；需要按上界算出具体宽度的调用方自行要求 Bounded。
 static BoundProof checkWidth(Value value, BoundProof proof) {
   if (proof.kind != BoundKind::Bounded)
     return proof;
@@ -190,8 +183,36 @@ static BoundProof checkWidth(Value value, BoundProof proof) {
   return proof;
 }
 
-// 证明 value 关于 pid 单调非降：区分无证明、仅有单调性、pid 无关常量与
-// 有数值范围四种情况。
+// 为什么需要这条单调性证明：一次行提升把同一个程序负责的 R 个连续 pid 折成
+// 一维行，而原循环的 trip count 由 pid 决定，合并后的循环却只能有一个上界。
+// 取组内最后一个 pid（末行）的上界取值来跑这条合并循环是正确的，当且仅当该
+// 上界随 pid 单调非降：只要中间某行比末行大，用末行取值就会截断那一行的循环，
+// 结果从「少算几次迭代」直接变成错误数据。
+// 单调性还不足以单独成立：语法上递增的链在中间整数运算回绕时会翻转，所以能给出
+// 范围时顺带证明不溢出。给不出范围（含幅度未知的项，或范围放不进表达式位宽）时
+// 仍按 Monotone 接受，因为末行上界不是证明器的数值，而是在运行期用原表达式在末行
+// 取值上重新求值（见 RowLiftBuilder::run 里的 lastRowMapping）。只有需要具体范围的
+// 调用方（DotRowCoalescing）才把 Monotone 当作拒绝理由。
+// 作用：沿参与上界计算的标量算术切片递归证明 `value` 关于 `pid` 单调非降，返回
+// 三态结果 None / Monotone / Bounded，供规则 A 与 RowCoalescing 的 matcher 在匹配
+// 阶段就拒绝无法保证正确性的循环，使不合法的形态进不了重写路径。
+// Why this monotonicity proof is required: one lift folds the R consecutive pids
+// a program owns into a row dimension, but the original loop's trip count varies
+// with pid while the merged loop can carry only one upper bound.  Using the last
+// row's bound value is correct only when the bound is monotone non-decreasing in
+// pid; any earlier row with a larger bound would have its loop truncated, which is
+// wrong data rather than merely fewer iterations.  Monotonicity alone is not
+// enough: a syntactically increasing chain flips once an intermediate integer
+// operation wraps, so a proven range also rules out wrapping.  A chain with no
+// usable range (an unknown-magnitude term, or a range that does not fit the
+// expression's bit width) is still accepted as `Monotone`, because the last-row
+// bound is re-evaluated at run time from the original expression instead of
+// taken from the prover (see lastRowMapping in RowLiftBuilder::run).  Only callers
+// that need a concrete range (DotRowCoalescing) treat `Monotone` as grounds for
+// rejection.  What it does: recurse over the scalar arithmetic slice that feeds
+// the bound and report one of None / Monotone / Bounded, so the rule A and
+// RowCoalescing matchers can reject unsafe loops at match time and keep them out
+// of the rewrite path.
 static BoundProof proveBound(Value value, Value pid, int64_t grid) {
   // 基例一：pid 本身，范围就是 [0, grid - 1]（grid 非正表示运行期范围）。
   if (value == pid)
@@ -491,7 +512,7 @@ int64_t selectRowsPerProgram(int64_t grid, int64_t maxDotRows,
 }
 
 // 返回单个元素的字节数；未知元素类型返回 0。
-static int64_t getElementBytes(Type element) {
+int64_t getElementStorageBytes(Type element) {
   if (auto integer = dyn_cast<IntegerType>(element))
     return (integer.getWidth() + 7) / 8;
   if (auto floatType = dyn_cast<FloatType>(element))
@@ -503,7 +524,7 @@ static int64_t getElementBytes(Type element) {
 
 // 返回张量总字节数；元素类型未知时返回 0。
 static int64_t getTensorBytes(RankedTensorType type) {
-  int64_t bytes = getElementBytes(type.getElementType());
+  int64_t bytes = getElementStorageBytes(type.getElementType());
   if (bytes == 0)
     return 0;
   for (int64_t extent : type.getShape())
@@ -515,6 +536,16 @@ static int64_t getTensorBytes(RankedTensorType type) {
 RowLiftBuilder::RowLiftBuilder(IRRewriter &rewriter, RowLiftCandidate candidate)
     : rewriter(rewriter), candidate(candidate), features(candidate.features) {}
 
+// 运行期网格把 x 轴 extent 作为倒数第二个隐藏参数追加在函数参数尾部
+// （末尾一个是 y 轴 extent）。参数布局由 ProgramGridTransform 定义，这里集中
+// 一处取用，避免布局变化时两处静默错位。
+// A runtime grid appends the x extent as the second-to-last hidden argument (the
+// last one is the y extent).  ProgramGridTransform owns that layout; fetching it
+// in one place keeps a layout change from silently mis-indexing both call sites.
+static Value getRuntimeGridExtent(Block *body) {
+  return body->getArgument(body->getNumArguments() - 2);
+}
+
 // 克隆函数体并逐条重建，成功时用新函数体替换旧函数体并返回 true。
 //
 // 重建的单位是「函数级」而不是单条指令：先把原 block 的每条指令按行提升
@@ -523,7 +554,14 @@ bool RowLiftBuilder::run(triton::FuncOp fn) {
   Block *old = &fn.getBody().front();
   // 原循环的起始上界。整组的 trip count 由末行取值决定，因此重建过程中
   // 需要知道哪些标量参与了这个上界的计算（见下方的末行切片克隆）。
-  scf::ForOp loop = *old->getOps<scf::ForOp>().begin();
+  // 公共引擎要求函数体内恰好有一个循环；没有循环时直接拒绝，避免解引用
+  // 空迭代器（调用方的 matcher 虽然已经保证 loops==1，但这里仍按 API 契约判空）。
+  auto loops = old->getOps<scf::ForOp>();
+  if (loops.empty()) {
+    LLVM_DEBUG(llvm::dbgs() << "row-lift: no loop to lift\n");
+    return false;
+  }
+  scf::ForOp loop = *loops.begin();
   Value upperBound = loop.getUpperBound();
   // 累加器拆分必须在重写任何指令之前定下来：要拆半的描述符可能位于循环
   // 之前，一旦先按整宽展开成指针张量，就无法再按半宽重建。
@@ -565,7 +603,7 @@ bool RowLiftBuilder::run(triton::FuncOp fn) {
               op.getLoc(), candidate.rowsPerProgram - 1, 32));
       // 运行期网格下组内末行可能越界，此处钳到 extent - 1，避免上界越界。
       if (candidate.runtimeGrid) {
-        Value extent = fresh->getArgument(fresh->getNumArguments() - 2);
+        Value extent = getRuntimeGridExtent(fresh);
         Value lastValid = rewriter.create<arith::SubIOp>(
             op.getLoc(), extent,
             rewriter.create<arith::ConstantIntOp>(op.getLoc(), 1, 32));
@@ -585,12 +623,12 @@ bool RowLiftBuilder::run(triton::FuncOp fn) {
       // 运行期网格下，再用「组内行号 < 剩余行数」得到逐行有效掩码，
       // 后续所有与行相关的访存都要在它之下重建。
       if (candidate.runtimeGrid) {
-        Value extent = fresh->getArgument(fresh->getNumArguments() - 2);
+        Value extent = getRuntimeGridExtent(fresh);
         // 逐行有效位写成「纯组内行号 vs 标量上界」：base + lanes < extent 等价于
         // lanes < extent - base，这样比较的左侧是纯 make_range（静态偏移），
         // 右侧是单值，掩码分析可以把它折叠成一个矩形区域，而不是一条带动态
-        // 基址的算术链。行号本身（valueMapping）仍然是 base + lanes，作为表读
-        // 的行下标保留。
+        // 基址的算术链。行号本身（valueMapping）仍然是 base + lanes，作为逐行
+        // 访存的行下标保留。
         // Spell the row-validity as "pure in-group lane range vs a scalar bound":
         // base + lanes < extent is the same as lanes < extent - base, and the
         // left-hand side becomes a plain make_range with a static offset so the
@@ -646,12 +684,33 @@ bool RowLiftBuilder::run(triton::FuncOp fn) {
   return true;
 }
 
+// 掩码访存的填充值：PAD_NAN 要求浮点元素类型，用 NaN 常量再广播成结果形状，
+// 与描述符访存路径保持同一语义；其余 padding 选项沿用零值。非浮点元素上
+// 请求 PAD_NAN 时返回空值，由调用方拒绝。
+// Padding value of a masked access: PAD_NAN needs a floating element type and
+// splats a NaN, matching the descriptor path; every other padding option keeps
+// zero.  PAD_NAN on a non-float element returns null and the caller declines.
+static Value buildMaskPadding(IRRewriter &rewriter, Location loc, Type type,
+                              std::optional<triton::PaddingOption> padding) {
+  auto tensor = dyn_cast<RankedTensorType>(type);
+  Type element = tensor ? tensor.getElementType() : type;
+  if (padding != triton::PaddingOption::PAD_NAN)
+    return rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(type));
+  auto floatType = dyn_cast<FloatType>(element);
+  if (!floatType)
+    return Value();
+  Value nan = rewriter.create<arith::ConstantOp>(
+      loc, rewriter.getFloatAttr(
+               floatType, APFloat::getNaN(floatType.getFloatSemantics())));
+  return tensor ? Value(rewriter.create<triton::SplatOp>(loc, type, nan)) : nan;
+}
+
 // 按操作种类分派重建；遇到尚未支持的形态返回 false，整次提升随即回退。
 //
 // 派发顺序带有语义，不能随意调整：
 //   0) scf.for 先处理，循环重写会一次性重建所有循环进位值；
-//   1) 「已被拆成两半的值」与「已提升的下标表读」必须早于通用依赖探测，
-//      否则探测会去查不存在的全宽映射，克隆出非法操作数；
+//   1) 「已被拆成两半的值」必须早于通用依赖探测，否则探测会去查不存在的
+//      全宽映射，克隆出非法操作数；
 //   2) 依赖探测：与查询行无关的指令直接克隆，与行相关的才需要特化；
 //   3) 带 region 的形态（tt.reduce / tt.make_tensor_ptr / scf.if）逐个重建；
 //   4) 描述符访存、循环内行相关访存、dot / splat / expand / reshape / trans
@@ -687,32 +746,6 @@ bool RowLiftBuilder::rewrite(Operation *op) {
   if (llvm::any_of(op->getOperands(),
                    [&](Value v) { return splitValues.contains(v); }))
     return rewriteSplitOp(op);
-
-  // 步骤 1b：下标表读已在循环外完成，循环内的列读变成列提取而不是访存。
-  // 这里必须早于依赖探测，因为被服务的 load 地址本身与行相关，探测会把
-  // 它当作普通指令克隆，从而留下未映射的操作数。
-  // A hoisted index table has already been read before the loop, so its column
-  // load becomes a column extraction instead of a memory access.  The lookup
-  // runs before the dependence probe because the served load's address is
-  // itself row-dependent and would otherwise be cloned as an unmapped operand.
-  if (auto load = dyn_cast<triton::LoadOp>(op)) {
-    auto table = columnTables.find(load.getPtr());
-    if (table != columnTables.end()) {
-      // 列提取需要循环归纳变量，不在循环内时无法构造，直接拒绝。
-      if (!loopInductionVar)
-        return false;
-      valueMapping.map(load.getResult(),
-                       extractTableColumn(table->second, loopInductionVar));
-      return true;
-    }
-  }
-  // 表读一旦改由循环外的整表读服务，原来的列地址计算就没有使用者了；
-  // 只要它确实只有一个使用者就允许删除，返回 true 表示「本条无需重建」。
-  // The column address computation is dead once its only use, the table load,
-  // is served by the hoisted read.
-  if (auto add = dyn_cast<triton::AddPtrOp>(op))
-    if (columnTables.contains(add.getResult()))
-      return add.getResult().hasOneUse();
 
   // 步骤 2：判断本指令是否与查询行相关。
   //   descriptor —— 操作数是已展开的块指针，必须走描述符访存路径；
@@ -799,8 +832,10 @@ bool RowLiftBuilder::rewrite(Operation *op) {
       Value other =
           load.getOther()
               ? broadcastFullValue(ensureRowDimension(load.getOther()), type)
-              : Value(rewriter.create<arith::ConstantOp>(
-                    op->getLoc(), rewriter.getZeroAttr(type)));
+              : buildMaskPadding(rewriter, op->getLoc(), type,
+                                 load.getPadding());
+      if (!other)
+        return false;
       auto replacement = rewriter.create<triton::LoadOp>(
           op->getLoc(), pointer, mask, other, load.getBoundaryCheck(),
           load.getPadding(), load.getCache(), load.getEvict(),
@@ -896,8 +931,10 @@ bool RowLiftBuilder::rewrite(Operation *op) {
       auto type = getLiftedType(load.getType());
       Value other = load.getOther()
                         ? ensureRowDimension(load.getOther())
-                        : rewriter.create<arith::ConstantOp>(
-                              op->getLoc(), rewriter.getZeroAttr(type));
+                        : buildMaskPadding(rewriter, op->getLoc(), type,
+                                           load.getPadding());
+      if (!other)
+        return false;
       auto replacement = rewriter.create<triton::LoadOp>(
           op->getLoc(), pointer, mask, other, load.getBoundaryCheck(),
           load.getPadding(), load.getCache(), load.getEvict(),
@@ -926,6 +963,14 @@ bool RowLiftBuilder::rewrite(Operation *op) {
           store.getBoundaryCheck(), store.getCache(), store.getEvict());
       return true;
     }
+    // 循环体内没有掩码的 store 必须失败关闭：提升后的循环跑到组内末行上界，
+    // 扫描已提前结束的行在本轮仍会执行到这条 store，通用克隆会把整段
+    // [R, ...] 写回，而它们的结果本应保持旧值。
+    // An unmasked store inside the loop has to fail closed: the lifted loop runs
+    // to the group's last-row bound, so rows whose scan already ended still reach
+    // this store, and the generic clone would write the whole [R, ...] block back.
+    if (op->getParentOfType<scf::ForOp>() && !store.getMask())
+      return false;
   }
 
   // 步骤 5：通用克隆。操作数统一补行维，结果类型统一在首部插入 [R]。
@@ -1005,16 +1050,15 @@ Value RowLiftBuilder::mergeMasks(Value pointer, Value base, ArrayRef<Value> part
   return mask;
 }
 
-// 把原循环重建为多行循环：规划表读与累加器拆分，并用末行上界生成新循环。
+// 把原循环重建为多行循环：先规划累加器拆分，再用末行上界生成新循环。
 //
 // 重建步骤：
 //   1) 循环进位值先补行维，作为新循环的初始值；
-//   2) 下标表读规划必须在循环体重建之前完成，因为它会改写 load 的语义；
-//   3) 累加器拆分规划也必须在建循环之前完成，因为它会改变进位值个数；
-//   4) 新循环的 trip count 取「末行上界」，单调性由 matcher 已证明；
-//   5) 循环体逐条重建；maskedLoad 需要先准备好逐行有效掩码；
-//   6) 循环末尾用有效行掩码选择「本轮新值 / 上一轮值」；
-//   7) 循环结果写回映射；拆分的累加器以成对结果继续向后传递。
+//   2) 累加器拆分规划必须在建循环之前完成，因为它会改变进位值个数；
+//   3) 新循环的 trip count 取「末行上界」，单调性由 matcher 已证明；
+//   4) 循环体逐条重建；maskedLoad 需要先准备好逐行有效掩码；
+//   5) 循环末尾用有效行掩码选择「本轮新值 / 上一轮值」；
+//   6) 循环结果写回映射；拆分的累加器以成对结果继续向后传递。
 bool RowLiftBuilder::rewriteLoop(scf::ForOp old) {
   // 已展开成指针张量的块指针不能作为循环进位值：展开时已删掉描述符，
   // 循环里没有它的等价物。
@@ -1024,21 +1068,13 @@ bool RowLiftBuilder::rewriteLoop(scf::ForOp old) {
     if (liftedDescriptors.contains(arg))
       return false;
 
-  // 每个循环从头开始，清空上一个循环遗留的归纳变量与有效行掩码。
+  // 每个循环从头开始，清空上一个循环遗留的有效行掩码。
   rowActiveMask = Value();
-  loopInductionVar = Value();
 
-  // 步骤 2：把循环体内的标量下标表读提升为循环外一次带掩码的 [R,S] 整表
-  // 读，循环体只提取列、不再访存。
-  // The scalar index-table reads are hoisted into one masked [R,S] vector read
-  // per program, so the body only extracts its column and touches no memory.
-  if (features.tableRead && !planTableRead(old))
-    return false;
-
-  // 步骤 1+3：原循环的进位值统一补上行维；哪些累加器要拆半已在 run 里定下
+  // 步骤 1+2：原循环的进位值统一补上行维；哪些累加器要拆半已在 run 里定下
   // （描述符必须先于展开拆半），新循环要为每个拆半值携带两个进位值。拆半
   // 初值直接从原始进位值算，避免对已提升值再做一次行维提升。
-  // Step 1+3: every carried value gains the row dimension; the accumulators
+  // Step 1+2: every carried value gains the row dimension; the accumulators
   // planned for halving in `run` become two loop-carried values.  A split
   // initial value is derived from the original one, never from its lifted copy.
   SmallVector<int64_t> splitIndices(plannedSplitIndices.begin(),
@@ -1063,7 +1099,7 @@ bool RowLiftBuilder::rewriteLoop(scf::ForOp old) {
     }
   }
 
-  // 步骤 4：末行上界必须已经物化到 lastRowMapping（run 里克隆的标量上界
+  // 步骤 3：末行上界必须已经物化到 lastRowMapping（run 里克隆的标量上界
   // 切片产生），否则说明上界被不支持的 region 包住，本次提升放弃。
   // The monotonic upper-bound proof means the last row supplies the maximum.
   // A bound whose last-row copy was not materialised (for example because it
@@ -1078,7 +1114,6 @@ bool RowLiftBuilder::rewriteLoop(scf::ForOp old) {
       lastRowMapping.lookup(old.getUpperBound()), getMappedValue(old.getStep()),
       loopInit);
   loop->setAttrs(old->getAttrs());
-  loopInductionVar = loop.getInductionVar();
 
   // 归纳变量与各进位值的映射：拆分值登记到 splitValues，普通值登记到
   // valueMapping。
@@ -1093,7 +1128,7 @@ bool RowLiftBuilder::rewriteLoop(scf::ForOp old) {
   }
 
   rewriter.setInsertionPointToStart(loop.getBody());
-  // 步骤 5：循环体内与行相关的访存需要逐行有效掩码，因此必须在重建循环体
+  // 步骤 4：循环体内与行相关的访存需要逐行有效掩码，因此必须在重建循环体
   // 之前就准备好。
   // A row-dependent body access needs the per-row mask, so it has to be
   // available before the body is rebuilt.
@@ -1110,7 +1145,7 @@ bool RowLiftBuilder::rewriteLoop(scf::ForOp old) {
     rowActiveMask = createLoopActiveMask(old, loop);
   Value active = rowActiveMask;
 
-  // 步骤 6：对「原循环在本轮没有执行」的行，保持上一轮的值不变（同时保留
+  // 步骤 5：对「原循环在本轮没有执行」的行，保持上一轮的值不变（同时保留
   // NaN/Inf 语义）。掩码为假时选 previous。
   // Retain exactly the previous accumulator for rows whose original loop did
   // not execute this iteration (also preserves NaN/Inf behavior).
@@ -1150,7 +1185,7 @@ bool RowLiftBuilder::rewriteLoop(scf::ForOp old) {
   rewriter.setInsertionPointToEnd(loop.getBody());
   rewriter.create<scf::YieldOp>(old.getLoc(), output);
 
-  // 步骤 7：循环结果回填映射。拆分的累加器以成对结果离开循环，后续 store
+  // 步骤 6：循环结果回填映射。拆分的累加器以成对结果离开循环，后续 store
   // 可以按同样方式拆它的指针，而不必重建全宽值。
   for (auto [index, result] : llvm::enumerate(old.getResults())) {
     auto [start, count] = ranges[index];
@@ -1180,205 +1215,6 @@ Value RowLiftBuilder::createLoopActiveMask(scf::ForOp old, scf::ForOp loop) {
       ensureRowDimension(old.getUpperBound()));
 }
 
-// 判断 `base` 在提升后是否会带上行维：与查询行相关的值会被提升，循环进位值
-// 无论是否与行相关都会被强制提升（与 RowLiftBuilder 的 lifted 集合一致）。
-// A value carries the row dimension after lifting when it depends on the query
-// row; loop-carried values are lifted unconditionally, matching the matcher's
-// lifted set.
-static bool willCarryRowDimension(Value base, scf::ForOp loop, Value pid) {
-  if (dependsOnValue(base, pid))
-    return true;
-  if (auto argument = dyn_cast<BlockArgument>(base))
-    return argument.getOwner()->getParentOp() == loop.getOperation();
-  return false;
-}
-
-// 下标表提升的完整判据。规则 matcher 与 planTableRead 都调用它：matcher 用它
-// 在匹配阶段拒绝提升不了的形态，重写路径用它保证自己独立成立。
-// The complete predicate for index-table hoisting, called by both the rule's
-// matcher and planTableRead.
-bool canHoistTableReads(scf::ForOp loop, const RowLiftCandidate &candidate) {
-  SmallVector<triton::LoadOp> tableLoads;
-  for (Operation &op : loop.getBody()->without_terminator()) {
-    auto load = dyn_cast<triton::LoadOp>(&op);
-    if (load && !isa<RankedTensorType>(load.getType()))
-      tableLoads.push_back(load);
-  }
-  // 没有标量表读的循环不需要列宽，因此不因上界不可证而拒绝。
-  // A loop without a scalar table read needs no column extent.
-  if (tableLoads.empty())
-    return true;
-
-  // 列宽来自上界证明：表读能力必须与 reduce 能力同时开启，且运行期网格
-  // 没有静态 trip count，无法给出列宽。
-  // The column extent comes from the bound proof: the table-read capability
-  // rides on `reduce`, and a runtime grid has no static trip count.
-  if (!candidate.features.tableRead || !candidate.features.reduce ||
-      candidate.grid <= 0)
-    return false;
-  auto pidOp = dyn_cast<triton::GetProgramIdOp>(candidate.anchor);
-  if (!pidOp)
-    return false;
-  Value pid = pidOp.getResult();
-  auto bound = inferMonotonicBounds(loop.getUpperBound(), pid, candidate.grid);
-  if (!bound || bound->hi <= 0)
-    return false;
-
-  // 按上界 hi 向上取 2 的幂作为静态列宽；过宽的列网格放弃提升。
-  int64_t columns = 1;
-  while (columns < bound->hi)
-    columns *= 2;
-  if (columns > kMaxTableColumns)
-    return false;
-
-  // 逐个表读必须是顺序扫描形态 `load(base + iv)`：列号就是迭代下标，且该
-  // 地址没有其他使用者；基址是整数元素标量指针，提升后带行维（每行一份表）。
-  for (triton::LoadOp load : tableLoads) {
-    auto address = load.getPtr().getDefiningOp<triton::AddPtrOp>();
-    if (!address || address.getOffset() != loop.getInductionVar() ||
-        !load.getPtr().hasOneUse())
-      return false;
-    Value base = address.getPtr();
-    auto pointer = dyn_cast<triton::PointerType>(base.getType());
-    if (!pointer || !isa<IntegerType>(pointer.getPointeeType()) ||
-        !willCarryRowDimension(base, loop, pid))
-      return false;
-  }
-  return true;
-}
-
-// 把循环内 load(base+iv) 形式的标量下标表读提升为循环外一次 [R,S] 掩码读。
-// 判据与规则 matcher 共用：匹配阶段已经拒绝提升不了的形态，这里再判一次，
-// 使重写路径不依赖 matcher 也能独立成立。
-bool RowLiftBuilder::planTableRead(scf::ForOp old) {
-  if (!canHoistTableReads(old, candidate))
-    return false;
-
-  // 第一步：收集可提升的标量表读；没有时整条链路无事可做。
-  // Collect the hoistable scalar reads; a loop without one has nothing to do.
-  SmallVector<triton::LoadOp> tableLoads;
-  for (Operation &op : old.getBody()->without_terminator()) {
-    auto load = dyn_cast<triton::LoadOp>(&op);
-    if (load && !isa<RankedTensorType>(load.getType()))
-      tableLoads.push_back(load);
-  }
-  if (tableLoads.empty())
-    return true;
-
-  // 第二步：列宽取自上界证明。判据已保证证明存在且为正，这里只把它换算成
-  // 2 的幂：组内任何一行的 trip count 都不会超过上界 hi，用不到的列由掩码
-  // 屏蔽、读取值为 0。
-  // The column extent comes from the bound proof; the predicate already
-  // guarantees a positive range, so it is only rounded up to a power of two.
-  Value pid = cast<triton::GetProgramIdOp>(candidate.anchor).getResult();
-  auto bound = inferMonotonicBounds(old.getUpperBound(), pid, candidate.grid);
-  if (!bound)
-    return false;
-  int64_t columns = 1;
-  while (columns < bound->hi)
-    columns *= 2;
-
-  Location loc = old.getLoc();
-  // 第四步：逐个取出可提升的表读，在循环外构造一张 [R,S] 的指针网格并读入。
-  for (triton::LoadOp load : tableLoads) {
-    // 形态已由 canHoistTableReads 保证；这里只取回表基址，用于构造行基址
-    // 向量。判据里的「是否会带行维」在重写期等价于 hasRowDimension。
-    // The shape was already checked by canHoistTableReads; only the table base
-    // is needed here to build the per-row base vector.
-    auto address = load.getPtr().getDefiningOp<triton::AddPtrOp>();
-    Value base = address.getPtr();
-
-    // 构造 [R,S] 相关类型：指针网格、值网格、偏移网格，以及列下标 [S]。
-    Value rowBase = ensureRowDimension(base);
-    auto rowBaseType = cast<RankedTensorType>(rowBase.getType());
-    int64_t rows = rowBaseType.getShape()[0];
-    auto elementPointer =
-        cast<triton::PointerType>(rowBaseType.getElementType());
-    auto pointerGridType = RankedTensorType::get({rows, columns},
-                                                 elementPointer);
-    auto valueType = RankedTensorType::get({rows, columns},
-                                            elementPointer.getPointeeType());
-    auto offsetType =
-        RankedTensorType::get({rows, columns}, rewriter.getI32Type());
-    auto columnType = RankedTensorType::get({columns}, rewriter.getI32Type());
-
-    // 列号向量 [0,1,...,S-1]，广播成 [R,S]；表基址同样广播，二者相加得到
-    // 每个 (行, 列) 的地址。
-    Value columnsRange = rewriter.create<triton::MakeRangeOp>(
-        loc, columnType, 0, static_cast<int32_t>(columns));
-    Value columnGrid = rewriter.create<triton::BroadcastOp>(
-        loc, offsetType,
-        rewriter.create<triton::ExpandDimsOp>(loc, columnsRange, 0));
-    Value pointerGrid = rewriter.create<triton::BroadcastOp>(
-        loc, pointerGridType,
-        rewriter.create<triton::ExpandDimsOp>(loc, rowBase, 1));
-    Value pointers = rewriter.create<triton::AddPtrOp>(
-        loc, pointerGridType, pointerGrid, columnGrid);
-
-    // 原顺序扫描的「越界即停」变成显式掩码：列号超过该行自身 trip count
-    // 的位置永不读取，因此任何行都不会读到别的行的表项。
-    // The boundary check of the scan becomes the explicit mask: a column past
-    // the row's own trip count is never read, so no row reads another row's
-    // table.
-    Value boundGrid = rewriter.create<triton::BroadcastOp>(
-        loc, offsetType,
-        rewriter.create<triton::ExpandDimsOp>(
-            loc, ensureRowDimension(old.getUpperBound()), 1));
-    Value mask = rewriter.create<arith::CmpIOp>(
-        loc, arith::CmpIPredicate::slt, columnGrid, boundGrid);
-    Value zero = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getZeroAttr(valueType));
-    // 每 program 只做这一次 [R,S] 掩码读，结果按「原列地址」登记，供循环
-    // 内的 load 改为列提取。
-    auto table = rewriter.create<triton::LoadOp>(
-        loc, pointers, mask, zero, load.getCache(), load.getEvict(), false);
-    columnTables[load.getPtr()] =
-        TableRead{table.getResult(), zero, columnsRange};
-  }
-  return true;
-}
-
-// 用 one-hot 选择把非目标列清零，再沿列求和得到第 iv 列。
-Value RowLiftBuilder::extractTableColumn(const TableRead &read, Value iv) {
-  Location loc = read.table.getLoc();
-  auto tableType = cast<RankedTensorType>(read.table.getType());
-  auto columnType = cast<RankedTensorType>(read.columns.getType());
-  auto maskType =
-      RankedTensorType::get(tableType.getShape(), rewriter.getI1Type());
-
-  // 构造 one-hot 列掩码：与 iv 相等的列置 1，其余列置 0。
-  // Only the column holding the iteration index survives the select, so the
-  // row sum is exactly that one table entry.
-  Value index = rewriter.create<triton::SplatOp>(loc, columnType, iv);
-  Value onehot = rewriter.create<arith::CmpIOp>(
-      loc, arith::CmpIPredicate::eq, read.columns, index);
-  // 选择后只有目标列保留原值，其余列变成 0；再沿列求和即得到该列的 [R]
-  // 切片。这里不做 gather，避免引入逐行的动态索引。
-  Value picked = rewriter.create<arith::SelectOp>(
-      loc,
-      rewriter.create<triton::BroadcastOp>(
-          loc, maskType,
-          rewriter.create<triton::ExpandDimsOp>(loc, onehot, 0)),
-      read.table, read.zero);
-  return sumAlongAxis(loc, picked, 1);
-}
-
-// 用整数加法组合子在指定轴上求和，生成 tt.reduce。
-Value RowLiftBuilder::sumAlongAxis(Location loc, Value value, int64_t axis) {
-  auto sourceType = cast<RankedTensorType>(value.getType());
-  Type element = sourceType.getElementType();
-  OpBuilder::InsertionGuard guard(rewriter);
-  auto reduce = rewriter.create<triton::ReduceOp>(
-      loc, ValueRange{value}, static_cast<int32_t>(axis));
-  Block *combine = rewriter.createBlock(&reduce.getCombineOp());
-  combine->addArgument(element, loc);
-  combine->addArgument(element, loc);
-  rewriter.setInsertionPointToStart(combine);
-  Value sum = rewriter.create<arith::AddIOp>(
-      loc, combine->getArgument(0), combine->getArgument(1));
-  rewriter.create<triton::ReduceReturnOp>(loc, sum);
-  return reduce->getResult(0);
-}
 
 // 前向声明：planWideAccumulatorSplits 与 canSplitWideAccumulators 都复用同
 // 一份累加器岛判定（定义见下方）。
@@ -2818,11 +2654,15 @@ bool RowLiftBuilder::rewriteDescriptorStore(
 // The complete predicate for a row-invariant scf.if, shared by the rule's
 // matcher and rewriteIfOp.
 bool liftsRowInvariantIf(scf::IfOp ifOp, Value pid) {
-  // 条件必须是标量 i1，且不依赖查询行；否则各行可能走不同分支。
+  // 条件必须是标量 i1，且不依赖查询行；否则各行可能走不同分支。这里用会
+  // 穿透 region 的 isPidInvariant：条件可能由某个 scf.if 的分支产出，浅层
+  // 判据会把这种情况误判为行无关。
   // Every lifted row takes the same branch, so the condition stays a scalar and
-  // must not depend on the query row.
+  // must not depend on the query row.  isPidInvariant looks through regions: the
+  // condition may come from a branch of another scf.if, which the shallow probe
+  // would wrongly report as row-invariant.
   Value condition = ifOp.getCondition();
-  if (!condition.getType().isInteger(1) || dependsOnValue(condition, pid))
+  if (!condition.getType().isInteger(1) || !isPidInvariant(condition, pid))
     return false;
   // 每个分支目前只支持单 block 形态。
   if (!llvm::hasSingleElement(ifOp.getThenRegion().getBlocks()) ||

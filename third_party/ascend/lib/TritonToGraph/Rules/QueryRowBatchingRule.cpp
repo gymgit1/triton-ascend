@@ -80,26 +80,10 @@ constexpr llvm::StringLiteral kCoalesceAxisAttr = "hacc.coalesce_axis";
 constexpr llvm::StringLiteral kCoalesceGridCeilDivAttr =
     "hacc.coalesce_grid_ceil_div";
 
-// 读取整数常量；不是常量时返回 nullopt。
-static std::optional<int64_t> getConstantIntValue(Value v) {
-  APInt value;
-  if (matchPattern(v, m_ConstantInt(&value)))
-    return value.getSExtValue();
-  return std::nullopt;
-}
-
-// 元素类型的存储字节数（指针按 8 字节）。
-// Storage bytes of one element; a pointer occupies eight bytes.
-static int64_t elementStorageBytes(Type element) {
-  return isa<triton::PointerType>(element)
-             ? 8
-             : (element.getIntOrFloatBitWidth() + 7) / 8;
-}
-
 // 计算 dot tile 的存储字节数，用作 L0A/L0C 的每因子需求。
 static int64_t tensorStorageBytes(RankedTensorType tensor) {
   Type element = tensor.getElementType();
-  const int64_t bytes = elementStorageBytes(element);
+  const int64_t bytes = getElementStorageBytes(element);
   int64_t size = 0;
   if (__builtin_mul_overflow(tensor.getNumElements(), bytes, &size))
     return std::numeric_limits<int64_t>::max();
@@ -159,9 +143,9 @@ static int64_t tensorStorageBytes(RankedTensorType tensor) {
 //   取值互相影响，所以由本函数统一算出并写进候选。
 //
 // 「循环是否已顺序化」不是这里的判据：按下标表读的稀疏循环由规则 A 负责
-// 顺序化，A 改完之后才调用 B。B 自己调度时若遇到未顺序化的循环，会在重写
-// 路径的能力开关（features.tableRead 关闭）处失败，而不是在匹配阶段拒绝，
-// 这样 A/B 的判定口径只有一份，不会因为形态代理条件而漂移。
+// 顺序化，A 改完之后才调用 B。B 自己调度时也不再推断「A 是否已经跑过」，
+// 循环体内与行相关的访存一律由重写路径的逐行有效掩码（maskedLoad）兜住，
+// 因此判定口径只有一份，不会因为形态代理条件而漂移。
 static std::optional<RowLiftCandidate>
 matchQueryRows(triton::FuncOp fn, uint64_t l0aBudgetBytes,
                uint64_t l0cBudgetBytes, uint64_t coreNum,
@@ -206,7 +190,7 @@ matchQueryRows(triton::FuncOp fn, uint64_t l0aBudgetBytes,
   scf::ForOp loop;
   // 入口 block 的第一个 store：后置门据此保证存在可写回的输出（B 不分析它的
   // 地址，逐行掩码写回由公共引擎负责）。
-  triton::StoreOp output;
+  bool output = false;
   // 结构计数：后置门要求 pids==1、loops==1、dots>=1、stores>=1。
   unsigned pids = 0, loops = 0, dots = 0, stores = 0;
   // 仅用于 LLVM_DEBUG 打印，不参与判定：B 允许 tensor pointer 与 reduce。
@@ -292,9 +276,14 @@ matchQueryRows(triton::FuncOp fn, uint64_t l0aBudgetBytes,
 
     if (auto makePtr = dyn_cast<triton::MakeTensorPtrOp>(op)) {
       ++blockPointers;
-      // 描述符必须能展开成显式指针张量，否则重写阶段必然失败；规则 B 始终
-      // 置位 tensorPointer 能力，所以这里传 true。
-      if (!canExpandTensorPointer(makePtr, true))
+      // 只有与查询行相关的描述符会在重写时展开成显式指针张量，因此也只有它
+      // 需要「可展开」判据；行无关的描述符在重写时整宽克隆或拆半克隆，不展开。
+      // Only a row-dependent descriptor is expanded into an explicit pointer
+      // tensor during the rewrite, so only it has to be expandable; a
+      // row-invariant descriptor is cloned whole or halved instead.
+      bool rowDependent = llvm::any_of(
+          makePtr.getOperands(), [&](Value v) { return lifted.contains(v); });
+      if (rowDependent && !canExpandTensorPointer(makePtr, true))
         reject(makePtr, "unexpanded tensor pointer");
       return;
     }
@@ -332,19 +321,19 @@ matchQueryRows(triton::FuncOp fn, uint64_t l0aBudgetBytes,
         return;
       }
       // 块指针与普通 load 都在这里放行：循环体内是否还按下标表读索引由规则 A
-      // 负责消除，B 不再据此判断「A 是否已经跑过」。行相关的下标表读能否提升
-      // 仍是重写路径的能力开关问题（features.tableRead 关闭），不在这里拦。
+      // 负责消除，B 不再据此判断「A 是否已经跑过」。与行相关的普通 load 由重写
+      // 路径的逐行有效掩码兜住（maskedLoad），因此不在这里拦。
       // Both block-pointer and plain loads are accepted: whether the loop still
       // reads an index table is rule A's business, and B no longer infers "has A
-      // run?" from it.  Lifting a row-dependent table read remains a rewrite-path
-      // capability question (features.tableRead stays off), not a matcher rule.
+      // run?" from it.  A row-dependent plain load is covered by the rewrite
+      // path's per-row active mask (maskedLoad), so it is not rejected here.
       return;
     }
 
     if (auto s = dyn_cast<triton::StoreOp>(op)) {
       ++stores;
       if (op->getBlock() == &fn.getBody().front() && !output)
-        output = s;
+        output = true;
       return;
     }
 
@@ -442,9 +431,6 @@ matchQueryRows(triton::FuncOp fn, uint64_t l0aBudgetBytes,
   // Only capabilities the shared engine already implements.  Rule B runs after
   // rule A, so the loop is already a sequential scan: the per-row active masks
   // keep a finished row off memory and the masked write-back is still needed.
-  // The index-table capability stays off because lifting a row-dependent table
-  // read is not implemented yet; the matcher no longer rejects such loops, so a
-  // candidate that needs it fails in the rewrite path instead.
   candidate.features.reduce = true;
   candidate.features.loopInvariantIf = true;
   candidate.features.tensorPointer = true;
@@ -503,20 +489,18 @@ matchQueryRows(triton::FuncOp fn, uint64_t l0aBudgetBytes,
   if (candidate.rowsPerProgram <= 1)
     return std::nullopt;
 
-  // 重写期要用的量留在候选里：提升后的 M 由原始 M 与因子相乘得到。
-  // Keep what the rewrite needs on the candidate: the lifted M is the original M
-  // times the factor.
-  candidate.maxDotRows = maxDotRows;
   // 单值预算按「提升后的 M × 每个值一行一个向量寄存器」设定：末维不超过一个
   // 向量寄存器（f32 即 64 列）的原样保留，超过的（V 补到 128）落进拆半路径。
-  // 阈值由 kVectorRegisterBytes 推出，不再写死列数。
+  // 阈值由 kVectorRegisterBytes 推出，不再写死列数。最宽 M 只在这里使用，
+  // 因此留在局部变量里，不再存进候选。
   // The per-value budget is "lifted M × one vector register per row": a value
   // whose last dimension fits one vector register (64 f32 columns) stays whole,
   // and a wider one (V padded to 128) takes the split path.  The threshold is
   // derived from kVectorRegisterBytes instead of a hard-coded column count.
+  // The widest M is only needed here, so it stays local instead of going on the
+  // candidate.
   candidate.splitValueBudgetBytes =
-      allowSplit ? candidate.maxDotRows * candidate.rowsPerProgram *
-                       kVectorRegisterBytes
+      allowSplit ? maxDotRows * candidate.rowsPerProgram * kVectorRegisterBytes
                  : std::numeric_limits<int64_t>::max();
 
   // 累加器拆分的判据原本只在重写路径里执行，这里在匹配阶段先判一遍：注定
