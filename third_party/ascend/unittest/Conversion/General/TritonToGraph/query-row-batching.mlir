@@ -39,7 +39,7 @@
 // CHECK: arith.cmpi slt, {{.*}} : tensor<64xi32>
 // CHECK: %[[RHS:.*]] = tt.load {{.*}} : tensor<16x16x!tt.ptr<f16>>
 // CHECK: tt.dot %{{.*}}, %[[RHS]], %{{.*}} : tensor<1024x16xf16> * tensor<16x16xf16> -> tensor<1024x16xf32>
-// CHECK: arith.select {{.*}} : tensor<64x16x16xi1>, tensor<64x16x16xf32>
+// CHECK: arith.select {{.*}} : tensor<1024x16xi1>, tensor<1024x16xf32>
 // CHECK: tt.store {{.*}} : tensor<64x16x16x!tt.ptr<f32>>
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num_tiles = 64 : i32} {
   tt.func @pid_bound_loop(%A: !tt.ptr<f16>, %B: !tt.ptr<f16>, %C: !tt.ptr<f32>) {
@@ -91,7 +91,7 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num
 // CHECK: tt.load {{.*}} : tensor<64x16x16x!tt.ptr<f16>>
 // CHECK: scf.for
 // CHECK: tt.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<1024x16xf16> * tensor<16x16xf16> -> tensor<1024x16xf32>
-// CHECK: arith.select {{.*}} : tensor<64x16x16xi1>, tensor<64x16x16xf32>
+// CHECK: arith.select {{.*}} : tensor<1024x16xi1>, tensor<1024x16xf32>
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num_tiles = 64 : i32} {
   tt.func @row_invariant_if_bound(%A: !tt.ptr<f16>, %B: !tt.ptr<f16>, %C: !tt.ptr<f32>) {
     %pid = tt.get_program_id x : i32
@@ -155,7 +155,7 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num
 // CHECK: tt.load {{.*}} : tensor<64x16x16x!tt.ptr<f16>>
 // CHECK: scf.for
 // CHECK: tt.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<1024x16xf16> * tensor<16x16xf16> -> tensor<1024x16xf32>
-// CHECK: arith.select {{.*}} : tensor<64x16x16xi1>, tensor<64x16x16xf32>
+// CHECK: arith.select {{.*}} : tensor<1024x16xi1>, tensor<1024x16xf32>
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num_tiles = 64 : i32} {
   tt.func @reduce_shifted_bound(%A: !tt.ptr<f16>, %B: !tt.ptr<f16>, %C: !tt.ptr<f32>) {
     %pid = tt.get_program_id x : i32
@@ -262,7 +262,7 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num
 // CHECK: tt.load {{.*}} : tensor<64x!tt.ptr<i32>>
 // CHECK: tt.load {{.*}} : tensor<64x16x16x!tt.ptr<f16>>
 // CHECK: tt.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<1024x16xf16> * tensor<16x16xf16> -> tensor<1024x16xf32>
-// CHECK: arith.select {{.*}} : tensor<64x16x16xi1>, tensor<64x16x16xf32>
+// CHECK: arith.select {{.*}} : tensor<1024x16xi1>, tensor<1024x16xf32>
 // CHECK: tt.store {{.*}} : tensor<64x16x16x!tt.ptr<f32>>
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num_tiles = 64 : i32} {
   tt.func @scalar_table_load_in_loop(%A: !tt.ptr<f16>, %B: !tt.ptr<f16>, %C: !tt.ptr<f32>, %S: !tt.ptr<i32>) {
@@ -312,8 +312,8 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num
 
 // -----
 
-// A runtime trip count is lifted too.  The bound stays a scalar load because it
-// is pid-invariant, and each row's active mask ends its own iterations.
+// A runtime trip count is lifted too. The pid-invariant bound gives every row
+// the same iteration count, so no accumulator-preserving select is needed.
 
 // CHECK: module attributes {{.*}}hacc.coalesce_factor = 64 : i32
 // CHECK-LABEL: tt.func @table_read_runtime_bound(
@@ -322,7 +322,7 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num
 // CHECK: tt.load {{.*}} : tensor<64x!tt.ptr<i32>>
 // CHECK: tt.load {{.*}} : tensor<64x16x16x!tt.ptr<f16>>
 // CHECK: tt.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<1024x16xf16> * tensor<16x16xf16> -> tensor<1024x16xf32>
-// CHECK: arith.select {{.*}} : tensor<64x16x16xi1>, tensor<64x16x16xf32>
+// CHECK-NOT: arith.select
 // CHECK: tt.store {{.*}} : tensor<64x16x16x!tt.ptr<f32>>
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num_tiles = 64 : i32} {
   tt.func @table_read_runtime_bound(%A: !tt.ptr<f16>, %B: !tt.ptr<f16>, %C: !tt.ptr<f32>, %S: !tt.ptr<i32>, %N: !tt.ptr<i32>) {
@@ -377,7 +377,7 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num
 // CHECK-LABEL: tt.func @wide_accumulator_reduced(
 // CHECK-NOT: tt.split
 // CHECK: tt.load {{.*}} : tensor<2x16x16x!tt.ptr<f16>>
-// CHECK: scf.for {{.*}} iter_args{{.*}} -> (tensor<2x16x512xf32>)
+// CHECK: scf.for {{.*}} iter_args{{.*}} -> (tensor<32x512xf32>)
 // CHECK: tt.load {{.*}} : tensor<16x512x!tt.ptr<f16>>
 // CHECK: tt.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<32x16xf16> * tensor<16x512xf16> -> tensor<32x512xf32>
 // CHECK: tt.reduce

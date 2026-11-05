@@ -206,13 +206,15 @@ inline int64_t tileBlockSize(const TilesFact &tiles) {
 
 // The tile width contract, one source for both translation units:
 // BN = max(64, BS) and R = BN / BS. BS is a power of two (checked by the
-// matcher), so the division is exact by construction.
-inline int64_t scanTileWidth(int64_t blockSize) {
-  return std::max<int64_t>(64, blockSize);
+// matcher), so the division is exact by construction.  The additive dQ form
+// keeps BN = BS: its three dots retain K for a transposed use, so widening the
+// scan would double both the score temporaries and the shared K/V tiles.
+inline int64_t scanTileWidth(int64_t blockSize, bool additive) {
+  return additive ? blockSize : std::max<int64_t>(64, blockSize);
 }
 
-inline int64_t blocksPerTile(int64_t blockSize) {
-  return scanTileWidth(blockSize) / blockSize;
+inline int64_t blocksPerTile(int64_t blockSize, bool additive) {
+  return scanTileWidth(blockSize, additive) / blockSize;
 }
 
 // ---------------------------------------------------------------------------

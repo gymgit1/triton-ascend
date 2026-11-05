@@ -105,10 +105,10 @@ std::optional<IntegerBounds> inferMonotonicBounds(Value value, Value pid,
 // `inferMonotonicBounds`.
 bool isMonotoneInPid(Value value, Value pid, int64_t grid);
 
-// 引擎尚未支持的各类模式的开关。所有开关默认关闭，未置位的能力会保持
-// 原有的失败关闭路径。
-// Capability switches for patterns the engine does not lift yet. Every switch
-// defaults off, so an unset feature keeps the original fail-closed path.
+// 行提升扩展能力的开关。所有开关默认关闭，未置位的能力保持原有的
+// 失败关闭路径。
+// Capability switches for row-lifting extensions. Every switch defaults off,
+// so an unset feature keeps the original fail-closed path.
 struct RowLiftFeatures {
   // 循环体内出现 tt.reduce。
   // tt.reduce appears in the loop body.
@@ -130,6 +130,11 @@ struct RowLiftFeatures {
   // 输出累加器过宽，需要沿宽度拆成两半。
   // The output accumulator is too wide and must be split along its width.
   bool splitWideAccumulator = false;
+  // Keep dot-connected loop state and arithmetic in [R*M, ...] form. Address
+  // construction and selection-table axes retain their logical row layout.
+  bool flatCompute = false;
+  // Omit per-row loop guards when aligned groups have equal trip counts.
+  bool groupedLoopBounds = false;
 };
 
 // 单个提升值的字节预算。超过该宽度的值默认被拒绝，由
@@ -289,9 +294,10 @@ bool canSplitWideAccumulators(scf::ForOp loop, int64_t rowsPerProgram,
                               int64_t budgetBytes = kMaxLiftedValueBytes);
 
 // 只提升与查询行相关的值。与行无关的 K/V load 保持二维；被提升的 lhs
-// [BT,G,K] 在每个 dot 处展平成 [BT*G,K]，而不是生成 batched dot。
+// [BT,G,K] 在 dot 处展平成 [BT*G,K]，flatCompute 开启时整个循环计算链保留该形状。
 // Lift only query-dependent values. Invariant K/V loads stay two-dimensional;
-// a lifted lhs [BT,G,K] is reshaped to [BT*G,K] at each dot, not batched dots.
+// a lifted lhs [BT,G,K] uses [BT*G,K] for ordinary dots. With flatCompute enabled,
+// the loop state and arithmetic retain that layout throughout the recurrence.
 class RowLiftBuilder {
 public:
   // 用给定的重写器与候选描述构造行提升引擎；能力开关取自候选。
@@ -299,8 +305,9 @@ public:
   // capability switches are taken from the candidate.
   RowLiftBuilder(IRRewriter &rewriter, RowLiftCandidate candidate);
 
-  // 在 `fn` 内执行行提升：克隆函数体并逐条重建，成功返回 true。
-  // Rewrite `fn` in place by rebuilding its body operation by operation.
+  // 在私有沙箱 fn 内逐条重建，成功返回 true；失败可能留下部分 IR，须丢弃沙箱。
+  // Rebuild a private sandbox in place. On failure, discard the sandbox:
+  // the partially rewritten function is not rolled back by this builder.
   bool run(triton::FuncOp fn);
 
 private:
@@ -311,14 +318,20 @@ private:
   // its own use site.
   struct LiftedDescriptor {
     Value pointer;              // [R]+tile 指针张量
-    SmallVector<Value> shapes;  // 每个 tile 维的 i64 形状
-    SmallVector<Value> offsets; // 每个 tile 维的 i64 偏移
+    SmallVector<Value> shapes;  // 每个 tile 维的 i32 形状
+    SmallVector<Value> offsets; // 每个 tile 维的 i32 偏移
     SmallVector<int64_t> tileShape;
   };
 
   // 按操作种类分派单条指令的重建；无法支持时返回 false，整次提升失败。
   // Rebuild one operation according to its kind; false declines the rewrite.
   bool rewrite(Operation *op);
+  // 重建逐行普通 load；循环内需活动掩码，循环外用于运行期网格的末组保护。
+  // Rebuild a per-row load with loop-active and runtime valid-row masks.
+  bool rewriteRowLoad(triton::LoadOp load);
+  // 重建 O/lse 普通指针张量写回，合并原始 mask 和末组有效行掩码。
+  // Rebuild an output store with the original and runtime valid-row masks.
+  bool rewriteMaskedStore(triton::StoreOp store);
   // 在 axis+1 上重建 tt.reduce（前插了行维），并原样复用 combine region。
   // Rebuild tt.reduce on axis+1 after the row dimension was inserted.
   bool rewriteReduce(triton::ReduceOp reduce);
@@ -344,8 +357,8 @@ private:
   // Emit one load for the given descriptor and hand back its result without
   // registering a mapping.  The split path calls it once per half, so the result
   // shape comes from the descriptor's pointer shape.
-  bool emitDescriptorLoad(triton::LoadOp load, const LiftedDescriptor &descriptor,
-                          Value &result);
+  bool emitDescriptorLoad(triton::LoadOp load,
+                          const LiftedDescriptor &descriptor, Value &result);
   // 用展开后的指针张量重建描述符 store，并把 boundaryCheck 转成掩码。
   // Rebuild a descriptor store on the expanded pointer tensor.
   bool rewriteDescriptorStore(triton::StoreOp store,
@@ -354,8 +367,8 @@ private:
   // Broadcast `v` to `target`: a scalar becomes a splat and a row-lifted value
   // gains the missing trailing unit dimensions first.
   Value broadcastFullValue(Value v, RankedTensorType target);
-  // 生成沿某个 tile 轴递增的 i64 索引网格，并广播到目标形状。
-  // Build an i64 index grid that increases along one tile axis.
+  // 生成沿 tile 轴递增的索引网格，按目标元素位宽转换并广播到目标形状。
+  // Build an index grid along a tile axis, matching the target integer width.
   Value expandTileRange(Location loc, int64_t axis, int64_t extent,
                         RankedTensorType target);
   // 把 boundaryCheck 指定的各轴越界判断合并成一个显式 i1 掩码。
@@ -404,15 +417,14 @@ private:
     Value second;
   };
 
-  // 找出超出字节预算且可安全拆半的累加器，返回其循环进位索引，并登记要按
-  // 最后一维拆半的描述符。必须在重建函数体之前调用：描述符可能位于循环之前，
+  // 找出超出字节预算且可安全拆半的累加器，登记循环进位索引、半宽与描述符。
+  // 必须在重建函数体之前调用：描述符可能位于循环之前，
   // 一旦先按整宽展开就无法再拆。
-  // Find the accumulators that exceed the byte budget and can be split safely,
-  // and record the descriptors that must be halved.  This has to run before the
+  // Record the carried indices, half widths and descriptors for accumulators
+  // that exceed the byte budget and can be split safely. Run this before the
   // body is rebuilt: a descriptor above the loop is already expanded by the time
   // the loop is rebuilt, so a whole-width expansion could no longer be halved.
-  bool planWideAccumulatorSplits(scf::ForOp old,
-                                 SmallVectorImpl<int64_t> &indices);
+  bool planWideAccumulatorSplits(scf::ForOp loop);
 
   // 一个按最后一维拆成两半的描述符。展开成指针张量时两半各自持有一份指针，
   // 与行无关而走克隆路径时则持有一对块指针。
@@ -459,7 +471,8 @@ private:
                                  SplitDescriptor &descriptor);
   // 用拆半描述符发出两次半宽 load。
   // Emit one half-width load per half of a split descriptor.
-  bool rewriteSplitDescriptorLoad(triton::LoadOp load, SplitDescriptor &descriptor);
+  bool rewriteSplitDescriptorLoad(triton::LoadOp load,
+                                  SplitDescriptor &descriptor);
   // 按操作种类分派拆分累加器的重建（dot / store / 逐元素算术）。
   // Dispatch the split-aware rebuild by operation kind.
   bool rewriteSplitOp(Operation *op);
@@ -529,15 +542,6 @@ private:
   // Which carried values are halved, decided before the body is rebuilt because
   // a descriptor above the loop has to be split before it is expanded.
   SmallVector<int64_t> plannedSplitIndices;
-  // 规划阶段认定将由两个半宽值表示的那些原始值（含累加器、dot 结果与穿过
-  // scf.if 的结果）。重写 scf.if 时必须在建出结果类型之前就知道哪些结果要
-  // 占两项半宽类型，因此这份判断不能只存在于重写期的 splitValues。
-  // Original values that planning decided to represent as two half-width values,
-  // including the accumulator, dot results and the values that flow through an
-  // scf.if.  Rebuilding an scf.if has to know which results take two half-width
-  // types before it is created, so this decision cannot live only in the
-  // rewrite-time `splitValues`.
-  DenseSet<Value> plannedSplitValues;
   // 规划阶段为每个要拆半的原始值登记的半宽（最后一维的宽度）。在生成任何 IR
   // 之前填充，因此半宽值的类型无需等到重写期 splitValues 才知道。
   // Half width (trailing extent) recorded during planning for every value that

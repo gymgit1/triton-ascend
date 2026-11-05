@@ -28,10 +28,9 @@
 // ---- the production (mptr) spelling: the loop is fully rewritten ----
 // MPTR-LABEL: tt.func public @parallel_nsa_bwd_kernel_dq
 // MPTR-NOT: scf.if
-// The scan bound is cdiv(row + 1, BN) in the scalar domain, plus the per-row
-// block-count divide of the weight chain.
+// BN stays at the source BS=32. Aligned groups have equal trip counts, so
+// only the scalar upper-bound divide survives.
 // MPTR: arith.divsi
-// MPTR: arith.divsi {{.*}} : tensor<
 // The weight reduce is the new third reduction of the additive form (the
 // baseline has none): axis 2 of the row-lifted [R, G, BN] score tile.
 // MPTR: "tt.reduce"(%{{.*}}) <{axis = 2 : i32}>
@@ -40,10 +39,10 @@
 // the per-value budget instead of the retired hard-coded 8-row cap.  The last
 // one consumes k^T, whose order attribute must be replayed verbatim (it is
 // semantic).
-// MPTR: tt.dot {{.*}} : tensor<512x64xf16> * tensor<64x64xf16> -> tensor<512x64xf32>
-// MPTR: tt.dot {{.*}} : tensor<512x64xf16> * tensor<64x64xf16> -> tensor<512x64xf32>
-// MPTR: tt.trans {{.*}} {order = array<i32: 1, 0>} : tensor<64x64xf16> -> tensor<64x64xf16>
-// MPTR: tt.dot {{.*}} : tensor<512x64xf16> * tensor<64x64xf16> -> tensor<512x64xf32>
+// MPTR: tt.dot {{.*}} : tensor<512x64xf16> * tensor<64x32xf16> -> tensor<512x32xf32>
+// MPTR: tt.dot {{.*}} : tensor<512x64xf16> * tensor<64x32xf16> -> tensor<512x32xf32>
+// MPTR: tt.trans {{.*}} {order = array<i32: 1, 0>} : tensor<64x32xf16> -> tensor<32x64xf16>
+// MPTR: tt.dot {{.*}} : tensor<512x32xf16> * tensor<32x64xf16> -> tensor<512x64xf32>
 // The single dq store survives; nothing else was added to the function.
 // MPTR: tt.store
 // MPTR-NOT: scf.if

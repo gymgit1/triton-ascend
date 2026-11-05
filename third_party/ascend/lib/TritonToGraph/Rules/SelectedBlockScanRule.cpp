@@ -318,7 +318,11 @@ public:
                << "selected-block-scan: matched gather loop in @"
                << candidate->function.getName()
                << " (BS=" << tileBlockSize(candidate->tiles)
-               << " BN=" << scanTileWidth(tileBlockSize(candidate->tiles))
+               << " BN="
+               << scanTileWidth(
+                      tileBlockSize(candidate->tiles),
+                      std::holds_alternative<AdditiveRecurrence>(
+                          candidate->recurrence))
                << " S=" << candidate->table.length << ")\n");
 
     if (auto plan = SelectedBlockScanPlan::create(

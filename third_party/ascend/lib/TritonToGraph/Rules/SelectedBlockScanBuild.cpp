@@ -337,8 +337,10 @@ static ScanWeights buildScanWeights(IRRewriter &rewriter, Location loc,
   const Type f32 = rewriter.getF32Type();
   const int64_t TW = prologue.tableWidth;
   const int64_t BS = tileBlockSize(candidate.tiles);
-  const int64_t BN = scanTileWidth(BS);
-  const int64_t R = blocksPerTile(BS);
+  const bool additive =
+      std::holds_alternative<AdditiveRecurrence>(candidate.recurrence);
+  const int64_t BN = scanTileWidth(BS, additive);
+  const int64_t R = blocksPerTile(BS, additive);
   Value startsRow = prologue.startsRow;
   Value slotRow = prologue.slotRow;
   Value bsConstant = prologue.bsConstant;
@@ -742,9 +744,9 @@ bool buildSelectedBlockScan(IRRewriter &rewriter, ScanCandidate &candidate) {
 
   const int64_t S = candidate.table.length;
   const int64_t BS = tileBlockSize(candidate.tiles);
-  const int64_t BN = scanTileWidth(BS);
   const bool additive =
       std::holds_alternative<AdditiveRecurrence>(candidate.recurrence);
+  const int64_t BN = scanTileWidth(BS, additive);
   // The variant has two alternatives, so this is set exactly when the form is
   // not additive. The tablegen accessors are not const-qualified in this tree,
   // so the handle is mutable and no field is written through it.

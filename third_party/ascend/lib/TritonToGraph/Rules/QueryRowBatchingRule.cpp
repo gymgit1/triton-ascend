@@ -20,8 +20,8 @@
  * THE SOFTWARE.
  */
 
-#include "TritonToGraph/QueryRowBatching.h"
 #include "TritonToGraph/ProgramGridTransform.h"
+#include "TritonToGraph/QueryRowBatching.h"
 #include "TritonToGraph/ResourceCostModel.h"
 #include "TritonToGraph/RowLifting.h"
 
@@ -31,10 +31,11 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Diagnostics.h"
-#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -43,6 +44,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -113,7 +115,7 @@ static int64_t tensorStorageBytes(RankedTensorType tensor) {
 //    要求）；行相关的 dot 要求 A 已提升、B 未提升，因为 B 是跨查询行共享的
 //    K/V tile，提升它没有收益，重写器也没有对应实现。循环必须在入口 block、
 //    lb 为常量 0、step 为正常数，否则行号与有效位无法按仿射关系重建。
-//    与 DotRowCoalescing 相比，B 额外允许 tt.reduce（bwd dq 形态）、条件与
+//    与 DotRowCoalescing 相比，B 额外允许 tt.reduce（前向 softmax 形态）、条件与
 //    pid 无关的 scf.if、tensor pointer、循环内行相关 load（由 maskedLoad 承担）
 //    以及多个 store；DotRow 则要求 reduce 数为 0、store 恰好 1 个、循环内
 //    不得有行相关 load，并要求输出地址是 pid 的仿射函数。这些放宽项的来源
@@ -146,12 +148,10 @@ static int64_t tensorStorageBytes(RankedTensorType tensor) {
 // 顺序化，A 改完之后才调用 B。B 自己调度时也不再推断「A 是否已经跑过」，
 // 循环体内与行相关的访存一律由重写路径的逐行有效掩码（maskedLoad）兜住，
 // 因此判定口径只有一份，不会因为形态代理条件而漂移。
-static std::optional<RowLiftCandidate>
-matchQueryRows(triton::FuncOp fn, uint64_t l0aBudgetBytes,
-               uint64_t l0cBudgetBytes, uint64_t coreNum,
-               uint64_t ubBudgetBytes,
-               std::optional<int64_t> forcedRows = std::nullopt,
-               bool allowSplit = true) {
+static std::optional<RowLiftCandidate> matchQueryRows(
+    triton::FuncOp fn, uint64_t l0aBudgetBytes, uint64_t l0cBudgetBytes,
+    uint64_t coreNum, uint64_t ubBudgetBytes,
+    std::optional<int64_t> forcedRows = std::nullopt, bool allowSplit = true) {
   ModuleOp module = fn->getParentOfType<ModuleOp>();
   if (!module)
     return std::nullopt;
@@ -188,7 +188,7 @@ matchQueryRows(triton::FuncOp fn, uint64_t l0aBudgetBytes,
   // 唯一的 scf.for（loops==1 保证已赋值）：取 lb/step、证明上界单调性、检查
   // 循环体可推测性，并在拆分预检里使用。
   scf::ForOp loop;
-  // 入口 block 的第一个 store：后置门据此保证存在可写回的输出（B 不分析它的
+  // 入口 block 中是否存在 store：后置门据此保证存在可写回的输出（B 不分析它的
   // 地址，逐行掩码写回由公共引擎负责）。
   bool output = false;
   // 结构计数：后置门要求 pids==1、loops==1、dots>=1、stores>=1。
@@ -281,9 +281,7 @@ matchQueryRows(triton::FuncOp fn, uint64_t l0aBudgetBytes,
       // Only a row-dependent descriptor is expanded into an explicit pointer
       // tensor during the rewrite, so only it has to be expandable; a
       // row-invariant descriptor is cloned whole or halved instead.
-      bool rowDependent = llvm::any_of(
-          makePtr.getOperands(), [&](Value v) { return lifted.contains(v); });
-      if (rowDependent && !canExpandTensorPointer(makePtr, true))
+      if (dependent && !canExpandTensorPointer(makePtr, true))
         reject(makePtr, "unexpanded tensor pointer");
       return;
     }
@@ -330,9 +328,9 @@ matchQueryRows(triton::FuncOp fn, uint64_t l0aBudgetBytes,
       return;
     }
 
-    if (auto s = dyn_cast<triton::StoreOp>(op)) {
+    if (isa<triton::StoreOp>(op)) {
       ++stores;
-      if (op->getBlock() == &fn.getBody().front() && !output)
+      if (op->getBlock() == &fn.getBody().front())
         output = true;
       return;
     }
@@ -369,9 +367,8 @@ matchQueryRows(triton::FuncOp fn, uint64_t l0aBudgetBytes,
 
   LLVM_DEBUG(llvm::dbgs() << "query-row: safe=" << safe << " pids=" << pids
                           << " loops=" << loops << " dots=" << dots
-                          << " stores=" << stores
-                          << " blockPtrs=" << blockPointers
-                          << " reduces=" << reduces << "\n");
+                          << " stores=" << stores << " blockPtrs="
+                          << blockPointers << " reduces=" << reduces << "\n");
 
   // Only the query-row axis must be unique.  tt.reduce is counted for tracing
   // but is not required: the backward dq form carries a plain accumulator and
@@ -380,8 +377,8 @@ matchQueryRows(triton::FuncOp fn, uint64_t l0aBudgetBytes,
   // reads with dense tile loads; Q and O may keep a tensor pointer, and the
   // engine expands it when the capability is on.
   // 后置结构条件：单循环、单 axis-0 pid、至少一个 dot 和一个输出 store。
-  // 与 DotRowCoalescing 的差别：B 允许 reduce（dq 形态）、允许多个 store
-  // （只把入口 block 的第一个 store 当输出）以及 tensor pointer；DotRow 要求
+  // 与 DotRowCoalescing 的差别：B 允许 reduce（前向 softmax 形态）、允许多个 store
+  // （入口 block 中须有输出写回）以及 tensor pointer；DotRow 要求
   // reduce 数为 0、store 恰好 1 个，并额外检查输出地址对 pid 的仿射性。
   // 循环必须带进位状态（否则没有可提升的行相关值）、下界为常量 0、步长为
   // 正常数，重写才能把「第 i 行」映射回原 pid 与循环迭代。
@@ -409,8 +406,7 @@ matchQueryRows(triton::FuncOp fn, uint64_t l0aBudgetBytes,
   if (!isPidInvariant(loop.getUpperBound(), pid.getResult())) {
     if (!isMonotoneInPid(loop.getUpperBound(), pid.getResult(),
                          grid ? grid.getInt() : INT32_MAX)) {
-      LLVM_DEBUG(llvm::dbgs()
-                 << "query-row: reject non-monotone loop bound\n");
+      LLVM_DEBUG(llvm::dbgs() << "query-row: reject non-monotone loop bound\n");
       return std::nullopt;
     }
     for (Operation &op : loop.getBody()->without_terminator()) {
@@ -436,6 +432,8 @@ matchQueryRows(triton::FuncOp fn, uint64_t l0aBudgetBytes,
   candidate.features.tensorPointer = true;
   candidate.features.maskedLoad = true;
   candidate.features.maskedStore = true;
+  candidate.features.flatCompute = true;
+  candidate.features.groupedLoopBounds = true;
   // 值维（PV 的 N 维）超过「M × 64 列」时按手写 kernel 的做法拆成两半，
   // 否则 V 补到 128 的形态会让 [R,G,128] 的 f32 累加器撑爆 UB。拆半是结构性
   // 的：V 的访存、PV dot、元素链与 O 的写回各复制成两条 64 宽链，与手写 kernel
@@ -457,16 +455,10 @@ matchQueryRows(triton::FuncOp fn, uint64_t l0aBudgetBytes,
   // stays zero) and lets the split capability double the byte budget.  The
   // L0A/L0C demands are a correctness constraint: the rewrite widens the lhs
   // and accumulator tiles by the factor, and a zero budget disables the check.
-  // UB 约束的每因子需求：estimatePeakLiveBytes 只能看到未提升的原始函数，而
-  // 提升后与查询行相关的值整体按 R 放大，所以原始峰值就是 R 的每倍需求。与行
-  // 无关的常驻值也计入其中，因此这个上界是保守的（只会把 R 压得更低）。
-  // Per-factor UB demand: estimatePeakLiveBytes sees the un-lifted function, and
-  // lifting scales the query-row-dependent values by R, so the original peak is
-  // the per-factor demand.  Row-invariant residents are counted in it too, which
-  // makes the bound conservative (it can only lower R further).
-  LiveByteEstimate liveEstimate = estimatePeakLiveBytes(fn.getOperation());
-  const int64_t peakLiveBytes =
-      liveEstimate.known ? static_cast<int64_t>(liveEstimate.peakLiveBytes) : 0;
+  // UB is checked on the materialised, cleaned candidate in create(), not by
+  // multiplying the original function's peak by R. K/V are shared across rows,
+  // and splitting and the flat compute layout change the candidate's live set.
+  // The other constraints provide an initial factor; UB can then halve it.
 
   RowCountPolicy policy;
   policy.splitWideAccumulator = candidate.features.splitWideAccumulator;
@@ -476,9 +468,9 @@ matchQueryRows(triton::FuncOp fn, uint64_t l0aBudgetBytes,
   policy.l0CBudgetBytes = l0cBudgetBytes;
   policy.ubBudgetBytes = ubBudgetBytes;
   policy.coreNum = coreNum;
-  candidate.rowsPerProgram = selectRowsPerProgram(
-      grid ? grid.getInt() : 0, maxDotRows, maxTensorBytes, peakLiveBytes,
-      policy);
+  candidate.rowsPerProgram =
+      selectRowsPerProgram(grid ? grid.getInt() : 0, maxDotRows, maxTensorBytes,
+                           /*peakLiveBytes=*/0, policy);
   // 预算不够时上层会按 2 的幂下调重试；这里把重试因子钉在候选上，后续所有
   // 依赖行数的判据（L0 需求、单值预算、UB 预算、拆分判据）都用这同一个因子。
   // The caller retries with smaller powers of two when the budget does not fit;
@@ -543,10 +535,9 @@ static LogicalResult rewriteQueryRowBatchInPlace(
     l0cBudgetBytes = resources.getSafeL0CBudget().value_or(0);
   }
 
-  auto candidate =
-      matchQueryRows(function, l0aBudgetBytes, l0cBudgetBytes,
-                     resources.coreNum, resources.getSafeUBBudget().value_or(0),
-                     forcedRows, allowSplit);
+  auto candidate = matchQueryRows(
+      function, l0aBudgetBytes, l0cBudgetBytes, resources.coreNum,
+      resources.getSafeUBBudget().value_or(0), forcedRows, allowSplit);
   if (!candidate)
     return failure();
 
@@ -588,6 +579,42 @@ static LogicalResult rewriteQueryRowBatchInPlace(
   module->setAttr(kCoalesceAxisAttr, rw.getI32IntegerAttr(0));
   module->setAttr(kCoalesceGridCeilDivAttr, rw.getI32IntegerAttr(1));
   return success();
+}
+
+// Use the same cleanup as rule A before measuring UB. In particular, fold
+// captured constant views and eliminate the builder's unused address values.
+// Keep the existing replication margin: changing layout is not a reason to
+// relax the memory safety policy or assume backend multi-buffering is free.
+static bool fitsQueryRowBudgets(ModuleOp module, triton::FuncOp function,
+                                const ResourceSnapshot &resources,
+                                int64_t factor) {
+  ScopedDiagnosticHandler diagnostics(
+      module.getContext(), [](Diagnostic &diag) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "query-row: candidate cleanup failed: " << diag << "\n");
+        return success();
+      });
+  PassManager cleanup(module.getContext(), ModuleOp::getOperationName());
+  cleanup.addPass(createCanonicalizerPass());
+  cleanup.addPass(createCSEPass());
+  cleanup.addPass(createLoopInvariantCodeMotionPass());
+  cleanup.addPass(createCanonicalizerPass());
+  cleanup.addPass(createCSEPass());
+  if (failed(cleanup.run(module)) || failed(verify(module)))
+    return false;
+  if (auto budget = resources.getSafeUBBudget()) {
+    LiveByteEstimate estimate = estimatePeakLiveBytes(function);
+    if (::getenv("TRITON_GRAPH_UB_DEBUG"))
+      llvm::errs() << "graph-ub[query-row]: R=" << factor
+                   << " liftedPeak=" << estimate.peakLiveBytes
+                   << " known=" << estimate.known
+                   << " replication=" << kUBBufferReplication
+                   << " ubBudget=" << *budget << "\n";
+    if (!estimate.known || estimate.overflow ||
+        estimate.peakLiveBytes > *budget / kUBBufferReplication)
+      return false;
+  }
+  return !exceedsCubeBudgets(function, resources);
 }
 
 class QueryRowBatchingPlan final : public RewritePlan {
@@ -648,16 +675,16 @@ public:
   }
 
   // 档位由调用方传入：拆半首选档把过宽的值维复制成两条半宽链，整宽兜底档
-  // 只在结构拆半不可表达时使用。行数已由四条资源约束（含 UB）定好，这里只在
-  // 重写形态失败时按 2 的幂下调因子兜底。
+  // 只在结构拆半不可表达时使用。初始行数由形状、L0 和网格约束定界；重写形态
+  // 失败或改写后的 UB 不足时按 2 的幂下调。
   // The tier is chosen by the caller: the preferred split tier duplicates an
   // over-wide value dimension into two half-width chains, and the whole-width
   // fallback is used only when the structural split cannot express the shape.
-  // The four resource constraints (UB included) already fixed the row count,
-  // so this loop only steps the factor down when the rewrite shape fails.
-  static std::unique_ptr<QueryRowBatchingPlan> create(
-      RowLiftCandidate candidate, unsigned epoch,
-      const ResourceSnapshot &resources, bool allowSplit) {
+  // Shape, L0 and grid constraints bound the initial row count. Retry smaller
+  // factors when materialisation fails or its measured UB demand does not fit.
+  static std::unique_ptr<QueryRowBatchingPlan>
+  create(RowLiftCandidate candidate, unsigned epoch,
+         const ResourceSnapshot &resources, bool allowSplit) {
     uint64_t l0aBudgetBytes = 0;
     uint64_t l0cBudgetBytes = 0;
     if (resources.hasL0Budgets()) {
@@ -676,21 +703,18 @@ public:
       sandbox->getOperation()->setAttrs(module->getAttrs());
       sandbox->getBody()->push_back(candidate.function->clone());
       auto cloned = cast<triton::FuncOp>(&sandbox->getBody()->front());
-      LLVM_DEBUG(llvm::dbgs() << "query-row: trying factor " << factor
-                              << (allowSplit ? " (split)" : " (no split)")
-                              << "\n");
+      LLVM_DEBUG(llvm::dbgs()
+                 << "query-row: trying factor " << factor
+                 << (allowSplit ? " (split)" : " (no split)") << "\n");
       if (succeeded(rewriteQueryRowBatchInPlace(*sandbox, cloned, resources,
-                                                factor, allowSplit)))
-        return std::unique_ptr<QueryRowBatchingPlan>(
-            new QueryRowBatchingPlan(candidate, epoch, std::move(sandbox),
-                                     l0aBudgetBytes, l0cBudgetBytes,
-                                     ubBudgetBytes, resources.coreNum,
-                                     allowSplit));
+                                                factor, allowSplit)) &&
+          fitsQueryRowBudgets(*sandbox, cloned, resources, factor))
+        return std::unique_ptr<QueryRowBatchingPlan>(new QueryRowBatchingPlan(
+            candidate, epoch, std::move(sandbox), l0aBudgetBytes,
+            l0cBudgetBytes, ubBudgetBytes, resources.coreNum, allowSplit));
 
-      if (factor == 2)
-        break;
-      // The row count already satisfies every resource constraint for `factor`,
-      // so the next admissible value is simply the next power of two down.
+      // Rebuild from the original body so failed candidates never leave partial
+      // edits or an oversized launch contract on the next attempt.
       factor /= 2;
     }
     LLVM_DEBUG(llvm::dbgs() << "query-row: no factor rewrites\n");
@@ -698,8 +722,7 @@ public:
   }
 
   // 把沙箱里已验证的函数体与启动契约一次性提交回原函数。
-  LogicalResult apply(IRRewriter &rw) override {
-    (void)rw;
+  LogicalResult apply(IRRewriter &) override {
     // Commit the verified body and, for runtime grids, its hidden arguments.
     ModuleOp module = candidate.function->getParentOfType<ModuleOp>();
     auto replacement = cast<triton::FuncOp>(&prepared->getBody()->front());
@@ -760,12 +783,7 @@ LogicalResult
 cfg::materializeQueryRowBatchingCandidate(ModuleOp module,
                                           triton::FuncOp function,
                                           const ResourceSnapshot &resources) {
-  if (!module || !function ||
-      function->getParentOfType<ModuleOp>() != module)
-    return failure();
-
-  // Rule B is supported only on Ascend 950, like the dot-row rule.
-  if (!hacc::utils::isAscend950(module))
+  if (!module || !function || function->getParentOfType<ModuleOp>() != module)
     return failure();
 
   // 与调度入口共用同一份「沙箱重写 + UB 预算重试」实现，避免两条入口出现
@@ -779,11 +797,11 @@ cfg::materializeQueryRowBatchingCandidate(ModuleOp module,
   return plan->apply(rw);
 }
 
-std::unique_ptr<RewritePlan>
 // 规则 B 的调度入口：按资源快照提取 L0 预算，在沙箱中调用同一份重写实现并
 // verify 后才交付计划。
 // Scheduler entry: it extracts the L0 budgets, runs the shared rewrite on a
 // sandbox and only hands out a plan once that sandbox verifies.
+std::unique_ptr<RewritePlan>
 cfg::createQueryRowBatchingPlan(triton::FuncOp function, unsigned epoch,
                                 const ResourceSnapshot &resources) {
   // Rule B is supported only on Ascend 950, like the dot-row rule.
@@ -820,8 +838,7 @@ cfg::createQueryRowBatchingPlan(triton::FuncOp function, unsigned epoch,
   return nullptr;
 }
 
-std::unique_ptr<GraphOptimizationRule>
 // 创建规则 B 的规则对象。
-cfg::createQueryRowBatchingRule() {
+std::unique_ptr<GraphOptimizationRule> cfg::createQueryRowBatchingRule() {
   return std::make_unique<QueryRowBatchingRule>();
 }
