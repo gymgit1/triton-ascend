@@ -96,6 +96,8 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
 // CHECK: %[[RESULT:.*]] = scf.for %[[IV:.*]] = %{{.*}} to %[[UPPER]] step %[[ONE]] iter_args(%[[ACC:.*]] = %{{.*}})
 // CHECK: %[[IV_TILE:.*]] = tt.splat %[[IV]] : i32 -> tensor<8xi32>
 // CHECK: %[[ACTIVE:.*]] = arith.cmpi slt, %[[IV_TILE]], %[[ROW_UPPER]] : tensor<8xi32>
+// The accumulator uses only the trip-count mask; loads/stores retain VALID.
+// CHECK-NOT: arith.andi %[[ACTIVE]]
 // CHECK: %[[ACTIVE1:.*]] = tt.expand_dims %[[ACTIVE]] {axis = 1 : i32}
 // CHECK: %[[ACTIVE2:.*]] = tt.expand_dims %[[ACTIVE1]] {axis = 2 : i32}
 // CHECK: %[[ACTIVE_TILE:.*]] = tt.broadcast %[[ACTIVE2]]

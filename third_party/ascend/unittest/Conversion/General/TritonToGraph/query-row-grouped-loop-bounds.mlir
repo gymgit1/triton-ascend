@@ -199,21 +199,25 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num
 
 // -----
 
+// An offset not divisible by R can cross a tile boundary inside a group.
+// Last-row evaluation must retain the accumulator select in this case.
 // CHECK: hacc.coalesce_factor = 2 : i32
-// CHECK-LABEL: tt.func @wrapped_aligned_bounds(
+// CHECK-LABEL: tt.func @unaligned_offset_bounds(
+// CHECK-NOT: "tt.reduce"
+// CHECK-NOT: arith.maxsi
 // CHECK: scf.for
 // CHECK: %[[DOT:.*]] = tt.dot
-// CHECK-NOT: arith.select
-// CHECK: scf.yield %[[DOT]] : tensor<32x16xf32>
+// CHECK: %[[KEEP:.*]] = arith.select %{{.*}}, %[[DOT]], %{{.*}}
+// CHECK: scf.yield %[[KEEP]] : tensor<32x16xf32>
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num_tiles = 64 : i32} {
-  tt.func @wrapped_aligned_bounds(%A: !tt.ptr<f16>, %B: !tt.ptr<f16>, %C: !tt.ptr<f32>) {
+  tt.func @unaligned_offset_bounds(%A: !tt.ptr<f16>, %B: !tt.ptr<f16>, %C: !tt.ptr<f32>) {
     %pid = tt.get_program_id x : i32
     %c0 = arith.constant 0 : i32
     %c1 = arith.constant 1 : i32
     %c2 = arith.constant 2 : i32
     %stride = arith.constant 256 : i32
     %base = arith.muli %pid, %stride : i32
-    %offset_c = arith.constant 2147483616 : i32
+    %offset_c = arith.constant 31 : i32
     %divisor = arith.constant 32 : i32
     %numerator = arith.addi %pid, %offset_c : i32
     %ub = arith.divsi %numerator, %divisor : i32

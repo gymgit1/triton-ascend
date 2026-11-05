@@ -33,7 +33,6 @@
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Verifier.h"
-#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -392,31 +391,11 @@ static std::optional<RowLiftCandidate> matchQueryRows(
   if (!step || *step <= 0)
     return std::nullopt;
 
-  // A merge across unequal trip counts evaluates the bound chain and the body
-  // for rows that stop early, so a query-row dependent bound needs a
-  // monotonicity proof over the whole pid range (the last row then supplies the
-  // group's trip count) plus a speculation check.  The dependence test looks
-  // through regions: an scf.if result comes from its branch values and a
-  // tt.reduce result from its sources, so neither may be mistaken for an
-  // invariant bound.  Only monotonicity is required here: the last row's bound
-  // is re-evaluated at run time, so the proof does not have to produce a
-  // numeric range (an i32 `pid + 64` chain under a runtime grid is accepted).
-  // 这里只要求单调性：末行上界在运行期用原表达式重新求值，证明器不必给出
-  // 具体数值范围。
-  if (!isPidInvariant(loop.getUpperBound(), pid.getResult())) {
-    if (!isMonotoneInPid(loop.getUpperBound(), pid.getResult(),
-                         grid ? grid.getInt() : INT32_MAX)) {
-      LLVM_DEBUG(llvm::dbgs() << "query-row: reject non-monotone loop bound\n");
-      return std::nullopt;
-    }
-    for (Operation &op : loop.getBody()->without_terminator()) {
-      StringRef ns = op.getName().getDialectNamespace();
-      if ((ns == "arith" || ns == "math") && !isSpeculatable(&op)) {
-        LLVM_DEBUG(llvm::dbgs()
-                   << "query-row: reject speculated " << op.getName() << "\n");
-        return std::nullopt;
-      }
-    }
+  // 两个规则共用非降性和推测执行检查；有效输入的上界算术约定不回绕。
+  // 无法证明的表达式拒绝合并，不再通过组内 max 补救。
+  if (!canUseLastRowLoopBound(loop, pid.getResult(), grid ? grid.getInt() : 0)) {
+    LLVM_DEBUG(llvm::dbgs() << "query-row: reject unsafe shared loop bound\n");
+    return std::nullopt;
   }
 
   RowLiftCandidate candidate;

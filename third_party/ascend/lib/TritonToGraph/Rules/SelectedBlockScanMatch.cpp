@@ -60,7 +60,7 @@ using namespace cfg;
 // consults a read-only row-lift matcher, it materializes the row lift's rewrite
 // inside its own sandbox, so neither rewrite can land without the other.
 
-#include "SelectedBlockScanFacts.h"
+#include "TritonToGraph/SelectedBlockScanFacts.h"
 
 namespace {
 

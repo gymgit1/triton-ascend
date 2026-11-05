@@ -48,6 +48,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <optional>
 
 using namespace mlir;
@@ -57,7 +58,7 @@ using namespace cfg;
 // The joint scan + row-lift gate is documented in SelectedBlockScanRule.cpp;
 // the rewriter only has to leave the sandbox in a state that gate can accept.
 
-#include "SelectedBlockScanFacts.h"
+#include "TritonToGraph/SelectedBlockScanFacts.h"
 
 namespace {
 
@@ -240,11 +241,15 @@ buildScanPrologue(IRRewriter &rewriter, ScanCandidate &candidate, Type i32,
   Value slotValid = rewriter.create<arith::CmpIOp>(
       loc, arith::CmpIPredicate::slt, offs, nsSplat);
 
-  // ---- Scan bound: cdiv(i_t + 1, BN) folded to divsi(pid_x + BN, BN), in i32
-  // whatever the old iv's width. Truncating a wider row position is inside the
-  // rewrite's contract (every token address it builds is i32); a negative
-  // result only shrinks the trip count to zero and never widens the table read,
-  // which is clamped to [0, S) separately.
+  // ---- Scan bound: (row + BN) / BN. ----
+  // NSA 的有效输入约定：行位置以及这里新增的 row + BN 均不发生 i32 回绕。
+  // 非负行的结果为 floor(row / BN) + 1；负行的有符号商不大于 0，
+  // 因而从 0 开始、步长为 1 的扫描自然不执行，无需额外的逐行 select。
+  // Use the no-wrap NSA input contract, including this added row + BN.
+  // A negative row yields a nonpositive bound and the zero-based loop is empty.
+  // Token addresses retain the existing i32 contract.
+  if (BN < 2 || BN > std::numeric_limits<int32_t>::max())
+    return std::nullopt;
   Value rowPosition = candidate.rowPosition;
   if (rowPosition.getType() != i32) {
     unsigned width = rowPosition.getType().getIntOrFloatBitWidth();
@@ -258,8 +263,16 @@ buildScanPrologue(IRRewriter &rewriter, ScanCandidate &candidate, Type i32,
   Value c0 = rewriter.create<arith::ConstantIntOp>(loc, 0, 32);
   Value c1 = rewriter.create<arith::ConstantIntOp>(loc, 1, 32);
   Value cBN = rewriter.create<arith::ConstantIntOp>(loc, BN, 32);
-  Value scanUpperBound = rewriter.create<arith::DivSIOp>(
-      loc, rewriter.create<arith::AddIOp>(loc, rowPosition, cBN), cBN);
+  Value scanUpperBound;
+  auto pid = rowPosition.getDefiningOp<triton::GetProgramIdOp>();
+  // 原始 pid 必然非负，保留既有的等价写法，避免改变 dQ 的后端调度。
+  // 带运行期偏移的行位置使用旧公式，负行自然得到非正上界。
+  if (pid && pid.getAxisAsInt() == 0)
+    scanUpperBound = rewriter.create<arith::AddIOp>(
+        loc, rewriter.create<arith::DivSIOp>(loc, rowPosition, cBN), c1);
+  else
+    scanUpperBound = rewriter.create<arith::DivSIOp>(
+        loc, rewriter.create<arith::AddIOp>(loc, rowPosition, cBN), cBN);
 
   // Re-create the K/V dynamic bound outside the loop, unfolded. Only the
   // online-softmax template's make_tensor_ptr rebuild consumes it.

@@ -27,10 +27,8 @@
 // CORENUM: hacc.coalesce_factor = 2 : i32
 
 // The row lift rewrites the query-row axis of the loop the scan rewrite handed
-// over.  The matcher no longer judges whether the loop is sequential.  It accepts a
-// pid-dependent upper bound only when the bound is provably non-decreasing over
-// the whole pid range, so the last row of the group supplies the loop trip
-// count and the per-row copy becomes the active mask.
+// over. A non-decreasing bound uses the last valid row under the no-wrap input
+// contract; unsupported bounds decline. The per-row copy supplies the active mask.
 
 // CHECK: module attributes {{.*}}hacc.coalesce_factor = 64 : i32
 // CHECK-LABEL: tt.func @pid_bound_loop(
@@ -82,16 +80,18 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num
 
 // -----
 
-// A row-invariant scf.if may select between two monotone bound chains: the
-// envelope of both branches is monotone, and every row takes the same branch.
+// 上界切片不分析 scf.if；分支结果依赖行号时保留原循环，不生成组内 max。
+// A row-dependent bound produced by scf.if declines the lift. This restriction
+// does not remove support for row-invariant conditions inside the loop body.
 
-// CHECK: module attributes {{.*}}hacc.coalesce_factor = 64 : i32
+// CHECK: module attributes {hacc.grid_num_tiles = 64 : i32
 // CHECK-LABEL: tt.func @row_invariant_if_bound(
-// CHECK: scf.if {{.*}} -> (i32, tensor<64xi32>)
-// CHECK: tt.load {{.*}} : tensor<64x16x16x!tt.ptr<f16>>
+// CHECK: scf.if {{.*}} -> (i32)
+// CHECK: tt.load {{.*}} : tensor<16x16x!tt.ptr<f16>>
+// CHECK-NOT: "tt.reduce"
 // CHECK: scf.for
-// CHECK: tt.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<1024x16xf16> * tensor<16x16xf16> -> tensor<1024x16xf32>
-// CHECK: arith.select {{.*}} : tensor<1024x16xi1>, tensor<1024x16xf32>
+// CHECK: tt.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<16x16xf16> * tensor<16x16xf16> -> tensor<16x16xf32>
+// CHECK: tt.store {{.*}} : tensor<16x16x!tt.ptr<f32>>
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num_tiles = 64 : i32} {
   tt.func @row_invariant_if_bound(%A: !tt.ptr<f16>, %B: !tt.ptr<f16>, %C: !tt.ptr<f32>) {
     %pid = tt.get_program_id x : i32
@@ -145,9 +145,9 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num
 
 // -----
 
-// A pid-invariant tt.reduce result shifts a monotone bound chain.  Its value is
-// unknown, so the prover accepts the chain as monotone but never invents a
-// numeric range for it.
+// 共享归约值作为行无关偏移复用；无需折叠归约即可证明偏移后的上界非降。
+// A shared reduction is reused as an invariant offset. Under the no-wrap input
+// contract the shifted bound is non-decreasing without folding the reduction.
 
 // CHECK: module attributes {{.*}}hacc.coalesce_factor = 64 : i32
 // CHECK-LABEL: tt.func @reduce_shifted_bound(
@@ -203,12 +203,11 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num
 
 // -----
 
-// A decreasing pid-dependent bound has no computable group trip count: the
-// merge is declined and the function is left exactly as it was.
-
-// CHECK-NOT: hacc.coalesce_factor
+// A decreasing bound cannot use the last row and must decline the lift.
+// CHECK: module attributes {hacc.grid_num_tiles
 // CHECK-LABEL: tt.func @nonmonotone_pid_bound(
-// CHECK: scf.for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} iter_args
+// CHECK-NOT: "tt.reduce"
+// CHECK: scf.for
 // CHECK: tt.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<16x16xf16> * tensor<16x16xf16> -> tensor<16x16xf32>
 // CHECK: tt.store {{.*}} : tensor<16x16x!tt.ptr<f32>>
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.grid_num_tiles = 64 : i32} {

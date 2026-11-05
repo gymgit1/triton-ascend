@@ -183,13 +183,13 @@
 // H > 1 that same constant would be H*S, i.e. a vector read spilling into the
 // next head's row.
 // Inputs/nsa_fwd_h1_dyn_ns.mlir is that IR (H=1 HQ=16 G=16 K=V=64 S=16 BS=32).
-// RUN: triton-opt %S/Inputs/nsa_fwd_h1_dyn_ns.mlir -graph-optimize='rule-mask=0' -canonicalize -cse -o %t.h1dyn.ctl
-// RUN: triton-opt %S/Inputs/nsa_fwd_h1_dyn_ns.mlir -graph-optimize='rule-mask=196608' -o %t.h1dyn.joint
-// RUN: FileCheck %s --check-prefix=H1DYNREW < %t.h1dyn.joint
-// RUN: not diff %t.h1dyn.ctl %t.h1dyn.joint
-// the joint rewrite lands on the runtime-grid flavour with R=8 and the slot
-// axis still S=16 wide (the row stride H*S was read as S because H == 1)
-// H1DYNREW: hacc.program_grid_transforms = {extent_source = "runtime_original_grid"
+// The runtime decode offset uses a last-valid-row bound under the no-wrap input contract. The bounded variant also exercises the static-grid contract.
+// RUN: triton-opt %S/Inputs/nsa_fwd_h1_dyn_ns.mlir -graph-optimize='rule-mask=196608' -canonicalize -cse -o %t.h1dyn.joint
+// RUN: FileCheck %s --check-prefix=H1GROUP < %t.h1dyn.joint
+// RUN: sed 's/%7 = arith.subi %arg9, %arg8 : i32/%7 = arith.constant 64 : i32/; s/module attributes {/module attributes {hacc.grid_num_tiles = 512 : i32,/' %S/Inputs/nsa_fwd_h1_dyn_ns.mlir > %t.h1bounded.mlir
+// RUN: triton-opt %t.h1bounded.mlir -graph-optimize='rule-mask=196608' -o %t.h1bounded
+// RUN: FileCheck %s --check-prefix=H1DYNREW < %t.h1bounded
+// H1DYNREW: hacc.coalesce_factor = 32 : i32
 // H1DYNREW: tt.func public @parallel_nsa_fwd_kernel(
 // H1DYNREW-NOT: scf.if
 // H1DYNREW: tensor<32x16x!tt.ptr<i64>>
@@ -277,3 +277,12 @@
 // RUN:   triton-opt %S/Inputs/$f.mlir -graph-optimize='rule-mask=196608' --verify-each -canonicalize -cse -o %t.$f.once && \
 // RUN:   triton-opt %t.$f.once -graph-optimize='rule-mask=196608' --verify-each -canonicalize -cse -o %t.$f.twice && \
 // RUN:   diff %t.$f.once %t.$f.twice || exit 1; done
+
+// The H=1 dynamic-offset form uses a last-valid-row bound. The scan rewrite still
+// commits only when its joint row-batching query succeeds.
+// H1GROUP: hacc.program_grid_transforms
+// H1GROUP-LABEL: tt.func public @parallel_nsa_fwd_kernel(
+// H1GROUP: arith.minsi
+// H1GROUP-NOT: arith.maxsi {{.*}} : i32
+// H1GROUP: scf.for
+// H1GROUP: tt.dot

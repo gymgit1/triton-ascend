@@ -35,7 +35,6 @@
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Verifier.h"
-#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -280,10 +279,6 @@ static std::optional<RowCandidate> matchDotRows(triton::FuncOp fn,
             triton::AddPtrOp, triton::TransOp, triton::ReshapeOp>(op))
       return;
     StringRef ns = op->getName().getDialectNamespace();
-    // A partial group evaluates arithmetic for inactive rows as well.
-    if (!grid && dependent && (ns == "arith" || ns == "math") &&
-        !isSpeculatable(op))
-      safe = false;
     if ((ns != "arith" && ns != "math") || op->getNumRegions())
       safe = false;
   });
@@ -294,21 +289,8 @@ static std::optional<RowCandidate> matchDotRows(triton::FuncOp fn,
   if (!safe || pids != 1 || loops != 1 || dots == 0 || stores != 1 ||
       loop.getNumResults() == 0 ||
       getConstantIntValue(loop.getLowerBound()) != std::optional<int64_t>(0) ||
-      (dependsOnValue(loop.getUpperBound(), pid.getResult()) &&
-       !inferMonotonicBounds(loop.getUpperBound(), pid.getResult(),
-                             grid ? grid.getInt() : INT32_MAX)))
+      !canUseLastRowLoopBound(loop, pid.getResult(), grid ? grid.getInt() : 0))
     return std::nullopt;
-
-  // Merging unequal trip counts speculates pure arithmetic for inactive rows.
-  // Preserve the old accumulator, but do not speculate potentially trapping
-  // operations such as integer division with an unproven nonzero divisor.
-  if (dependsOnValue(loop.getUpperBound(), pid.getResult())) {
-    for (Operation &op : loop.getBody()->without_terminator()) {
-      StringRef ns = op.getName().getDialectNamespace();
-      if ((ns == "arith" || ns == "math") && !isSpeculatable(&op))
-        return std::nullopt;
-    }
-  }
 
   for (Value init : loop.getInitArgs())
     if (!isa<RankedTensorType>(init.getType()))

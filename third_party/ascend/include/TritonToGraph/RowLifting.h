@@ -66,44 +66,10 @@ std::optional<int64_t> getConstantIntValue(Value v);
 // type returns 0.
 int64_t getElementStorageBytes(Type element);
 
-// 标量表达式在 `pid` 取 `[0, grid - 1]` 时的有符号取值范围。`grid` 非正
-// 表示运行期范围，此时按整个非负 i32 区间证明。
-// Signed range of a scalar expression over `pid` taken from `[0, grid - 1]`.
-// A non-positive `grid` denotes a runtime extent and is proved over the whole
-// non-negative i32 range.
-struct IntegerBounds {
-  int64_t lo;
-  int64_t hi;
-};
-
-// 同时证明 `value` 关于 `pid` 单调非降且中间整数运算不会回绕，并返回其
-// 范围。语法上递增的表达式一旦中间 add/mul 回绕就不再单调，所以必须先
-// 得到可靠范围，才能用最后一行的值作为整组的循环上界。
-// Prove together that `value` is monotone non-decreasing in `pid` and that no
-// intermediate integer operation wraps. A syntactically increasing expression
-// is not monotonic if an intermediate add/multiply wraps, so a proven range is
-// required before the last row's value can serve as the group's loop bound.
-std::optional<IntegerBounds> inferMonotonicBounds(Value value, Value pid,
-                                                  int64_t grid);
-
-// 上界证明的布尔形式，供只需要判断「最后一行给出最大值」的调用方使用。
-// 与 pid 无关的值在各提升行上是常量，因此由不变量源的 `tt.reduce` 或
-// 条件不变的 `scf.if` 产生的上界可以直接接受，无需数值范围（统一按
-// 「单调但无范围」处理，不单独区分 pid 无关）。
-// 与 pid 有关的链只要语法上单调非降即可通过：末行上界由运行期重新求值得到，
-// 证明器不必给出数值范围；范围放不进表达式位宽时也按「单调」接受，只有需要
-// 按上界算出具体宽度的调用方才要求 `inferMonotonicBounds` 返回具体范围。
-// Boolean form of the bound proof for callers that only need "the last row
-// supplies the maximum".  A pid-invariant value is constant across the lifted
-// rows, so a bound produced by a `tt.reduce` of invariant sources, or by an
-// `scf.if` with an invariant condition, is accepted without a numeric range.
-// A pid-dependent chain only has to be syntactically monotone non-decreasing:
-// the last row's bound is re-evaluated at run time, so no numeric range is
-// needed; a range that does not fit the expression's bit width still counts as
-// monotone, and only callers that size something from the proven `hi`
-// (DotRowCoalescing) require the concrete range returned by
-// `inferMonotonicBounds`.
-bool isMonotoneInPid(Value value, Value pid, int64_t grid);
+// 有效输入的上界算术不回绕时，判断能否证明非降并安全取最后一个有效行。
+// 不支持或非单调的上界拒绝合并；运行期尾组仍按原 grid 钳位并保留活动掩码。
+// Both callers share the no-wrap input contract and speculative-execution checks.
+bool canUseLastRowLoopBound(scf::ForOp loop, Value pid, int64_t grid);
 
 // 行提升扩展能力的开关。所有开关默认关闭，未置位的能力保持原有的
 // 失败关闭路径。
@@ -439,20 +405,8 @@ private:
     bool expanded = false;
   };
 
-  // 沿最后一维把值拆成两个连续半宽值（仅用于进位初值等无法结构拆分的形态）。
-  // Splits `value` along its last dimension into two contiguous halves; only used
-  // for the loop-carried initial value, which has no structural source.
-  bool splitLastDimension(Value value, SplitValue &halves);
-  // 取一个已规划拆半值的两个半宽提升值：先复用重写期已登记的两半，否则按规划
-  // 的半宽从原始值直接重建（splat 常量与 splat 折叠成半宽常量，其余形态先拆
-  // 再各自补行维），避免先提升成全宽再拆。两者都不可用时返回 false，调用方据
-  // 此放弃整次提升。
-  // Return the two half-width lifted values of a value planned for halving: reuse
-  // the halves registered during rewriting, otherwise rebuild them from the
-  // original value using the planned half width (a splat constant or a scalar
-  // splat collapses into a half-width constant; anything else is halved first and
-  // lifted per half), so a full-width lifted temporary is never materialised.
-  // Returning false makes the caller decline the whole lift.
+  // 取已规划拆半值的两个半宽提升值：复用已登记的两半，或从常量/广播直接
+  // 重建同列值。不存在结构化半宽来源时返回 false，由调用方放弃该提升候选。
   bool ensureRowHalves(Value old, SplitValue &halves);
   // 把一个整宽操作数按半宽重建：只有「各列取值相同」的形态（标量 splat、
   // 沿最后一维从 1 广播、splat 常量）可以这样折叠，重建后同一个半宽值同时

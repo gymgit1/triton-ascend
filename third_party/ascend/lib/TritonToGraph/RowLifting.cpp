@@ -27,6 +27,7 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APInt.h"
@@ -50,7 +51,7 @@ namespace cfg {
 
 // 本文件把「一个 program 只处理一行查询」的函数体重建为「一个 program
 // 处理 R 行查询」：与查询行相关的值在类型最前面插入行维 [R]，循环用组内
-// 末行的上界作为共享 trip count，各行的差异由逐行有效掩码表达。
+// 最后一个有效行的上界作为共享 trip count，各行的差异由逐行有效掩码表达。
 //
 // 公共类型、依赖分析与形状/掩码工具之后，扩展能力按需求顺序组织：
 //   1. tt.reduce 与条件和行号无关的 scf.if；
@@ -61,8 +62,8 @@ namespace cfg {
 // 最后是引擎入口与指令分派；函数的排列不改变分派顺序。
 //
 // DotRowCoalescing 与规则 B 共用本引擎，各自维护 matcher。RowLiftFeatures
-// 默认全部关闭；DotRow 不启用新能力，保留其原有重建路径。循环压平针对计算
-// 链，地址、掩码和布局边界仍可保留 reshape。启动契约由规则层发布；双版本
+// 默认全部关闭；DotRow 不启用这些扩展开关，两个规则都使用共享上界策略。
+// 循环压平针对计算链，地址、掩码和布局边界仍可保留 reshape。启动契约由规则层发布；双版本
 // 生成与运行期选择不属于本组件，网格契约本身也不提供双版本分派。
 
 //===----------------------------------------------------------------------===//
@@ -126,249 +127,154 @@ bool isPidInvariant(Value value, Value pid) {
 // 读取整数常量；不是常量时返回 nullopt。规则 matcher 与重写路径共用。
 std::optional<int64_t> getConstantIntValue(Value v) {
   APInt value;
-  if (matchPattern(v, m_ConstantInt(&value)))
+  if (matchPattern(v, m_ConstantInt(&value)) && value.isSignedIntN(64))
     return value.getSExtValue();
 
   return std::nullopt;
 }
 
-// 上界证明的三态结果：
-//   None      —— 无法证明单调，调用方必须拒绝行提升；
-//   Monotone  —— 已证明关于 pid 单调非降，但没有可用的数值范围。幅度未知的
-//                项（例如对已加载 tile 做 tt.reduce 得到的标量）与范围放不进
-//                表达式位宽，都归入此态；
-//   Bounded   —— 给出了具体数值范围，末行取值可作循环上界；需要按上界算出
-//                具体宽度的调用方只接受此态。
-// 行提升只需要「末行取值是组内最大」这一单调性，末行上界是在运行期用原表达式
-// 重新求值得到的，不依赖证明器算出的数值，所以 Monotone 已经够用。
-// A pid-independent term only shifts the chain by a constant, which keeps the
-// monotonicity but hides its magnitude (the scalar result of a tt.reduce over a
-// loaded tile, for instance).  That case and a range that does not fit the
-// expression's bit width are both reported as `Monotone`: row lifting only needs
-// the last row's value to be the group maximum, which is re-evaluated from the
-// original expression at run time.  Only callers that have to size something
-// from the proven `hi` (DotRowCoalescing) ask for `Bounded`.
-enum class BoundKind { None, Monotone, Bounded };
-
-struct BoundProof {
-  BoundKind kind = BoundKind::None;
-  IntegerBounds bounds{0, 0};
-
-  static BoundProof none() { return {}; }
-
-  static BoundProof monotone() { return {BoundKind::Monotone, {0, 0}}; }
-
-  static BoundProof bounded(IntegerBounds b) { return {BoundKind::Bounded, b}; }
-
-  bool ok() const { return kind != BoundKind::None; }
+// 标量表达式在 pid 范围内的有符号区间，仅供本文件的上界和等迭代数分析使用。
+struct IntegerBounds {
+  int64_t lo;
+  int64_t hi;
 };
 
-// 前向声明：证明 value 关于 pid 单调非降，返回三态证明结果。
-static BoundProof proveBound(Value value, Value pid, int64_t grid);
-
-// Narrow a bounded result to the bit width of the expression it came from.
-// A range that does not fit the expression's width cannot be used as a numeric
-// bound, but the chain is still syntactically monotone, so the result degrades
-// to `Monotone` instead of failing: row lifting only needs monotonicity, and
-// only callers that size something from `hi` (DotRowCoalescing) need the range.
-// 把有界证明收窄到表达式位宽；范围放不进该位宽时退化为「单调但无范围」，
-// 供行提升使用；需要按上界算出具体宽度的调用方自行要求 Bounded。
-static BoundProof checkWidth(Value value, BoundProof proof) {
-  if (proof.kind != BoundKind::Bounded)
-    return proof;
-
+// 证明上界随 pid 非降，并保留区间供乘数符号和等迭代数分析使用。
+// 输入约定：有效行的上界算术按普通有符号整数计算，不发生回绕。这里不再要求
+// 静态范围完全落在位宽内；例如运行期 pid + 共享偏移可证明非降，但独立区间
+// 无法表达 grid 与序列长度的关联。此时仍返回单调，调用方取最后一个有效行。
+// 该约定只放宽上界的数值范围证明，不放行负乘数、非正除数或未知条件选择。
+// Valid inputs must not wrap in row-dependent bound arithmetic. The analysis
+// proves order under that contract; it does not require independent intervals
+// to prove the runtime grid/sequence-length relation. Generated IR keeps its
+// original integer width. Unsupported or non-monotone forms decline the lift.
+static std::optional<IntegerBounds> inferMonotonicBounds(Value value, Value pid,
+                                                        int64_t grid) {
   auto integer = dyn_cast<IntegerType>(value.getType());
-  if (!integer || integer.getWidth() > 64 ||
-      !APInt(64, proof.bounds.lo, true).isSignedIntN(integer.getWidth()) ||
-      !APInt(64, proof.bounds.hi, true).isSignedIntN(integer.getWidth()))
-    return BoundProof::monotone();
-  return proof;
-}
-
-// 为什么需要这条单调性证明：一次行提升把同一个程序负责的 R 个连续 pid 折成
-// 一维行，而原循环的 trip count 由 pid 决定，合并后的循环却只能有一个上界。
-// 取组内最后一个 pid（末行）的上界取值来跑这条合并循环是正确的，当且仅当该
-// 上界随 pid 单调非降：只要中间某行比末行大，用末行取值就会截断那一行的循环，
-// 结果从「少算几次迭代」直接变成错误数据。
-// 单调性还不足以单独成立：语法上递增的链在中间整数运算回绕时会翻转，所以能给出
-// 范围时顺带证明不溢出。给不出范围（含幅度未知的项，或范围放不进表达式位宽）时
-// 仍按 Monotone 接受，因为末行上界不是证明器的数值，而是在运行期用原表达式在末行
-// 取值上重新求值（见 RowLiftBuilder::run 里的 lastRowMapping）。只有需要具体范围的
-// 调用方（DotRowCoalescing）才把 Monotone 当作拒绝理由。
-// 作用：沿参与上界计算的标量算术切片递归证明 `value` 关于 `pid` 单调非降，返回
-// 三态结果 None / Monotone / Bounded，供规则 A 与 RowCoalescing 的 matcher 在匹配
-// 阶段就拒绝无法保证正确性的循环，使不合法的形态进不了重写路径。
-// Why this monotonicity proof is required: one lift folds the R consecutive pids
-// a program owns into a row dimension, but the original loop's trip count varies
-// with pid while the merged loop can carry only one upper bound.  Using the last
-// row's bound value is correct only when the bound is monotone non-decreasing in
-// pid; any earlier row with a larger bound would have its loop truncated, which is
-// wrong data rather than merely fewer iterations.  Monotonicity alone is not
-// enough: a syntactically increasing chain flips once an intermediate integer
-// operation wraps, so a proven range also rules out wrapping.  A chain with no
-// usable range (an unknown-magnitude term, or a range that does not fit the
-// expression's bit width) is still accepted as `Monotone`, because the last-row
-// bound is re-evaluated at run time from the original expression instead of
-// taken from the prover (see lastRowMapping in RowLiftBuilder::run).  Only callers
-// that need a concrete range (DotRowCoalescing) treat `Monotone` as grounds for
-// rejection.  What it does: recurse over the scalar arithmetic slice that feeds
-// the bound and report one of None / Monotone / Bounded, so the rule A and
-// RowCoalescing matchers can reject unsafe loops at match time and keep them out
-// of the rewrite path.
-static BoundProof proveBound(Value value, Value pid, int64_t grid) {
-  // 基例一：pid 本身，范围就是 [0, grid - 1]（grid 非正表示运行期范围）。
-  if (value == pid)
-    return BoundProof::bounded({0, grid - 1});
-
-  // 基例二：整数常量，退化为单点范围。
-  if (auto constant = getConstantIntValue(value))
-    return BoundProof::bounded({*constant, *constant});
-
-  // 有符号扩展不改变单调性，直接穿透到源操作数。
-  if (auto ext = value.getDefiningOp<arith::ExtSIOp>())
-    return proveBound(ext.getIn(), pid, grid);
-
-  // scf.if：条件与 pid 无关时所有提升行都走同一分支，因此只需分别证明两个
-  // 分支的 yield 值；两个分支都有范围时取并集，任一分支无范围时整条链仍
-  // 单调但没有可用范围。
-  // Every lifted row takes the same branch when the condition is pid-invariant,
-  // so each branch only has to be proven monotone on its own.  Two bounded
-  // branches yield the union of their ranges; as soon as one branch has no
-  // proven range the selection is monotone but unbounded.
-  if (auto ifOp = value.getDefiningOp<scf::IfOp>()) {
-    if (!isPidInvariant(ifOp.getCondition(), pid))
-      return BoundProof::none();
-    if (ifOp.getElseRegion().empty())
-      return BoundProof::none();
-
-    unsigned index = cast<OpResult>(value).getResultNumber();
-    SmallVector<Value, 2> yields;
-    for (Region *region : {&ifOp.getThenRegion(), &ifOp.getElseRegion()}) {
-      auto yield = dyn_cast<scf::YieldOp>(region->front().getTerminator());
-      if (!yield || yield.getNumOperands() <= index)
-        return BoundProof::none();
-      yields.push_back(yield.getOperand(index));
-    }
-
-    auto then = proveBound(yields[0], pid, grid);
-    auto otherwise = proveBound(yields[1], pid, grid);
-    if (!then.ok() || !otherwise.ok())
-      return BoundProof::none();
-    if (then.kind == BoundKind::Bounded && otherwise.kind == BoundKind::Bounded)
-      return BoundProof::bounded(
-          {std::min(then.bounds.lo, otherwise.bounds.lo),
-           std::max(then.bounds.hi, otherwise.bounds.hi)});
-    return BoundProof::monotone();
-  }
-
-  // 二元整数运算：先递归证明两个操作数，再按运算类型推导结果范围。
-  //   add —— 两个有范围的操作数逐项相加；混入与 pid 无关的项时只保留
-  //           「单调但幅度未知」，因为常量平移不改变单调性；
-  //   mul —— 只有两个操作数都有范围且非负时才可推导，否则乘法可能放大
-  //           甚至翻转整条链；
-  //   div —— 除数必须是已知正数常量，被除数的范围按常量整除收窄。
-  // 任一中间运算可能回绕时退化为「单调但无范围」（checkWidth 再核对结果位宽），
-  // 因为行提升的末行上界是运行期重新求值，不需要证明器给出的数值。
-  Operation *op = value.getDefiningOp();
-  if (op && op->getNumOperands() == 2) {
-    auto lhs = proveBound(op->getOperand(0), pid, grid);
-    auto rhs = proveBound(op->getOperand(1), pid, grid);
-    if (lhs.ok() && rhs.ok()) {
-      IntegerBounds result;
-      if (isa<arith::AddIOp>(op)) {
-        // 常量平移保持单调性但会隐藏和的幅度，因此只能作为自身范围使用。
-        // A constant shift preserves monotonicity but hides the magnitude of
-        // the sum, so the result is only usable as a bound of its own.
-        if (lhs.kind != BoundKind::Bounded || rhs.kind != BoundKind::Bounded)
-          return BoundProof::monotone();
-        if (__builtin_add_overflow(lhs.bounds.lo, rhs.bounds.lo, &result.lo) ||
-            __builtin_add_overflow(lhs.bounds.hi, rhs.bounds.hi, &result.hi))
-          return BoundProof::monotone();
-      } else if (isa<arith::MulIOp>(op)) {
-        // 未知因子可能放大或翻转整条链，含幅度未知项的乘积一律不证明。
-        // An unknown factor could flip or amplify the chain, so a product with
-        // an unbounded term stays unproven.
-        if (lhs.kind != BoundKind::Bounded || rhs.kind != BoundKind::Bounded)
-          return BoundProof::none();
-        if (lhs.bounds.lo < 0 || rhs.bounds.lo < 0 ||
-            __builtin_mul_overflow(lhs.bounds.lo, rhs.bounds.lo, &result.lo) ||
-            __builtin_mul_overflow(lhs.bounds.hi, rhs.bounds.hi, &result.hi))
-          return BoundProof::none();
-      } else if (isa<arith::SubIOp>(op)) {
-        // 被减数随 pid 单调、减数与 pid 无关时，差值保持同一方向；减数依赖
-        // pid 则可能翻转整条链。幅度未知，因此只给出单调性。
-        // A monotone numerator minus a pid-invariant term keeps its direction;
-        // a pid-dependent subtrahend can invert it.  The magnitude is unknown,
-        // so only monotonicity is reported.
-        if (!isPidInvariant(op->getOperand(1), pid))
-          return BoundProof::none();
-        return BoundProof::monotone();
-      } else if (isa<arith::DivSIOp>(op) && rhs.kind == BoundKind::Bounded &&
-                 rhs.bounds.lo == rhs.bounds.hi && rhs.bounds.lo > 0) {
-        // 除以正常量保持单调性，但被除数的幅度未知时无法给出范围。
-        // Dividing by a positive constant preserves monotonicity, but the
-        // quotient has no usable range when the numerator is unbounded.
-        if (lhs.kind != BoundKind::Bounded)
-          return BoundProof::monotone();
-        result = {lhs.bounds.lo / rhs.bounds.lo, lhs.bounds.hi / rhs.bounds.lo};
-      } else {
-        // 其余算术（例如 sub、rem）不再细分，统一放弃证明。
-        return BoundProof::none();
-      }
-      return checkWidth(value, BoundProof::bounded(result));
-    }
-  }
-
-  // 兜底：算术推导失败但值完全与 pid 无关时仍可接受——各行取同一常量，
-  // 末行副本天然是最大值；tt.reduce 这类不变量源的标量结果由此通过。
-  // A value the arithmetic prover cannot bound is still acceptable when it does
-  // not depend on the query row: it never changes as the row advances, so the
-  // last row's copy is trivially the maximum.  This is how a bound produced by a
-  // tt.reduce of invariant sources is accepted.
-  if (isPidInvariant(value, pid))
-    return BoundProof::monotone();
-  return BoundProof::none();
-}
-
-// 只接受能给出具体数值范围的上界证明，返回下界与上界。
-std::optional<IntegerBounds> inferMonotonicBounds(Value value, Value pid,
-                                                  int64_t grid) {
-  BoundProof proof = proveBound(value, pid, grid);
-  if (proof.kind != BoundKind::Bounded)
+  if (!integer || integer.getWidth() > 64)
     return std::nullopt;
-  return proof.bounds;
+  unsigned width = integer.getWidth();
+  IntegerBounds domain{APInt::getSignedMinValue(width).getSExtValue(),
+                       APInt::getSignedMaxValue(width).getSExtValue()};
+  // 128 位仅用于编译器内部的区间运算，避免分析器自身溢出；按上述有效输入约定
+  // 将区间限于结果类型的范围。这不是在生成的 kernel 中插入饱和算术。
+  auto finish = [&](__int128 lo, __int128 hi) -> IntegerBounds {
+    return {static_cast<int64_t>(std::clamp<__int128>(lo, domain.lo, domain.hi)),
+            static_cast<int64_t>(std::clamp<__int128>(hi, domain.lo, domain.hi))};
+  };
+  if (value == pid)
+    return finish(0, (grid > 0 ? grid : INT32_MAX) - 1);
+  if (auto constant = getConstantIntValue(value))
+    return IntegerBounds{*constant, *constant};
+  if (isPidInvariant(value, pid))
+    return domain;
+  if (auto ext = value.getDefiningOp<arith::ExtSIOp>())
+    return inferMonotonicBounds(ext.getIn(), pid, grid);
+
+  // 规则 A 的 NSA 扫描上界：row >= 0 ? row / BN + 1 : 0。
+  // row 非降且 BN > 0 时，两段各自非降，在 row=0 处由 0 跳到 1；不需要
+  // 通用分支区间推导。接受 canonicalize 后的反向条件，其余 select 仍拒绝。
+  if (auto select = value.getDefiningOp<arith::SelectOp>()) {
+    auto cmp = select.getCondition().getDefiningOp<arith::CmpIOp>();
+    if (!cmp || getConstantIntValue(cmp.getRhs()) != 0)
+      return std::nullopt;
+    Value positive;
+    if (cmp.getPredicate() == arith::CmpIPredicate::sge &&
+        getConstantIntValue(select.getFalseValue()) == 0)
+      positive = select.getTrueValue();
+    else if (cmp.getPredicate() == arith::CmpIPredicate::slt &&
+             getConstantIntValue(select.getTrueValue()) == 0)
+      positive = select.getFalseValue();
+    auto add = positive ? positive.getDefiningOp<arith::AddIOp>()
+                        : arith::AddIOp();
+    if (!add)
+      return std::nullopt;
+    Value quotient = getConstantIntValue(add.getRhs()) == 1 ? add.getLhs()
+                     : getConstantIntValue(add.getLhs()) == 1 ? add.getRhs()
+                                                             : Value();
+    auto div = quotient ? quotient.getDefiningOp<arith::DivSIOp>()
+                        : arith::DivSIOp();
+    if (!div || div.getLhs() != cmp.getLhs())
+      return std::nullopt;
+    auto divisor = getConstantIntValue(div.getRhs());
+    auto bounds = inferMonotonicBounds(div.getLhs(), pid, grid);
+    if (!divisor || *divisor <= 0 || !bounds)
+      return std::nullopt;
+    return finish(0, std::max<__int128>(
+                         0, static_cast<__int128>(bounds->hi) / *divisor + 1));
+  }
+
+  Operation *op = value.getDefiningOp();
+  if (!op || op->getNumOperands() != 2)
+    return std::nullopt;
+  auto lhs = inferMonotonicBounds(op->getOperand(0), pid, grid);
+  auto rhs = inferMonotonicBounds(op->getOperand(1), pid, grid);
+  if (!lhs || !rhs)
+    return std::nullopt;
+  if (isa<arith::AddIOp>(op))
+    return finish(static_cast<__int128>(lhs->lo) + rhs->lo,
+                  static_cast<__int128>(lhs->hi) + rhs->hi);
+  if (isa<arith::SubIOp>(op) && isPidInvariant(op->getOperand(1), pid))
+    return finish(static_cast<__int128>(lhs->lo) - rhs->hi,
+                  static_cast<__int128>(lhs->hi) - rhs->lo);
+  if (isa<arith::MulIOp>(op)) {
+    // 乘非负常量保持次序，不要求另一个操作数非负；两个变化量则需都非负。
+    if (rhs->lo == rhs->hi && rhs->lo >= 0)
+      return finish(static_cast<__int128>(lhs->lo) * rhs->lo,
+                    static_cast<__int128>(lhs->hi) * rhs->lo);
+    if (lhs->lo == lhs->hi && lhs->lo >= 0)
+      return finish(static_cast<__int128>(lhs->lo) * rhs->lo,
+                    static_cast<__int128>(lhs->lo) * rhs->hi);
+    if (lhs->lo >= 0 && rhs->lo >= 0)
+      return finish(static_cast<__int128>(lhs->lo) * rhs->lo,
+                    static_cast<__int128>(lhs->hi) * rhs->hi);
+  }
+  if (isa<arith::DivSIOp>(op) && rhs->lo == rhs->hi && rhs->lo > 0)
+    return finish(lhs->lo / rhs->lo, lhs->hi / rhs->lo);
+  return std::nullopt;
 }
 
-// 上界证明的布尔查询：只要能证明单调（含 pid 无关常量）即为 true。
-bool isMonotoneInPid(Value value, Value pid, int64_t grid) {
-  return proveBound(value, pid, grid).ok();
+// 在不回绕的输入约定下证明上界非降，并检查合并带来的额外求值是否安全。
+// 通过后统一取最后一个有效行；无法证明的形态直接拒绝，不再生成组内 max。
+bool canUseLastRowLoopBound(scf::ForOp loop, Value pid, int64_t grid) {
+  Value bound = loop.getUpperBound();
+  auto unsafeArithmetic = [](Operation *op) {
+    StringRef ns = op->getName().getDialectNamespace();
+    return (ns == "arith" || ns == "math") && !isSpeculatable(op);
+  };
+  if (grid <= 0) {
+    // Padded tail rows also evaluate address arithmetic outside the bound's
+    // slice. Masking a load does not make an earlier integer division safe.
+    auto function = loop->getParentOfType<triton::FuncOp>();
+    if (!function)
+      return false;
+    auto result = function.walk([&](Operation *op) {
+      bool unsafe = unsafeArithmetic(op) &&
+                    llvm::any_of(op->getOperands(), [&](Value operand) {
+                      return !isPidInvariant(operand, pid);
+                    });
+      return unsafe ? WalkResult::interrupt() : WalkResult::advance();
+    });
+    if (result.wasInterrupted())
+      return false;
+  }
+  if (!isPidInvariant(bound, pid)) {
+    // A shared loop also evaluates the body for rows which have stopped. A
+    // select on the yielded accumulator cannot repair a trapping operation.
+    auto result = loop.getBody()->walk([&](Operation *op) {
+      return unsafeArithmetic(op) ? WalkResult::interrupt()
+                                  : WalkResult::advance();
+    });
+    if (result.wasInterrupted())
+      return false;
+  }
+  return inferMonotonicBounds(bound, pid, grid).has_value();
 }
 
-// The part of a loop bound that can be re-evaluated at the last row: integer
-// arithmetic, plus an scf.if whose branches hold nothing but that arithmetic.  A
-// region that could have side effects stops the last-row copy, so the bound is
-// evaluated once instead of being duplicated into a speculative path.
-// 判断 op 是否属于可安全复制到末行求值的纯标量上界切片（arith 或纯算术 scf.if）。
+// NSA 和原有 DotRow 的上界只重建无 region 的标量算术；其他形态由调用方回退。
 static bool isScalarBoundSlice(Operation *op) {
   StringRef ns = op->getName().getDialectNamespace();
-  if (ns == "arith")
-    return true;
-  if (!isa<scf::IfOp>(op))
-    return false;
-
-  bool pure = true;
-  op->walk([&](Operation *nested) {
-    if (nested == op || !pure)
-      return;
-    // Branch terminators only forward the yielded value, so they are part of
-    // the slice; anything else in a branch has to be plain arithmetic.
-    if (isa<scf::YieldOp>(nested))
-      return;
-    StringRef inner = nested->getName().getDialectNamespace();
-    if (inner != "arith" && inner != "math")
-      pure = false;
-  });
-  return pure;
+  return (ns == "arith" || ns == "math") && op->getNumRegions() == 0;
 }
 
 // `tt.ptr<tensor<...>>` is a block-pointer descriptor, not a pointer tensor.
@@ -1369,13 +1275,15 @@ bool RowLiftBuilder::rewriteDescriptorStore(
   return true;
 }
 
-// Prove equal trip counts inside an aligned row group.  For
-// (pid + offset) / divisor, both the offset and divisor must be multiples of R.
-// A power-of-two R also aligns the integer wrap and sign boundaries.  A wrapped
-// negative numerator can give unequal nonpositive signed quotients, but all
-// those rows execute zero iterations of a loop starting at zero.
+// 依照上界不回绕的输入约定，判断对齐行组内的迭代数是否相同；仅用于省去
+// 多余的逐行 active 选择，不替代上界单调性检查。
+// Prove equal trip counts inside an aligned row group. For
+// (pid + offset) / divisor + shift, offset and divisor must be multiples of R;
+// the outer constant shift does not affect equality. This also recognizes the
+// pid / BN + 1 emitted by rule A. This uses the same no-wrap input contract as
+// the monotonicity analysis; alignment alone does not establish monotonicity.
 static bool hasUniformGroupedTripCount(scf::ForOp loop, Value pid,
-                                       int64_t rows) {
+                                       int64_t rows, int64_t grid) {
   Value bound = loop.getUpperBound();
   if (isPidInvariant(bound, pid))
     return true;
@@ -1390,13 +1298,28 @@ static bool hasUniformGroupedTripCount(scf::ForOp loop, Value pid,
       value = ext.getIn();
     return value;
   };
-  auto div = stripExtension(bound).getDefiningOp<arith::DivSIOp>();
+  bound = stripExtension(bound);
+  if (auto add = bound.getDefiningOp<arith::AddIOp>()) {
+    if (getConstantIntValue(add.getRhs()))
+      bound = stripExtension(add.getLhs());
+    else if (getConstantIntValue(add.getLhs()))
+      bound = stripExtension(add.getRhs());
+    else
+      return false;
+  }
+  auto div = bound.getDefiningOp<arith::DivSIOp>();
   if (!div)
     return false;
   auto divisor = getConstantIntValue(div.getRhs());
   if (!divisor || *divisor <= 0 || *divisor % rows)
     return false;
   Value numerator = div.getLhs();
+  // Signed division truncates toward zero. Even an aligned pair [-32, -31]
+  // divided by 32 gives [-1, 0]; an outer +1 makes their trip counts differ.
+  // Require the numerator to stay nonnegative before using the alignment test.
+  auto bounds = inferMonotonicBounds(numerator, pid, grid);
+  if (!bounds || bounds->lo < 0)
+    return false;
   if (auto add = numerator.getDefiningOp<arith::AddIOp>()) {
     Value source = add.getLhs();
     auto offset = getConstantIntValue(add.getRhs());
@@ -1411,12 +1334,12 @@ static bool hasUniformGroupedTripCount(scf::ForOp loop, Value pid,
   return stripExtension(numerator) == pid;
 }
 
-// 把原循环重建为多行循环：先规划累加器拆分，再用末行上界生成新循环。
+// 把原循环重建为多行循环：先规划累加器拆分，再用共享上界生成新循环。
 //
 // 重建步骤：
 //   1) 循环进位值先补行维，作为新循环的初始值；
 //   2) 累加器拆分规划必须在建循环之前完成，因为它会改变进位值个数；
-//   3) 新循环的 trip count 取「末行上界」，单调性由 matcher 已证明；
+//   3) 非降性已由匹配期确认，取最后一个有效行的上界；
 //   4) 循环体逐条重建；maskedLoad 需要先准备好逐行有效掩码；
 //   5) 循环末尾用有效行掩码选择「本轮新值 / 上一轮值」；
 //   6) 循环结果写回映射；拆分的累加器以成对结果继续向后传递。
@@ -1434,7 +1357,7 @@ bool RowLiftBuilder::rewriteLoop(scf::ForOp old) {
   const bool uniformTripCount =
       features.groupedLoopBounds &&
       hasUniformGroupedTripCount(old, candidate.anchor->getResult(0),
-                                 candidate.rowsPerProgram);
+                                  candidate.rowsPerProgram, candidate.grid);
 
   // 步骤 1+2：原循环的进位值统一补上行维；哪些累加器要拆半已在 run 里定下
   // （描述符必须先于展开拆半），新循环要为每个拆半值携带两个进位值。拆半
@@ -1461,20 +1384,14 @@ bool RowLiftBuilder::rewriteLoop(scf::ForOp old) {
     }
   }
 
-  // 步骤 3：末行上界必须已经物化到 lastRowMapping（run 里克隆的标量上界
-  // 切片产生），否则说明上界被不支持的 region 包住，本次提升放弃。
-  // The monotonic upper-bound proof means the last row supplies the maximum.
-  // A bound whose last-row copy was not materialised (for example because it
-  // sits behind an unsupported region) declines instead of aborting.
-  if (!lastRowMapping.contains(old.getUpperBound())) {
-    LLVM_DEBUG(llvm::dbgs() << "row-lift: last-row bound missing\n");
+  // 步骤 3：共享上界在循环外只计算一次；无法物化时丢弃沙箱。
+  Value sharedBound = lastRowMapping.lookupOrNull(old.getUpperBound());
+  if (!sharedBound)
     return false;
-  }
-  // 下界与步长沿用原循环（它们与行无关），上界换成末行取值。
+  // 下界与步长沿用原循环（它们与行无关）。
   auto loop = rewriter.create<scf::ForOp>(
       old.getLoc(), getMappedValue(old.getLowerBound()),
-      lastRowMapping.lookup(old.getUpperBound()), getMappedValue(old.getStep()),
-      loopInit);
+      sharedBound, getMappedValue(old.getStep()), loopInit);
   loop->setAttrs(old->getAttrs());
 
   // 归纳变量与各进位值的映射：拆分值登记到 splitValues，普通值登记到
@@ -1510,8 +1427,6 @@ bool RowLiftBuilder::rewriteLoop(scf::ForOp old) {
   // 函数，指令序列与基线保持一致。
   if (!rowActiveMask)
     rowActiveMask = createLoopActiveMask(old, loop);
-  Value active = rowActiveMask;
-
   // 步骤 5：对「原循环在本轮没有执行」的行，保持上一轮的值不变（同时保留
   // NaN/Inf 语义）。掩码为假时选 previous。
   // Retain exactly the previous accumulator for rows whose original loop did
@@ -1520,7 +1435,8 @@ bool RowLiftBuilder::rewriteLoop(scf::ForOp old) {
     if (uniformTripCount)
       return incoming;
     Value mask = broadcastRowValue(
-        active, RankedTensorType::get(type.getShape(), rewriter.getI1Type()));
+        rowActiveMask,
+        RankedTensorType::get(type.getShape(), rewriter.getI1Type()));
     return Value(rewriter.create<arith::SelectOp>(old.getLoc(), mask, incoming,
                                                   previous));
   };
@@ -1579,9 +1495,22 @@ Value RowLiftBuilder::createLoopActiveMask(scf::ForOp old, scf::ForOp loop) {
   Value ivSplat = rewriter.create<triton::SplatOp>(
       old.getLoc(), getLiftedType(old.getInductionVar().getType()),
       loop.getInductionVar());
-  return rewriter.create<arith::CmpIOp>(
+  Value active = rewriter.create<arith::CmpIOp>(
       old.getLoc(), arith::CmpIPredicate::slt, ivSplat,
       ensureRowDimension(old.getUpperBound()));
+  // 尾组的访存由 combineMemoryMask 等路径单独合并 validRows；逐行计算
+  // 不跨查询行归约，因此未写回的补齐行不必在每轮冻结累加器。
+  // tt.assert 可能观察这些状态，含断言时保留原来的有效行约束。
+  // Memory masks already protect padded rows. Only assertions can observe
+  // their otherwise discarded accumulator state; keep the old mask for them.
+  bool hasAssert = candidate.function
+                       .walk([](triton::AssertOp) {
+                         return WalkResult::interrupt();
+                       })
+                       .wasInterrupted();
+  if (validRows && hasAssert)
+    active = rewriter.create<arith::AndIOp>(old.getLoc(), active, validRows);
+  return active;
 }
 
 namespace {
@@ -1593,280 +1522,295 @@ namespace {
 // masks and split accumulators. Keep that representation at the memory boundary,
 // but collapse the first two axes throughout the loop's compute region. Views
 // around every dot interrupt vector fusion and materialise full P temporaries.
+// 本文件私有的循环重写上下文：类内集中声明接口和状态，函数实现统一放在类外。
 class LoopRowFlattener {
 public:
   LoopRowFlattener(IRRewriter &rewriter, scf::ForOp loop, int64_t rows,
-                   int64_t dotRows)
-      : rewriter(rewriter), original(loop), rows(rows), dotRows(dotRows) {}
-
-  // 在旧循环之前新建一个循环：初值、循环参数和结果都换成扁平布局，逐句重写
-  // 循环体后把结果 view 回逻辑布局，最后删除旧循环。
-  // Builds a replacement loop whose initial values, iter args and results use the
-  // flattened layout, rewrites the body statement by statement, views the results
-  // back to the logical layout and erases the original loop.
-  void run() {
-    rewriter.setInsertionPoint(original);
-    SmallVector<Value> initial;
-    for (Value value : original.getInitArgs())
-      initial.push_back(get(value, flatType(value.getType())));
-    replacement = rewriter.create<scf::ForOp>(
-        original.getLoc(), original.getLowerBound(), original.getUpperBound(),
-        original.getStep(), initial);
-    replacement->setAttrs(original->getAttrs());
-    mapping.map(original.getInductionVar(), replacement.getInductionVar());
-    mapping.map(original.getRegionIterArgs(), replacement.getRegionIterArgs());
-    rewriteBlock(original.getBody(), replacement.getBody(),
-                 replacement.getResultTypes());
-
-    rewriter.setInsertionPointAfter(replacement);
-    for (auto [oldValue, newValue] :
-         llvm::zip(original.getResults(), replacement.getResults())) {
-      Value result = view(newValue, oldValue.getType());
-      oldValue.replaceAllUsesWith(result);
-    }
-    rewriter.eraseOp(original);
-    rewriter.setInsertionPointAfter(replacement);
-  }
+                   int64_t dotRows);
+  void run();
 
 private:
-  // 只有前两维恰好是 [rows, dotRows]、没有 encoding、且元素为 float/int 的张量
-  // 才折叠成 [rows*dotRows, ...]；其它类型原样返回，保持边界布局不变。
-  // Collapse [rows, dotRows, ...] into [rows*dotRows, ...] only for plain
-  // float/integer tensors whose leading two extents match the loop shape; every
-  // other type is returned unchanged and keeps its boundary layout.
-  Type flatType(Type type) const {
-    auto tensor = dyn_cast<RankedTensorType>(type);
-    if (!tensor || tensor.getRank() < 2 || tensor.getEncoding() ||
-        tensor.getShape()[0] != rows || tensor.getShape()[1] != dotRows ||
-        !isa<FloatType, IntegerType>(tensor.getElementType()))
-      return type;
-    SmallVector<int64_t> shape{rows * dotRows};
-    llvm::append_range(shape, tensor.getShape().drop_front(2));
-    return RankedTensorType::get(shape, tensor.getElementType());
-  }
-
-  // 把 `value` 转成目标类型：类型已一致时零开销返回，否则插入一条逻辑上
-  // 等价的 tt.reshape 作为布局边界。
-  // Converts `value` to `type`: returns it directly when the type already
-  // matches, otherwise inserts an equivalent tt.reshape as the layout boundary.
-  Value view(Value value, Type type) {
-    if (value.getType() == type)
-      return value;
-    return rewriter.create<triton::ReshapeOp>(
-        value.getLoc(), cast<RankedTensorType>(type), value, false);
-  }
-
-  // 取 `value` 在目标布局下的表示：类型已一致直接用映射结果；循环外定义的
-  // 不变量（含 softmax 递推用到的常量）在循环外建立并缓存边界视图；循环内
-  // 的值则就地插入视图。
-  // Returns `value` in the requested layout: a matching mapped value is used
-  // as-is, an invariant defined outside the loop gets its boundary view built
-  // and cached above the loop, and a loop-local value is viewed in place.
-  Value get(Value value, Type type) {
-    Value mapped = mapping.lookupOrDefault(value);
-    if (mapped.getType() == type)
-      return mapped;
-    // 循环外捕获值和初值都是不变量，它们的边界视图应建在循环之外，softmax
-    // 递推用到的常量也一样。
-    // Captures and initial values are invariant: their boundary views belong
-    // above the loop, including constants used by the softmax recurrence.
-    if (original.isDefinedOutsideOfLoop(value)) {
-      auto found = captures.find(value);
-      if (found != captures.end() && found->second.getType() == type)
-        return found->second;
-      OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPoint(replacement ? replacement : original);
-      Value result = flattenCapture(value, type);
-      if (!result)
-        result = view(mapped, type);
-      captures[value] = result;
-      return result;
-    }
-    return view(mapped, type);
-  }
-
-  // 让循环外的不变量计算直接产出与循环内消费者一致的布局。如果先按 [R,M,N]
-  // 算完再 view，bufferization 可能同时保留两种布局（Q 缩放和 lse 尤其明显）。
-  // 只有单结果、结果类型可折叠，且操作是 expand_dims / elementwise / broadcast
-  // / splat 时才原位重算；否则返回空，交由调用方退回普通 view。
-  // Keep invariant computation in the same layout as its loop consumers.
-  // Viewing a fully broadcast [R,M,N] result only after computing it can make
-  // bufferization materialize both layouts, notably for Q scaling and lse.
-  Value flattenCapture(Value value, Type type) {
-    Operation *op = value.getDefiningOp();
-    if (!op || op->getNumResults() != 1 || flatType(value.getType()) != type)
-      return {};
-    // 可折叠的 expand_dims 在循环外重算：轴号左移一位，源先在扁平布局下取到。
-    // A collapsible expand_dims is rebuilt outside the loop with its axis
-    // shifted left by one and its source fetched in the flat layout.
-    if (auto expand = dyn_cast<triton::ExpandDimsOp>(op)) {
-      if (expand.getAxis() >= 2 &&
-          flatType(expand.getSrc().getType()) != expand.getSrc().getType())
-        return rewriter.create<triton::ExpandDimsOp>(
-            expand.getLoc(),
-            get(expand.getSrc(), flatType(expand.getSrc().getType())),
-            expand.getAxis() - 1);
-      return {};
-    }
-    bool elementwise =
-        op->hasTrait<OpTrait::Elementwise>() && op->getNumRegions() == 0;
-    if (!elementwise && !isa<triton::BroadcastOp, triton::SplatOp>(op))
-      return {};
-    if (!llvm::all_of(op->getOperandTypes(), [&](Type operandType) {
-          return !isa<RankedTensorType>(operandType) ||
-                 flatType(operandType) != operandType;
-        }))
-      return {};
-    IRMapping operands;
-    for (Value operand : op->getOperands())
-      operands.map(operand, get(operand, flatType(operand.getType())));
-    Operation *next = rewriter.clone(*op, operands);
-    next->getResult(0).setType(type);
-    return next->getResult(0);
-  }
-
-  // 把 `from` 中的非终结指令逐条重写到 `to`，最后按 `yieldTypes` 把原 yield
-  // 的操作数转成新布局，生成新的 scf.yield。
-  // Rewrites every non-terminator of `from` into `to`, then emits a new
-  // scf.yield whose operands are converted to `yieldTypes`.
-  void rewriteBlock(Block *from, Block *to, TypeRange yieldTypes) {
-    rewriter.setInsertionPointToEnd(to);
-    if (!to->empty() && isa<scf::YieldOp>(to->back()))
-      rewriter.eraseOp(to->getTerminator());
-    for (Operation &op : from->without_terminator())
-      rewrite(&op);
-    auto yield = cast<scf::YieldOp>(from->getTerminator());
-    SmallVector<Value> values;
-    for (auto [value, type] : llvm::zip(yield.getOperands(), yieldTypes))
-      values.push_back(get(value, type));
-    rewriter.create<scf::YieldOp>(yield.getLoc(), values);
-  }
-
-  // 单条指令的布局重写分派：scf.if / tt.reduce / expand_dims / reshape 需要
-  // 结构性重建，其余 elementwise、broadcast、splat 只克隆后改结果类型。
-  // Per-op dispatch: scf.if, tt.reduce, expand_dims and reshape need structural
-  // rebuilding; other elementwise, broadcast and splat ops are cloned and have
-  // their result types updated.
-  void rewrite(Operation *op) {
-    // scf.if 的结果按扁平类型重建，两个分支用同一组结果类型重写；条件通常
-    // 是标量，也统一走 get 以保持映射一致。
-    // Rebuild scf.if with flattened result types and rewrite both branches
-    // against them; the condition is fetched through `get` as well.
-    if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
-      SmallVector<Type> types;
-      for (Type type : ifOp.getResultTypes())
-        types.push_back(flatType(type));
-      auto next = rewriter.create<scf::IfOp>(
-          ifOp.getLoc(), types,
-          get(ifOp.getCondition(), ifOp.getCondition().getType()),
-          !ifOp.getElseRegion().empty());
-      next->setAttrs(ifOp->getAttrs());
-      {
-        OpBuilder::InsertionGuard guard(rewriter);
-        rewriteBlock(ifOp.thenBlock(), next.thenBlock(), types);
-        if (!ifOp.getElseRegion().empty())
-          rewriteBlock(ifOp.elseBlock(), next.elseBlock(), types);
-      }
-      mapping.map(ifOp.getResults(), next.getResults());
-      return;
-    }
-
-    if (auto reduce = dyn_cast<triton::ReduceOp>(op)) {
-      // 折叠 R 和 M 不能改变任何一维上的归约语义，因此归约轴 >= 2 时才把轴号
-      // 前移一位并在扁平布局上重建，否则留在逻辑布局边界上。
-      // Collapsing R and M must never change a reduction over either axis.
-      // Such a reduction stays at the logical-layout boundary instead.
-      if (reduce.getAxis() >= 2 &&
-          llvm::all_of(reduce.getSrcs(), [&](Value value) {
-            return flatType(value.getType()) != value.getType();
-          })) {
-        SmallVector<Value> sources;
-        for (Value value : reduce.getSrcs())
-          sources.push_back(get(value, flatType(value.getType())));
-        auto next = rewriter.create<triton::ReduceOp>(reduce.getLoc(), sources,
-                                                      reduce.getAxis() - 1);
-        rewriter.cloneRegionBefore(reduce.getCombineOp(), next.getCombineOp(),
-                                   next.getCombineOp().end());
-        mapping.map(reduce.getResults(), next.getResults());
-        return;
-      }
-    }
-
-    // 折叠前两维后轴号左移一位；源不可折叠时保持原样，不在这里改写。
-    // The axis shifts left by one after the collapse; an unsplittable source is
-    // left untouched here.
-    if (auto expand = dyn_cast<triton::ExpandDimsOp>(op)) {
-      if (expand.getAxis() >= 2 &&
-          flatType(expand.getSrc().getType()) != expand.getSrc().getType()) {
-        auto next = rewriter.create<triton::ExpandDimsOp>(
-            expand.getLoc(),
-            get(expand.getSrc(), flatType(expand.getSrc().getType())),
-            expand.getAxis() - 1);
-        mapping.map(expand.getResult(), next.getResult());
-        return;
-      }
-    }
-
-    if (auto reshape = dyn_cast<triton::ReshapeOp>(op)) {
-      // 这里也覆盖 dot 进出计算区域的视图：两侧都已是计算布局时，视图会直接
-      // 消失，而不是每轮迭代重建一次。
-      // This includes the dot's entry/exit views. Once both sides have the
-      // compute layout, the view disappears instead of being recreated per trip.
-      Value source = mapping.lookupOrDefault(reshape.getSrc());
-      Type type = flatType(reshape.getType());
-      if (original.isDefinedOutsideOfLoop(reshape.getSrc()))
-        source = get(reshape.getSrc(), flatType(reshape.getSrc().getType()));
-      mapping.map(reshape.getResult(), view(source, type));
-      return;
-    }
-
-    // 普通指令：elementwise、broadcast、splat 在结果可折叠时也进入扁平布局，
-    // 否则按原类型克隆。broadcast 只在第 0 个操作数可折叠（源本身就按扁平
-    // 布局广播）时才算可折叠。
-    // Plain ops: elementwise, broadcast and splat also join the flat layout when
-    // their results can be collapsed; a broadcast additionally requires operand
-    // 0 to be collapsible, i.e. the source itself broadcasts in the flat layout.
-    bool elementwise =
-        op->hasTrait<OpTrait::Elementwise>() && op->getNumRegions() == 0;
-    bool broadcast =
-        isa<triton::BroadcastOp>(op) &&
-        flatType(op->getOperand(0).getType()) != op->getOperand(0).getType();
-    bool flatten = (elementwise || broadcast || isa<triton::SplatOp>(op)) &&
-                   llvm::all_of(op->getResultTypes(), [&](Type type) {
-                     return flatType(type) != type;
-                   });
-    // 被折叠的 elementwise / broadcast 指令，其每个张量操作数都必须带上两个
-    // 逻辑行轴。逐查询的掩码或权重先在逻辑布局里广播，再在边界处 view 进
-    // 计算区域。只有 splat 的源是标量，不受此限。
-    // Every tensor operand of a collapsed elementwise/broadcast op must carry
-    // both logical row axes. A per-query mask or weight is broadcast in its
-    // logical layout first, then viewed at the boundary into the compute region.
-    if (flatten && !isa<triton::SplatOp>(op))
-      flatten = llvm::all_of(op->getOperandTypes(), [&](Type type) {
-        return !isa<RankedTensorType>(type) || flatType(type) != type;
-      });
-
-    IRMapping operands = mapping;
-    for (Value operand : op->getOperands())
-      operands.map(operand, get(operand, flatten ? flatType(operand.getType())
-                                                 : operand.getType()));
-    Operation *next = rewriter.clone(*op, operands);
-    // 克隆复用同一操作，结果类型需手工改成折叠后的形状。
-    // The cloned results still carry the original logical shape.
-    if (flatten)
-      for (Value result : next->getResults())
-        result.setType(flatType(result.getType()));
-    mapping.map(op->getResults(), next->getResults());
-  }
+  Type flatType(Type type) const;
+  Value view(Value value, Type type);
+  Value get(Value value, Type type);
+  Value flattenCapture(Value value, Type type);
+  void rewriteBlock(Block *from, Block *to, TypeRange yieldTypes);
+  void rewrite(Operation *op);
 
   IRRewriter &rewriter;
-  scf::ForOp original;             // 待扁平化的原循环
-  scf::ForOp replacement;          // 重建中的新循环
-  int64_t rows;                    // 提升行数 R
-  int64_t dotRows;                 // dot 的 M 维
-  IRMapping mapping;               // 旧值 -> 新布局值
-  DenseMap<Value, Value> captures; // 循环外不变量的边界视图缓存
+  scf::ForOp original;            // 待扁平化的原循环
+  scf::ForOp replacement;         // 重建中的新循环
+  int64_t rows;                   // 提升行数 R
+  int64_t dotRows;                // dot 的 M 维
+  IRMapping mapping;              // 旧值 -> 新布局值
+  DenseMap<Value, Value> captures;// 循环外不变量的边界视图缓存
 };
+
+} // namespace
+
+LoopRowFlattener::LoopRowFlattener(IRRewriter &rewriter, scf::ForOp loop,
+                                 int64_t rows, int64_t dotRows)
+    : rewriter(rewriter), original(loop), rows(rows), dotRows(dotRows) {}
+
+// 在旧循环之前新建一个循环：初值、循环参数和结果都换成扁平布局，逐句重写
+// 循环体后把结果 view 回逻辑布局，最后删除旧循环。
+// Builds a replacement loop whose initial values, iter args and results use the
+// flattened layout, rewrites the body statement by statement, views the results
+// back to the logical layout and erases the original loop.
+void LoopRowFlattener::run() {
+  rewriter.setInsertionPoint(original);
+  SmallVector<Value> initial;
+  for (Value value : original.getInitArgs())
+    initial.push_back(get(value, flatType(value.getType())));
+  replacement = rewriter.create<scf::ForOp>(
+      original.getLoc(), original.getLowerBound(), original.getUpperBound(),
+      original.getStep(), initial);
+  replacement->setAttrs(original->getAttrs());
+  mapping.map(original.getInductionVar(), replacement.getInductionVar());
+  mapping.map(original.getRegionIterArgs(), replacement.getRegionIterArgs());
+  rewriteBlock(original.getBody(), replacement.getBody(),
+               replacement.getResultTypes());
+
+  rewriter.setInsertionPointAfter(replacement);
+  for (auto [oldValue, newValue] :
+       llvm::zip(original.getResults(), replacement.getResults())) {
+    Value result = view(newValue, oldValue.getType());
+    oldValue.replaceAllUsesWith(result);
+  }
+  rewriter.eraseOp(original);
+  rewriter.setInsertionPointAfter(replacement);
+}
+
+// 只有前两维恰好是 [rows, dotRows]、没有 encoding、且元素为 float/int 的张量
+// 才折叠成 [rows*dotRows, ...]；其它类型原样返回，保持边界布局不变。
+// Collapse [rows, dotRows, ...] into [rows*dotRows, ...] only for plain
+// float/integer tensors whose leading two extents match the loop shape; every
+// other type is returned unchanged and keeps its boundary layout.
+Type LoopRowFlattener::flatType(Type type) const {
+  auto tensor = dyn_cast<RankedTensorType>(type);
+  if (!tensor || tensor.getRank() < 2 || tensor.getEncoding() ||
+      tensor.getShape()[0] != rows || tensor.getShape()[1] != dotRows ||
+      !isa<FloatType, IntegerType>(tensor.getElementType()))
+    return type;
+  SmallVector<int64_t> shape{rows * dotRows};
+  llvm::append_range(shape, tensor.getShape().drop_front(2));
+  return RankedTensorType::get(shape, tensor.getElementType());
+}
+
+// 把 `value` 转成目标类型：类型已一致时零开销返回，否则插入一条逻辑上
+// 等价的 tt.reshape 作为布局边界。
+// Converts `value` to `type`: returns it directly when the type already
+// matches, otherwise inserts an equivalent tt.reshape as the layout boundary.
+Value LoopRowFlattener::view(Value value, Type type) {
+  if (value.getType() == type)
+    return value;
+  return rewriter.create<triton::ReshapeOp>(
+      value.getLoc(), cast<RankedTensorType>(type), value, false);
+}
+
+// 取 `value` 在目标布局下的表示：类型已一致直接用映射结果；循环外定义的
+// 不变量（含 softmax 递推用到的常量）在循环外建立并缓存边界视图；循环内
+// 的值则就地插入视图。
+// Returns `value` in the requested layout: a matching mapped value is used
+// as-is, an invariant defined outside the loop gets its boundary view built
+// and cached above the loop, and a loop-local value is viewed in place.
+Value LoopRowFlattener::get(Value value, Type type) {
+  Value mapped = mapping.lookupOrDefault(value);
+  if (mapped.getType() == type)
+    return mapped;
+  // 循环外捕获值和初值都是不变量，它们的边界视图应建在循环之外，softmax
+  // 递推用到的常量也一样。
+  // Captures and initial values are invariant: their boundary views belong
+  // above the loop, including constants used by the softmax recurrence.
+  if (original.isDefinedOutsideOfLoop(value)) {
+    auto found = captures.find(value);
+    if (found != captures.end() && found->second.getType() == type)
+      return found->second;
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPoint(replacement ? replacement : original);
+    Value result = flattenCapture(value, type);
+    if (!result)
+      result = view(mapped, type);
+    captures[value] = result;
+    return result;
+  }
+  return view(mapped, type);
+}
+
+// 让循环外的不变量计算直接产出与循环内消费者一致的布局。如果先按 [R,M,N]
+// 算完再 view，bufferization 可能同时保留两种布局（Q 缩放和 lse 尤其明显）。
+// 只有单结果、结果类型可折叠，且操作是 expand_dims / elementwise / broadcast
+// / splat 时才原位重算；否则返回空，交由调用方退回普通 view。
+// Keep invariant computation in the same layout as its loop consumers.
+// Viewing a fully broadcast [R,M,N] result only after computing it can make
+// bufferization materialize both layouts, notably for Q scaling and lse.
+Value LoopRowFlattener::flattenCapture(Value value, Type type) {
+  Operation *op = value.getDefiningOp();
+  if (!op || op->getNumResults() != 1 || flatType(value.getType()) != type)
+    return {};
+  // 可折叠的 expand_dims 在循环外重算：轴号左移一位，源先在扁平布局下取到。
+  // A collapsible expand_dims is rebuilt outside the loop with its axis
+  // shifted left by one and its source fetched in the flat layout.
+  if (auto expand = dyn_cast<triton::ExpandDimsOp>(op)) {
+    if (expand.getAxis() >= 2 &&
+        flatType(expand.getSrc().getType()) != expand.getSrc().getType())
+      return rewriter.create<triton::ExpandDimsOp>(
+          expand.getLoc(),
+          get(expand.getSrc(), flatType(expand.getSrc().getType())),
+          expand.getAxis() - 1);
+    return {};
+  }
+  bool elementwise =
+      op->hasTrait<OpTrait::Elementwise>() && op->getNumRegions() == 0;
+  if (!elementwise && !isa<triton::BroadcastOp, triton::SplatOp>(op))
+    return {};
+  if (!llvm::all_of(op->getOperandTypes(), [&](Type operandType) {
+        return !isa<RankedTensorType>(operandType) ||
+               flatType(operandType) != operandType;
+      }))
+    return {};
+  IRMapping operands;
+  for (Value operand : op->getOperands())
+    operands.map(operand, get(operand, flatType(operand.getType())));
+  Operation *next = rewriter.clone(*op, operands);
+  next->getResult(0).setType(type);
+  return next->getResult(0);
+}
+
+// 把 `from` 中的非终结指令逐条重写到 `to`，最后按 `yieldTypes` 把原 yield
+// 的操作数转成新布局，生成新的 scf.yield。
+// Rewrites every non-terminator of `from` into `to`, then emits a new
+// scf.yield whose operands are converted to `yieldTypes`.
+void LoopRowFlattener::rewriteBlock(Block *from, Block *to,
+                                   TypeRange yieldTypes) {
+  rewriter.setInsertionPointToEnd(to);
+  if (!to->empty() && isa<scf::YieldOp>(to->back()))
+    rewriter.eraseOp(to->getTerminator());
+  for (Operation &op : from->without_terminator())
+    rewrite(&op);
+  auto yield = cast<scf::YieldOp>(from->getTerminator());
+  SmallVector<Value> values;
+  for (auto [value, type] : llvm::zip(yield.getOperands(), yieldTypes))
+    values.push_back(get(value, type));
+  rewriter.create<scf::YieldOp>(yield.getLoc(), values);
+}
+
+// 单条指令的布局重写分派：scf.if / tt.reduce / expand_dims / reshape 需要
+// 结构性重建，其余 elementwise、broadcast、splat 只克隆后改结果类型。
+// Per-op dispatch: scf.if, tt.reduce, expand_dims and reshape need structural
+// rebuilding; other elementwise, broadcast and splat ops are cloned and have
+// their result types updated.
+void LoopRowFlattener::rewrite(Operation *op) {
+  // scf.if 的结果按扁平类型重建，两个分支用同一组结果类型重写；条件通常
+  // 是标量，也统一走 get 以保持映射一致。
+  // Rebuild scf.if with flattened result types and rewrite both branches
+  // against them; the condition is fetched through `get` as well.
+  if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+    SmallVector<Type> types;
+    for (Type type : ifOp.getResultTypes())
+      types.push_back(flatType(type));
+    auto next = rewriter.create<scf::IfOp>(
+        ifOp.getLoc(), types,
+        get(ifOp.getCondition(), ifOp.getCondition().getType()),
+        !ifOp.getElseRegion().empty());
+    next->setAttrs(ifOp->getAttrs());
+    {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriteBlock(ifOp.thenBlock(), next.thenBlock(), types);
+      if (!ifOp.getElseRegion().empty())
+        rewriteBlock(ifOp.elseBlock(), next.elseBlock(), types);
+    }
+    mapping.map(ifOp.getResults(), next.getResults());
+    return;
+  }
+
+  if (auto reduce = dyn_cast<triton::ReduceOp>(op)) {
+    // 折叠 R 和 M 不能改变任何一维上的归约语义，因此归约轴 >= 2 时才把轴号
+    // 前移一位并在扁平布局上重建，否则留在逻辑布局边界上。
+    // Collapsing R and M must never change a reduction over either axis.
+    // Such a reduction stays at the logical-layout boundary instead.
+    if (reduce.getAxis() >= 2 &&
+        llvm::all_of(reduce.getSrcs(), [&](Value value) {
+          return flatType(value.getType()) != value.getType();
+        })) {
+      SmallVector<Value> sources;
+      for (Value value : reduce.getSrcs())
+        sources.push_back(get(value, flatType(value.getType())));
+      auto next = rewriter.create<triton::ReduceOp>(reduce.getLoc(), sources,
+                                                    reduce.getAxis() - 1);
+      rewriter.cloneRegionBefore(reduce.getCombineOp(), next.getCombineOp(),
+                                 next.getCombineOp().end());
+      mapping.map(reduce.getResults(), next.getResults());
+      return;
+    }
+  }
+
+  // 折叠前两维后轴号左移一位；源不可折叠时保持原样，不在这里改写。
+  // The axis shifts left by one after the collapse; an unsplittable source is
+  // left untouched here.
+  if (auto expand = dyn_cast<triton::ExpandDimsOp>(op)) {
+    if (expand.getAxis() >= 2 &&
+        flatType(expand.getSrc().getType()) != expand.getSrc().getType()) {
+      auto next = rewriter.create<triton::ExpandDimsOp>(
+          expand.getLoc(),
+          get(expand.getSrc(), flatType(expand.getSrc().getType())),
+          expand.getAxis() - 1);
+      mapping.map(expand.getResult(), next.getResult());
+      return;
+    }
+  }
+
+  if (auto reshape = dyn_cast<triton::ReshapeOp>(op)) {
+    // 这里也覆盖 dot 进出计算区域的视图：两侧都已是计算布局时，视图会直接
+    // 消失，而不是每轮迭代重建一次。
+    // This includes the dot's entry/exit views. Once both sides have the
+    // compute layout, the view disappears instead of being recreated per trip.
+    Value source = mapping.lookupOrDefault(reshape.getSrc());
+    Type type = flatType(reshape.getType());
+    if (original.isDefinedOutsideOfLoop(reshape.getSrc()))
+      source = get(reshape.getSrc(), flatType(reshape.getSrc().getType()));
+    mapping.map(reshape.getResult(), view(source, type));
+    return;
+  }
+
+  // 普通指令：elementwise、broadcast、splat 在结果可折叠时也进入扁平布局，
+  // 否则按原类型克隆。broadcast 只在第 0 个操作数可折叠（源本身就按扁平
+  // 布局广播）时才算可折叠。
+  // Plain ops: elementwise, broadcast and splat also join the flat layout when
+  // their results can be collapsed; a broadcast additionally requires operand
+  // 0 to be collapsible, i.e. the source itself broadcasts in the flat layout.
+  bool elementwise =
+      op->hasTrait<OpTrait::Elementwise>() && op->getNumRegions() == 0;
+  bool broadcast =
+      isa<triton::BroadcastOp>(op) &&
+      flatType(op->getOperand(0).getType()) != op->getOperand(0).getType();
+  bool flatten = (elementwise || broadcast || isa<triton::SplatOp>(op)) &&
+                 llvm::all_of(op->getResultTypes(), [&](Type type) {
+                   return flatType(type) != type;
+                 });
+  // 被折叠的 elementwise / broadcast 指令，其每个张量操作数都必须带上两个
+  // 逻辑行轴。逐查询的掩码或权重先在逻辑布局里广播，再在边界处 view 进
+  // 计算区域。只有 splat 的源是标量，不受此限。
+  // Every tensor operand of a collapsed elementwise/broadcast op must carry
+  // both logical row axes. A per-query mask or weight is broadcast in its
+  // logical layout first, then viewed at the boundary into the compute region.
+  if (flatten && !isa<triton::SplatOp>(op))
+    flatten = llvm::all_of(op->getOperandTypes(), [&](Type type) {
+      return !isa<RankedTensorType>(type) || flatType(type) != type;
+    });
+
+  IRMapping operands = mapping;
+  for (Value operand : op->getOperands())
+    operands.map(operand, get(operand, flatten ? flatType(operand.getType())
+                                               : operand.getType()));
+  Operation *next = rewriter.clone(*op, operands);
+  // 克隆复用同一操作，结果类型需手工改成折叠后的形状。
+  // The cloned results still carry the original logical shape.
+  if (flatten)
+    for (Value result : next->getResults())
+      result.setType(flatType(result.getType()));
+  mapping.map(op->getResults(), next->getResults());
+}
 
 // 收集函数内所有循环，逐个找出 dot 结果被 reshape 成 [rows, M, ...] 的 M；
 // 同一循环内各 dot 给出的 M 必须一致，确认后对该循环做计算区域扁平化。
@@ -1898,8 +1842,6 @@ static void flattenLoopCompute(IRRewriter &rewriter, triton::FuncOp fn,
   }
 }
 
-} // namespace
-
 //===----------------------------------------------------------------------===//
 // 5. Split wide output accumulators and descriptors along the width
 //===----------------------------------------------------------------------===//
@@ -1916,7 +1858,7 @@ static Value ifResultForYield(OpOperand &use) {
   if (!yield)
     return Value();
   auto ifOp = dyn_cast<scf::IfOp>(yield->getParentOp());
-  if (!ifOp || use.getOperandNumber() >= ifOp.getNumResults())
+  if (!ifOp)
     return Value();
   return ifOp.getResult(use.getOperandNumber());
 }
@@ -2077,43 +2019,6 @@ bool RowLiftBuilder::planWideAccumulatorSplits(scf::ForOp loop) {
   return true;
 }
 
-// 沿最后一维把值拆成两个连续半宽值。
-bool RowLiftBuilder::splitLastDimension(Value value, SplitValue &halves) {
-  auto type = dyn_cast<RankedTensorType>(value.getType());
-  // 半宽形状：最后一维减半。
-  auto halfType = halvedType(type);
-  if (!halfType)
-    return false;
-  const int64_t rank = type.getRank();
-
-  // 第一步：reshape 成 [.., 2, W/2]，使两个半宽在内存中连续。
-  // [.., W] -> [.., 2, W/2] keeps both halves contiguous, and the trailing
-  // transpose makes the size-2 dimension the one tt.split removes.
-  SmallVector<int64_t> pairShape(halfType.getShape());
-  pairShape.back() = 2;
-  pairShape.push_back(halfType.getShape().back());
-  Value paired = reshape(value, pairShape);
-
-  // 第二步：转置把大小为 2 的维度移到最后一维，满足 tt.split 的格式要求。
-  SmallVector<int64_t> transposedShape(halfType.getShape());
-  transposedShape.push_back(2);
-  SmallVector<int32_t> order;
-  for (int64_t dim = 0; dim + 1 < rank; ++dim)
-    order.push_back(static_cast<int32_t>(dim));
-  order.push_back(static_cast<int32_t>(rank));
-  order.push_back(static_cast<int32_t>(rank - 1));
-  Value transposed = rewriter.create<triton::TransOp>(
-      value.getLoc(),
-      RankedTensorType::get(transposedShape, type.getElementType()), paired,
-      order);
-
-  // 第三步：tt.split 沿最后一维切成两个半宽值。
-  auto split = rewriter.create<triton::SplitOp>(value.getLoc(), halfType,
-                                                halfType, transposed);
-  halves = {split.getOutLHS(), split.getOutRHS()};
-  return true;
-}
-
 // 判断 `value` 能否尾部广播到 `target`，且沿最后一维的取值不变：源的秩更小
 // （末维是补齐出来的单位维），或源末维就是 1。只有这种形态才能用同一个半宽
 // 值同时代表两半。
@@ -2161,36 +2066,9 @@ bool RowLiftBuilder::ensureRowHalves(Value value, SplitValue &halves) {
     return true;
   }
 
-  // 其余形态没有结构化的半宽来源：取已重建的整宽值沿末维拆半，再按需补行维。
-  // 尚未重建的值没有可拆的来源，直接放弃。
-  if (!valueMapping.contains(value))
-    return false;
-  Value full = valueMapping.lookup(value);
-  auto fullType = dyn_cast<RankedTensorType>(full.getType());
-  if (!fullType || fullType.getShape().back() != original.getShape().back())
-    return false;
-  SplitValue raw;
-  if (!splitLastDimension(full, raw))
-    return false;
-  auto rawType = dyn_cast<RankedTensorType>(raw.first.getType());
-  if (!rawType)
-    return false;
-  // 已重建值本身就是提升形态时，拆半结果已经是目标半宽类型。
-  if (raw.first.getType() == halfType) {
-    halves = raw;
-    return true;
-  }
-  // 未提升的整宽值拆半后秩少一维，两半各自在最前面补行维。
-  if (rawType.getRank() + 1 != halfType.getRank())
-    return false;
-  auto lift = [&](Value half) {
-    Value expanded =
-        rewriter.create<triton::ExpandDimsOp>(half.getLoc(), half, 0);
-    return Value(rewriter.create<triton::BroadcastOp>(half.getLoc(), halfType,
-                                                      expanded));
-  };
-  halves = {lift(raw.first), lift(raw.second)};
-  return true;
+  // 当前 NSA 的初值可由常量/广播直接折叠。没有结构化半宽来源就拒绝该候选，
+  // 不先物化整宽张量，再通过 reshape/trans/split 拆分。
+  return false;
 }
 
 // 把一个整宽操作数按半宽重建。只有「各列取值相同」的形态（splat 常量、标量
@@ -2231,16 +2109,11 @@ Value RowLiftBuilder::rebuildHalfOperand(Value original,
   // 就能由同一个半宽值代表两半；该退化条件统一由 collapseAcrossLastDim 判定。
   // A splat, broadcast or expand_dims source can be shared by both halves once
   // its row dimension is added and it degenerates along the last axis.
-  Value src;
-  if (auto splat = original.getDefiningOp<triton::SplatOp>()) {
-    src = splat.getSrc();
-  } else if (auto bcast = original.getDefiningOp<triton::BroadcastOp>()) {
-    src = bcast.getSrc();
-  } else if (auto expand = original.getDefiningOp<triton::ExpandDimsOp>()) {
-    src = expand.getSrc();
-  } else {
+  Operation *source = original.getDefiningOp();
+  if (!isa_and_nonnull<triton::SplatOp, triton::BroadcastOp,
+                       triton::ExpandDimsOp>(source))
     return Value();
-  }
+  Value src = source->getOperand(0);
   src = ensureRowDimension(src);
   return collapseAcrossLastDim(src, halfType) ? broadcastRowValue(src, halfType)
                                               : Value();
@@ -2356,12 +2229,6 @@ bool RowLiftBuilder::rewriteSplitDescriptorLoad(triton::LoadOp load,
     return false;
   SmallVector<Value> halves;
   for (Value pointer : {descriptor.firstPointer, descriptor.secondPointer}) {
-    auto pointerType = dyn_cast<triton::PointerType>(pointer.getType());
-    auto resultType =
-        pointerType ? dyn_cast<RankedTensorType>(pointerType.getPointeeType())
-                    : RankedTensorType();
-    if (!resultType)
-      return false;
     halves.push_back(
         rewriter
             .create<triton::LoadOp>(load.getLoc(), pointer, Value(), Value(),
@@ -2533,6 +2400,7 @@ bool RowLiftBuilder::rewriteSplitStore(triton::StoreOp store) {
   auto valueType = dyn_cast<RankedTensorType>(valueIt->second.first.getType());
   if (!valueType || valueIt->second.second.getType() != valueType)
     return fail("value halves not same type");
+  const Value halfValues[] = {valueIt->second.first, valueIt->second.second};
 
   Location loc = store.getLoc();
   // 带掩码写回需要 maskedStore 能力，与全宽路径一致。
@@ -2545,8 +2413,6 @@ bool RowLiftBuilder::rewriteSplitStore(triton::StoreOp store) {
     ArrayRef<int32_t> boundaryCheck = store.getBoundaryCheck();
     const LiftedDescriptor *halves[] = {&descriptor.first, &descriptor.second};
     for (const LiftedDescriptor *half : halves) {
-      if (!half->pointer)
-        return fail("expanded half pointer missing");
       if (!boundaryAxesInTile(boundaryCheck, half->tileShape))
         return fail("boundary axis out of tile rank");
     }
@@ -2579,7 +2445,7 @@ bool RowLiftBuilder::rewriteSplitStore(triton::StoreOp store) {
           ok);
       if (!ok)
         return fail("mask merge failed");
-      Value value = index == 0 ? valueIt->second.first : valueIt->second.second;
+      Value value = halfValues[index];
       rewriter.create<triton::StoreOp>(loc, pointer, value, mask,
                                        ArrayRef<int32_t>{}, store.getCache(),
                                        store.getEvict());
@@ -2598,7 +2464,7 @@ bool RowLiftBuilder::rewriteSplitStore(triton::StoreOp store) {
     auto pointerType = dyn_cast<triton::PointerType>(pointer.getType());
     if (!pointerType || pointerType.getPointeeType() != valueType)
       return fail("block pointer pointee != value type");
-    Value value = index == 0 ? valueIt->second.first : valueIt->second.second;
+    Value value = halfValues[index];
     rewriter.create<triton::StoreOp>(loc, pointer, value, Value(),
                                      store.getBoundaryCheck(), store.getCache(),
                                      store.getEvict());
@@ -2623,8 +2489,7 @@ RowLiftBuilder::RowLiftBuilder(IRRewriter &rewriter, RowLiftCandidate candidate)
 // 调用方必须丢弃私有沙箱，不能把失败后的 fn 当作未修改的原始 IR。
 bool RowLiftBuilder::run(triton::FuncOp fn) {
   Block *old = &fn.getBody().front();
-  // 原循环的起始上界。整组的 trip count 由末行取值决定，因此重建过程中
-  // 需要知道哪些标量参与了这个上界的计算（见下方的末行切片克隆）。
+  // 原循环的上界。在输入不回绕的约定下证明非降，重算最后一个有效行。
   // 公共引擎要求函数体内恰好有一个循环；没有循环时直接拒绝，避免解引用
   // 空迭代器（调用方的 matcher 虽然已经保证 loops==1，但这里仍按 API 契约判空）。
   auto loops = old->getOps<scf::ForOp>();
@@ -2634,6 +2499,9 @@ bool RowLiftBuilder::run(triton::FuncOp fn) {
   }
   scf::ForOp loop = *loops.begin();
   Value upperBound = loop.getUpperBound();
+  if (!canUseLastRowLoopBound(loop, candidate.anchor->getResult(0),
+                              candidate.grid))
+    return false;
   // 累加器拆分必须在重写任何指令之前定下来：要拆半的描述符可能位于循环
   // 之前，一旦先按整宽展开成指针张量，就无法再按半宽重建。
   // The accumulator split has to be decided before any instruction is rewritten:
@@ -2713,15 +2581,8 @@ bool RowLiftBuilder::run(triton::FuncOp fn) {
       continue;
     }
 
-    // 只把「纯标量上界切片」克隆进末行映射：该切片就是参与循环上界计算的
-    // 标量算术，在末行取值上重新求值得到组内最大 trip count。依赖判定必须
-    // 穿透 region：scf.if 选出的上界来自分支 yield 而不是操作数，浅层判定
-    // 会漏掉这段算术，导致循环重写时找不到末行上界。
-    // Only clone the pure scalar bound slice for the last-row evaluation.  The
-    // dependence test has to look through regions: a bound selected by an scf.if
-    // takes its value from a branch yield rather than from an operand, so the
-    // shallow test would leave that arithmetic unmapped and the loop rewrite
-    // would then fail to find the last-row upper bound.
+    // 只把无 region 的纯标量上界算术复制到末行映射；与行无关的结果
+    // 在普通重写后加入映射。不能按这条路径重建的上界由策略选择或调用方回退。
     if (op.getNumResults() == 1 &&
         !isa<RankedTensorType>(op.getResult(0).getType()) &&
         isScalarBoundSlice(&op) &&
@@ -2939,11 +2800,11 @@ bool RowLiftBuilder::rewrite(Operation *op) {
     if (candidate.runtimeGrid || (store.getMask() && features.maskedStore)) {
       return rewriteMaskedStore(store);
     }
-    // 循环体内没有掩码的 store 必须失败关闭：提升后的循环跑到组内末行上界，
+    // 循环体内没有掩码的 store 必须失败关闭：提升后的循环跑到组内共享上界，
     // 扫描已提前结束的行在本轮仍会执行到这条 store，通用克隆会把整段
     // [R, ...] 写回，而它们的结果本应保持旧值。
     // An unmasked store inside the loop has to fail closed: the lifted loop runs
-    // to the group's last-row bound, so rows whose scan already ended still reach
+    // to the group's shared bound, so rows whose scan already ended still reach
     // this store, and the generic clone would write the whole [R, ...] block back.
     if (op->getParentOfType<scf::ForOp>() && !store.getMask())
       return false;
@@ -2961,6 +2822,13 @@ bool RowLiftBuilder::rewrite(Operation *op) {
   Operation *cloned =
       rewriter.create(op->getLoc(), op->getName().getIdentifier(), operands,
                       types, op->getAttrs());
+  // A partial group evaluates padded rows as well. A no-wrap promise on the
+  // original scalar need not hold in those inactive lanes; dropping it preserves
+  // all defined results and prevents poison from entering their validity masks.
+  if (auto flags = dyn_cast<arith::ArithIntegerOverflowFlagsInterface>(cloned))
+    cloned->setAttr(flags.getIntegerOverflowAttrName(),
+                    arith::IntegerOverflowFlagsAttr::get(
+                        rewriter.getContext(), arith::IntegerOverflowFlags::none));
   valueMapping.map(op->getResults(), cloned->getResults());
   return true;
 }
