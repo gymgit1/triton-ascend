@@ -67,7 +67,6 @@ from triton.backends.ascend.utils import (
     force_disable_ffts,
     graph_ub_budget_bytes_for_arch,
     l0_size_in_kbytes_for_arch,
-    reserved_ub_kbytes_for_arch,
     ub_size_in_kbytes_for_arch,
     get_cann_version_file_hash,
     is_cann_version_at_least,
@@ -306,18 +305,8 @@ def _graph_optimize_core_num(opt):
 
 def _graph_optimize_kwargs(opt):
     l0a_kb, l0b_kb, l0c_kb = l0_size_in_kbytes_for_arch(opt.target_arch)
-    # 映射侧取物理 UB 容量并只打一次安全系数。若退回 ub_capacity_bytes（它本身
-    # 已是 80% 折减后的值）会再乘一次 80%，把预算打成 64%（RFC #2686 §4：
-    # estimatePeakLiveBytes <= UB × safetyPercent）。
-    # Program-mapping candidates take the physical UB capacity and apply the
-    # safety percent once.  Falling back to ub_capacity_bytes (already an 80
-    # percent figure) would discount it twice down to 64 percent; RFC #2686
-    # section 4 budgets UB as `UB × safetyPercent`.
     kwargs = {
         "ub_capacity_bytes": graph_ub_budget_bytes_for_arch(opt.target_arch),
-        "mapping_ub_capacity_bytes": ub_size_in_kbytes_for_arch(opt.target_arch) * 1024,
-        "reserved_ub_bytes": reserved_ub_kbytes_for_arch(opt.target_arch) * 1024,
-        "ub_safety_percent": 80,
         "compile_mode": opt.compile_mode,
         # Zero capacities (unknown target) leave the cube L0 checks disabled.
         "mapping_l0a_capacity_bytes": l0a_kb * 1024,
@@ -329,6 +318,9 @@ def _graph_optimize_kwargs(opt):
     rule_mask = getattr(opt, "rule_mask", DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK)
     if rule_mask != DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK:
         kwargs["rule_mask"] = rule_mask
+        kwargs["ub_safety_percent"] = 80
+        kwargs["reserved_ub_bytes"] = 0
+        kwargs["mapping_ub_capacity_bytes"] = (ub_size_in_kbytes_for_arch(opt.target_arch) * 1024)
     return kwargs
 
 
