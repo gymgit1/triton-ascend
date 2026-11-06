@@ -298,8 +298,8 @@ private:
   // 重建 O/lse 普通指针张量写回，合并原始 mask 和末组有效行掩码。
   // Rebuild an output store with the original and runtime valid-row masks.
   bool rewriteMaskedStore(triton::StoreOp store);
-  // 在 axis+1 上重建 tt.reduce（前插了行维），并原样复用 combine region。
-  // Rebuild tt.reduce on axis+1 after the row dimension was inserted.
+  // 逻辑布局后移归约轴；展平布局保留列归约轴，combine region 原样复用。
+  // Shift logical reduction axes; preserve column axes in flat computation.
   bool rewriteReduce(triton::ReduceOp reduce);
   // 把 tt.make_tensor_ptr 的块指针展开成显式 [R]+tile 指针张量；若该描述符
   // 已被规划成拆半，则走拆半路径。
@@ -350,7 +350,7 @@ private:
   // Rebuild one branch region of an scf.if and its yield values.  `split` says
   // per result whether it is represented by two half-width values; both branches
   // must agree on it.
-  bool rewriteIfBody(Region &from, Region &to, ArrayRef<bool> split);
+  bool rewriteIfBody(Region &from, Region &to, ArrayRef<bool> split, bool flat);
   // 合并一次提升访存涉及的所有掩码：描述符边界掩码、原始 mask 操作数以及
   // 运行期有效行掩码。没有任何掩码时返回空 Value；某一部分无法对齐到指针
   // 形状时 `ok` 置 false。
@@ -442,20 +442,18 @@ private:
   // 把 scf.for 重建为每个 program 处理多行的循环。
   // Rebuild an scf.for into a loop that handles several query rows.
   bool rewriteLoop(scf::ForOp old);
-  // 在类型最前面插入行维 [R]。
-  // Prepend the leading row dimension [R] to a type.
-  RankedTensorType getLiftedType(Type old);
+  // 默认在首部插入 [R]；flat 为真时对计算类型折叠 R、M。
+  // Prepend [R], optionally collapsing compatible R and M axes.
+  RankedTensorType getLiftedType(Type old, bool flat = false);
   // 取原始值对应的已重建值。
   // Look up the rebuilt value for an original SSA value.
   Value getMappedValue(Value old);
-  // 判断值是否已被提升；提升后其类型与原始类型不同，因此无需额外布尔状态。
-  // Every lifted value gains a leading row dimension, so its type already
-  // records this state; no separate boolean needs to be maintained.
+  // 判断值是否已被提升；类型不同表示依赖行，不保证仍有显式 R 轴。
+  // A changed type records row lifting, including a collapsed row axis.
   bool hasRowDimension(Value old);
-  // 返回带行维的映射值；标量做 splat，张量先扩维再广播。
-  // Return the mapped value with a leading row dimension, splatting a scalar
-  // or expanding and broadcasting a tensor as needed.
-  Value ensureRowDimension(Value old);
+  // 按请求取得逻辑或计算布局的提升值；必要时广播或生成边界视图。
+  // Return a row-lifted value in the requested logical or flat layout.
+  Value getRowValue(Value old, bool flat = false);
   // 生成一次保持元素顺序的 reshape（不重排元素，避免混入其他 program 的值）。
   // Emit a reshape that preserves element order.
   Value reshape(Value v, ArrayRef<int64_t> shape);
@@ -465,6 +463,20 @@ private:
   // 补齐尾部单位维后广播到目标形状。
   // Broadcast a value to `target`, adding trailing unit dimensions first.
   Value broadcastRowValue(Value v, RankedTensorType target);
+
+  // 规划计算布局和循环外纯计算；只读取旧 IR，不生成中间循环。
+  void planFlatCompute(scf::ForOp loop);
+  // 把逻辑 R、M 两轴折叠；不适用的类型保持原样。
+  Type flatType(Type type) const;
+  // 在计算与访存边界转换形状，相同类型直接复用。
+  Value view(Value value, Type type);
+
+  // 候选循环的只读布局计划及循环外捕获值的边界视图缓存。
+  scf::ForOp computeLoop;
+  scf::ForOp rewrittenLoop;
+  int64_t dotRows = 0;
+  DenseSet<Operation *> flatOperations;
+  DenseMap<std::pair<Value, Type>, Value> boundaryViews;
 
   IRRewriter &rewriter;
   RowLiftCandidate candidate;

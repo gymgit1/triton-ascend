@@ -2,6 +2,7 @@
 
 // A row-invariant condition may branch around a dot and a row reduction. Both
 // arms must carry the same flat types, including an arm returning old state.
+// 沿原 M 轴的归约必须恢复 [R,M,N] 再归约，不能归约合并的 R*M 轴。
 // CHECK: factor = 8 : i64
 // CHECK-LABEL: tt.func @flat_conditional_recurrence
 // CHECK: scf.for {{.*}} -> (tensor<128x16xf32>, tensor<128xf32>)
@@ -9,6 +10,10 @@
 // CHECK: tt.dot {{.*}} -> tensor<128x16xf32>
 // CHECK-NOT: tt.reshape
 // CHECK: "tt.reduce"({{.*}}) <{axis = 1 : i32}>
+// CHECK: tt.reshape {{.*}} : tensor<128x16xf32> -> tensor<8x16x16xf32>
+// CHECK: "tt.reduce"({{.*}}) <{axis = 1 : i32}>
+// CHECK: }) : (tensor<8x16x16xf32>) -> tensor<8x16xf32>
+// CHECK: tt.reshape {{.*}} : tensor<8x16xf32> -> tensor<128xf32>
 // CHECK: arith.addf {{.*}} : tensor<128xf32>
 // CHECK: scf.yield {{.*}} : tensor<128x16xf32>, tensor<128xf32>
 // CHECK: } else {
@@ -42,7 +47,13 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
           %sum = arith.addf %x, %y : f32
           tt.reduce.return %sum : f32
         }) : (tensor<16x16xf32>) -> tensor<16xf32>
-        %n = arith.addf %m, %r : tensor<16xf32>
+        %column = "tt.reduce"(%d) <{axis = 0 : i32}> ({
+        ^bb0(%x: f32, %y: f32):
+          %sum = arith.addf %x, %y : f32
+          tt.reduce.return %sum : f32
+        }) : (tensor<16x16xf32>) -> tensor<16xf32>
+        %both = arith.addf %r, %column : tensor<16xf32>
+        %n = arith.addf %m, %both : tensor<16xf32>
         scf.yield %d, %n : tensor<16x16xf32>, tensor<16xf32>
       } else {
         scf.yield %acc, %m : tensor<16x16xf32>, tensor<16xf32>

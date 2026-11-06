@@ -171,39 +171,6 @@ static std::optional<IntegerBounds> inferMonotonicBounds(Value value, Value pid,
   if (auto ext = value.getDefiningOp<arith::ExtSIOp>())
     return inferMonotonicBounds(ext.getIn(), pid, grid);
 
-  // 规则 A 的 NSA 扫描上界：row >= 0 ? row / BN + 1 : 0。
-  // row 非降且 BN > 0 时，两段各自非降，在 row=0 处由 0 跳到 1；不需要
-  // 通用分支区间推导。接受 canonicalize 后的反向条件，其余 select 仍拒绝。
-  if (auto select = value.getDefiningOp<arith::SelectOp>()) {
-    auto cmp = select.getCondition().getDefiningOp<arith::CmpIOp>();
-    if (!cmp || getConstantIntValue(cmp.getRhs()) != 0)
-      return std::nullopt;
-    Value positive;
-    if (cmp.getPredicate() == arith::CmpIPredicate::sge &&
-        getConstantIntValue(select.getFalseValue()) == 0)
-      positive = select.getTrueValue();
-    else if (cmp.getPredicate() == arith::CmpIPredicate::slt &&
-             getConstantIntValue(select.getTrueValue()) == 0)
-      positive = select.getFalseValue();
-    auto add = positive ? positive.getDefiningOp<arith::AddIOp>()
-                        : arith::AddIOp();
-    if (!add)
-      return std::nullopt;
-    Value quotient = getConstantIntValue(add.getRhs()) == 1 ? add.getLhs()
-                     : getConstantIntValue(add.getLhs()) == 1 ? add.getRhs()
-                                                             : Value();
-    auto div = quotient ? quotient.getDefiningOp<arith::DivSIOp>()
-                        : arith::DivSIOp();
-    if (!div || div.getLhs() != cmp.getLhs())
-      return std::nullopt;
-    auto divisor = getConstantIntValue(div.getRhs());
-    auto bounds = inferMonotonicBounds(div.getLhs(), pid, grid);
-    if (!divisor || *divisor <= 0 || !bounds)
-      return std::nullopt;
-    return finish(0, std::max<__int128>(
-                         0, static_cast<__int128>(bounds->hi) / *divisor + 1));
-  }
-
   Operation *op = value.getDefiningOp();
   if (!op || op->getNumOperands() != 2)
     return std::nullopt;
@@ -429,15 +396,16 @@ static bool boundaryAxesInTile(ArrayRef<int32_t> boundaryCheck,
 // 在类型最前面插入行维 [R]，标量则变成 [R] 张量。
 //   tensor<M,N> -> tensor<R,M,N>
 //   i32         -> tensor<Rxi32>
-// 行提升后的所有值都要经过这里，行维始终是 0 号轴。
-RankedTensorType RowLiftBuilder::getLiftedType(Type old) {
+// 默认保留逻辑行轴；计算布局仅把兼容的 [R,M,...] 折叠为 [R*M,...]。
+RankedTensorType RowLiftBuilder::getLiftedType(Type old, bool flat) {
   SmallVector<int64_t> shape{candidate.rowsPerProgram};
   Type elem = old;
   if (auto tensor = dyn_cast<RankedTensorType>(old)) {
     shape.append(tensor.getShape().begin(), tensor.getShape().end());
     elem = tensor.getElementType();
   }
-  return RankedTensorType::get(shape, elem);
+  auto logical = RankedTensorType::get(shape, elem);
+  return flat ? cast<RankedTensorType>(flatType(logical)) : logical;
 }
 
 // 查原始值对应的已重建值。
@@ -445,7 +413,7 @@ Value RowLiftBuilder::getMappedValue(Value old) {
   return valueMapping.lookup(old);
 }
 
-// 判断值是否已提升：重建后的类型与原始类型不同即带行维。
+// 类型不同表示已经提升，值可能保留显式 R 轴，也可能采用展平计算布局。
 bool RowLiftBuilder::hasRowDimension(Value old) {
   // 已展开的块指针故意没有描述符映射，因此按「未提升」处理其描述符值。
   // An expanded block pointer intentionally has no mapped descriptor.
@@ -454,28 +422,45 @@ bool RowLiftBuilder::hasRowDimension(Value old) {
   return valueMapping.lookup(old).getType() != old.getType();
 }
 
-// 返回带行维的值：标量做 splat，张量扩维后广播，块指针保持原样。
-Value RowLiftBuilder::ensureRowDimension(Value old) {
-  Value value = valueMapping.contains(old) ? valueMapping.lookup(old) : Value();
-  // 块指针要么在使用点被展开，要么整体保留，绝不能 splat 成描述符张量。
-  // A block pointer is either expanded at its use site or kept whole, never
-  // splatted into a tensor of descriptors.
+// 取原值在指定布局下的提升表示。计算值可已展平，不能把“依赖行”视为
+// “仍有显式 R 轴”；访存调用默认请求逻辑布局，计算调用显式请求展平布局。
+Value RowLiftBuilder::getRowValue(Value old, bool flat) {
+  Value value = valueMapping.lookupOrNull(old);
   if (isTensorPointer(old.getType()))
     return value;
-  // 已经是提升值：直接返回，避免重复扩维。
-  if (hasRowDimension(old))
+  RankedTensorType target = getLiftedType(old.getType(), flat);
+  if (value.getType() == target)
     return value;
 
-  // 标量：splat 成 [R] 张量。
-  if (!isa<RankedTensorType>(old.getType()))
-    return rewriter.create<triton::SplatOp>(
-        old.getLoc(), getLiftedType(old.getType()), value);
-
-  // 张量：先在 0 号轴插入单位维，再广播到 [R]+原形状。
-  Value expanded =
-      rewriter.create<triton::ExpandDimsOp>(old.getLoc(), value, 0);
-  return rewriter.create<triton::BroadcastOp>(
-      old.getLoc(), getLiftedType(old.getType()), expanded);
+  // 循环外捕获值的展平视图在循环外创建并缓存；循环内临时量不跨分支缓存，
+  // 避免某分支生成的值被另一个分支引用而破坏 SSA 支配关系。
+  Operation *producer = old.getDefiningOp();
+  bool capture = flat && computeLoop &&
+                 computeLoop.isDefinedOutsideOfLoop(old) &&
+                 (!producer || (producer->getBlock() == computeLoop->getBlock() &&
+                                producer->isBeforeInBlock(computeLoop)));
+  auto key = std::make_pair(old, Type(target));
+  if (capture) {
+    auto found = boundaryViews.find(key);
+    if (found != boundaryViews.end())
+      return found->second;
+  }
+  OpBuilder::InsertionGuard guard(rewriter);
+  if (capture && rewrittenLoop)
+    rewriter.setInsertionPoint(rewrittenLoop);
+  if (!hasRowDimension(old)) {
+    auto logical = getLiftedType(old.getType());
+    if (!isa<RankedTensorType>(old.getType())) {
+      value = rewriter.create<triton::SplatOp>(old.getLoc(), logical, value);
+    } else {
+      value = rewriter.create<triton::ExpandDimsOp>(old.getLoc(), value, 0);
+      value = rewriter.create<triton::BroadcastOp>(old.getLoc(), logical, value);
+    }
+  }
+  value = view(value, target);
+  if (capture)
+    boundaryViews[key] = value;
+  return value;
 }
 
 // 生成一次保持元素顺序的 reshape。
@@ -488,6 +473,8 @@ Value RowLiftBuilder::reshape(Value v, ArrayRef<int64_t> shape) {
 // 把 [R,M,K] 展平成 [R*M,K]，让普通 tt.dot 可以处理多行。
 Value RowLiftBuilder::flattenDotRows(Value v) {
   auto t = cast<RankedTensorType>(v.getType());
+  if (t.getRank() == 2)
+    return v;
   return reshape(v, {t.getShape()[0] * t.getShape()[1], t.getShape()[2]});
 }
 
@@ -529,7 +516,7 @@ Value RowLiftBuilder::combineMemoryMask(Value pointer, Value originalMask,
   if (!ok)
     return Value();
   return mergeMasks(pointer, mask,
-                    {originalMask ? ensureRowDimension(originalMask) : Value()},
+                    {originalMask ? getRowValue(originalMask) : Value()},
                     ok);
 }
 
@@ -597,21 +584,21 @@ static Value buildMaskPadding(IRRewriter &rewriter, Location loc, Type type,
 // 1. tt.reduce and row-invariant scf.if
 //===----------------------------------------------------------------------===//
 
-// 在 axis+1 上重建 tt.reduce，并原样复用 combine region。
-// 行维插在最前面后，原 axis 对应的轴号全部后移一位。
+// 按目标布局选择归约轴，并原样复用 combine region。
+// 逻辑布局在首部插入 R 轴；展平布局保留列归约轴，沿 M 的归约仍走逻辑布局。
 bool RowLiftBuilder::rewriteReduce(triton::ReduceOp reduce) {
   // 能力未开启或没有输入时保持失败关闭。
   if (!features.reduce || reduce.getSrcs().empty())
     return false;
 
-  // 所有源值补行维。
+  bool flat = flatOperations.contains(reduce);
   SmallVector<Value> sources;
   for (Value src : reduce.getSrcs())
-    sources.push_back(ensureRowDimension(src));
+    sources.push_back(getRowValue(src, flat));
 
-  // 归约轴从 axis 变为 axis+1，逐行独立归约。
-  auto replacement = rewriter.create<triton::ReduceOp>(reduce.getLoc(), sources,
-                                                       reduce.getAxis() + 1);
+  // 展平只合并 R、M，原来的列归约轴号不变；沿 M 的归约仍在逻辑布局上做。
+  auto replacement = rewriter.create<triton::ReduceOp>(
+      reduce.getLoc(), sources, reduce.getAxis() + (flat ? 0 : 1));
   // combine region 只关心元素类型，与形状无关，因此可以整段原样复用。
   // The combine region sees element types only, so it is reused verbatim.
   rewriter.cloneRegionBefore(reduce.getCombineOp(), replacement.getCombineOp(),
@@ -666,6 +653,7 @@ bool RowLiftBuilder::rewriteIfOp(scf::IfOp old) {
   // 结果占两项半宽类型，因此两个分支都必须以半宽对 yield。
   // Every result gains the row dimension, and a result planned for halving
   // occupies two half-width slots, so both branches have to yield its two halves.
+  bool flat = flatOperations.contains(old);
   SmallVector<Type> types;
   SmallVector<int64_t> starts;
   SmallVector<bool> split;
@@ -674,7 +662,7 @@ bool RowLiftBuilder::rewriteIfOp(scf::IfOp old) {
     if (isTensorPointer(t))
       return false;
     starts.push_back(static_cast<int64_t>(types.size()));
-    auto lifted = getLiftedType(t);
+    auto lifted = getLiftedType(t, flat);
     bool halve = features.splitWideAccumulator &&
                  plannedHalfWidths.contains(old.getResult(index));
     if (halve) {
@@ -693,8 +681,10 @@ bool RowLiftBuilder::rewriteIfOp(scf::IfOp old) {
   auto replacement = rewriter.create<scf::IfOp>(
       old.getLoc(), types, valueMapping.lookupOrDefault(condition),
       /*withElseRegion=*/!old.getElseRegion().empty());
-  if (!rewriteIfBody(old.getThenRegion(), replacement.getThenRegion(), split) ||
-      !rewriteIfBody(old.getElseRegion(), replacement.getElseRegion(), split))
+  if (!rewriteIfBody(old.getThenRegion(), replacement.getThenRegion(), split,
+                     flat) ||
+      !rewriteIfBody(old.getElseRegion(), replacement.getElseRegion(), split,
+                     flat))
     return false;
 
   // 分支重建完成后插入点会留在分支 block 内，这里移回 if 之后。
@@ -714,7 +704,7 @@ bool RowLiftBuilder::rewriteIfOp(scf::IfOp old) {
 
 // 重建 scf.if 的一个分支 region，并生成提升后的 yield。
 bool RowLiftBuilder::rewriteIfBody(Region &from, Region &to,
-                                   ArrayRef<bool> split) {
+                                   ArrayRef<bool> split, bool flat) {
   if (from.empty())
     return true;
 
@@ -744,7 +734,7 @@ bool RowLiftBuilder::rewriteIfBody(Region &from, Region &to,
       values.push_back(it->second.second);
       continue;
     }
-    values.push_back(ensureRowDimension(v));
+    values.push_back(getRowValue(v, flat));
   }
   rewriter.create<scf::YieldOp>(yield.getLoc(), values);
   return true;
@@ -1129,11 +1119,11 @@ bool RowLiftBuilder::emitDescriptorLoad(triton::LoadOp load,
       // width instead of materialising a full-width temporary first.
       if (getLiftedType(load.getOther().getType()) == resultType) {
         other =
-            broadcastRowValue(ensureRowDimension(load.getOther()), resultType);
+            broadcastRowValue(getRowValue(load.getOther()), resultType);
       } else {
         other = rebuildHalfOperand(load.getOther(), resultType);
         if (!other) {
-          Value lifted = ensureRowDimension(load.getOther());
+          Value lifted = getRowValue(load.getOther());
           if (lifted.getType() == resultType)
             other = lifted;
         }
@@ -1183,7 +1173,7 @@ bool RowLiftBuilder::rewriteRowLoad(triton::LoadOp load) {
   // may already have ended. Without a per-row active mask, decline the lift.
   if (insideLoop && (!features.maskedLoad || !rowActiveMask))
     return false;
-  Value pointer = ensureRowDimension(load.getPtr());
+  Value pointer = getRowValue(load.getPtr());
   if (!isa<RankedTensorType>(pointer.getType()))
     return false;
   bool ok = true;
@@ -1198,7 +1188,7 @@ bool RowLiftBuilder::rewriteRowLoad(triton::LoadOp load) {
   auto type = getLiftedType(load.getType());
   Value other;
   if (load.getOther()) {
-    other = ensureRowDimension(load.getOther());
+    other = getRowValue(load.getOther());
     if (insideLoop)
       other = broadcastFullValue(other, type);
   } else {
@@ -1222,7 +1212,7 @@ bool RowLiftBuilder::rewriteRowLoad(triton::LoadOp load) {
 // Merge the original output mask and the runtime grid's valid-row mask before
 // storing O/lse through an ordinary pointer tensor.
 bool RowLiftBuilder::rewriteMaskedStore(triton::StoreOp store) {
-  Value pointer = ensureRowDimension(store.getPtr());
+  Value pointer = getRowValue(store.getPtr());
   if (!isa<RankedTensorType>(pointer.getType()))
     return false;
   bool ok = true;
@@ -1230,7 +1220,7 @@ bool RowLiftBuilder::rewriteMaskedStore(triton::StoreOp store) {
   if (!ok)
     return false;
   rewriter.create<triton::StoreOp>(
-      store.getLoc(), pointer, ensureRowDimension(store.getValue()), mask,
+      store.getLoc(), pointer, getRowValue(store.getValue()), mask,
       store.getBoundaryCheck(), store.getCache(), store.getEvict());
   return true;
 }
@@ -1263,7 +1253,7 @@ bool RowLiftBuilder::rewriteDescriptorStore(
     return false;
 
   // 被写入的值必须与指针张量同形（已补上行维）。
-  Value value = ensureRowDimension(store.getValue());
+  Value value = getRowValue(store.getValue());
   auto valueType = dyn_cast<RankedTensorType>(value.getType());
   if (!valueType || valueType.getShape() != pointerType.getShape())
     return false;
@@ -1334,11 +1324,11 @@ static bool hasUniformGroupedTripCount(scf::ForOp loop, Value pid,
   return stripExtension(numerator) == pid;
 }
 
-// 把原循环重建为多行循环：先规划累加器拆分，再用共享上界生成新循环。
+// 按已确定的拆半与布局计划，用共享上界一次生成最终多行循环。
 //
 // 重建步骤：
-//   1) 循环进位值先补行维，作为新循环的初始值；
-//   2) 累加器拆分规划必须在建循环之前完成，因为它会改变进位值个数；
+//   1) 循环初值对齐到计划的逻辑或展平布局；
+//   2) 按先前的拆半计划，每个宽累加器改为两个半宽进位值；
 //   3) 非降性已由匹配期确认，取最后一个有效行的上界；
 //   4) 循环体逐条重建；maskedLoad 需要先准备好逐行有效掩码；
 //   5) 循环末尾用有效行掩码选择「本轮新值 / 上一轮值」；
@@ -1368,6 +1358,7 @@ bool RowLiftBuilder::rewriteLoop(scf::ForOp old) {
   // 建立「原进位值索引 -> 新进位值起始位置 + 个数」的映射：一个未拆分的
   // 累加器对应 1 个新进位值，拆分的累加器对应 2 个半宽值。
   // One original accumulator maps onto one or two loop-carried values.
+  bool flat = computeLoop == old;
   SmallVector<Value> loopInit;
   SmallVector<std::pair<int64_t, int64_t>> ranges;
   for (auto [index, arg] : llvm::enumerate(old.getInitArgs())) {
@@ -1376,11 +1367,12 @@ bool RowLiftBuilder::rewriteLoop(scf::ForOp old) {
       if (!ensureRowHalves(arg, halves))
         return false;
       ranges.push_back({loopInit.size(), 2});
-      loopInit.push_back(halves.first);
-      loopInit.push_back(halves.second);
+      auto type = halvedType(getLiftedType(arg.getType(), flat));
+      loopInit.push_back(view(halves.first, type));
+      loopInit.push_back(view(halves.second, type));
     } else {
       ranges.push_back({loopInit.size(), 1});
-      loopInit.push_back(ensureRowDimension(arg));
+      loopInit.push_back(getRowValue(arg, flat));
     }
   }
 
@@ -1393,6 +1385,8 @@ bool RowLiftBuilder::rewriteLoop(scf::ForOp old) {
       old.getLoc(), getMappedValue(old.getLowerBound()),
       sharedBound, getMappedValue(old.getStep()), loopInit);
   loop->setAttrs(old->getAttrs());
+  if (flat)
+    rewrittenLoop = loop;
 
   // 归纳变量与各进位值的映射：拆分值登记到 splitValues，普通值登记到
   // valueMapping。
@@ -1437,6 +1431,9 @@ bool RowLiftBuilder::rewriteLoop(scf::ForOp old) {
     Value mask = broadcastRowValue(
         rowActiveMask,
         RankedTensorType::get(type.getShape(), rewriter.getI1Type()));
+    auto previousType = cast<RankedTensorType>(previous.getType());
+    mask = view(mask, RankedTensorType::get(previousType.getShape(),
+                                         rewriter.getI1Type()));
     return Value(rewriter.create<arith::SelectOp>(old.getLoc(), mask, incoming,
                                                   previous));
   };
@@ -1445,23 +1442,20 @@ bool RowLiftBuilder::rewriteLoop(scf::ForOp old) {
   SmallVector<Value> output;
   for (auto [index, value] : llvm::enumerate(yield.getOperands())) {
     auto [start, count] = ranges[index];
+    auto logical = getLiftedType(value.getType());
     if (count == 2) {
       auto it = splitValues.find(value);
       if (it == splitValues.end())
         return false;
-      output.push_back(keep(
-          it->second.first, loop.getRegionIterArgs()[start],
-          cast<RankedTensorType>(loop.getRegionIterArgs()[start].getType())));
-      output.push_back(
-          keep(it->second.second, loop.getRegionIterArgs()[start + 1],
-               cast<RankedTensorType>(
-                   loop.getRegionIterArgs()[start + 1].getType())));
+      output.push_back(keep(it->second.first, loop.getRegionIterArgs()[start],
+                            halvedType(logical)));
+      output.push_back(keep(it->second.second,
+                            loop.getRegionIterArgs()[start + 1],
+                            halvedType(logical)));
       continue;
     }
-    auto previous =
-        cast<RankedTensorType>(loop.getRegionIterArgs()[start].getType());
-    output.push_back(keep(ensureRowDimension(value),
-                          loop.getRegionIterArgs()[start], previous));
+    output.push_back(keep(getRowValue(value, flat),
+                          loop.getRegionIterArgs()[start], logical));
   }
 
   // 用新生成的 yield 替换循环体末尾的占位 terminator。
@@ -1470,22 +1464,25 @@ bool RowLiftBuilder::rewriteLoop(scf::ForOp old) {
   rewriter.setInsertionPointToEnd(loop.getBody());
   rewriter.create<scf::YieldOp>(old.getLoc(), output);
 
-  // 步骤 6：循环结果回填映射。拆分的累加器以成对结果离开循环，后续 store
+  rewriter.setInsertionPointAfter(loop);
+  // 步骤 6：循环结果在边界恢复逻辑布局，循环内部始终保留最终计算形状。
+  // 拆分的累加器以成对结果离开循环，后续 store
   // 可以按同样方式拆它的指针，而不必重建全宽值。
   for (auto [index, result] : llvm::enumerate(old.getResults())) {
     auto [start, count] = ranges[index];
     if (count == 2) {
       // The halves leave the loop as a pair so that a later store can split its
       // pointer the same way instead of rebuilding the full width.
-      splitValues[result] = {loop.getResults()[start],
-                             loop.getResults()[start + 1]};
+      auto type = halvedType(getLiftedType(result.getType()));
+      splitValues[result] = {view(loop.getResults()[start], type),
+                             view(loop.getResults()[start + 1], type)};
       continue;
     }
-    valueMapping.map(result, loop.getResults()[start]);
+    valueMapping.map(result, view(loop.getResults()[start],
+                                  getLiftedType(result.getType())));
   }
 
-  // 循环体之后继续发出后续指令。
-  rewriter.setInsertionPointAfter(loop);
+  // 继续在循环结果的边界视图之后发出后续指令。
   return true;
 }
 
@@ -1497,7 +1494,7 @@ Value RowLiftBuilder::createLoopActiveMask(scf::ForOp old, scf::ForOp loop) {
       loop.getInductionVar());
   Value active = rewriter.create<arith::CmpIOp>(
       old.getLoc(), arith::CmpIPredicate::slt, ivSplat,
-      ensureRowDimension(old.getUpperBound()));
+      getRowValue(old.getUpperBound()));
   // 尾组的访存由 combineMemoryMask 等路径单独合并 validRows；逐行计算
   // 不跨查询行归约，因此未写回的补齐行不必在每轮冻结累加器。
   // tt.assert 可能观察这些状态，含断言时保留原来的有效行约束。
@@ -1513,333 +1510,80 @@ Value RowLiftBuilder::createLoopActiveMask(scf::ForOp old, scf::ForOp loop) {
   return active;
 }
 
-namespace {
-
-// 行提升构建器用逻辑布局 [R,M,...] 构造地址、掩码和拆半累加器。该布局只在
-// 访存边界保留，循环体内的计算区域统一把前两维折叠成 R*M；否则每个 dot
-// 前后的 reshape 会打断向量融合，并实打实地生成一份完整的 P 临时量。
-// The row-lifting builder uses logical [R,M,...] types to construct addresses,
-// masks and split accumulators. Keep that representation at the memory boundary,
-// but collapse the first two axes throughout the loop's compute region. Views
-// around every dot interrupt vector fusion and materialise full P temporaries.
-// 本文件私有的循环重写上下文：类内集中声明接口和状态，函数实现统一放在类外。
-class LoopRowFlattener {
-public:
-  LoopRowFlattener(IRRewriter &rewriter, scf::ForOp loop, int64_t rows,
-                   int64_t dotRows);
-  void run();
-
-private:
-  Type flatType(Type type) const;
-  Value view(Value value, Type type);
-  Value get(Value value, Type type);
-  Value flattenCapture(Value value, Type type);
-  void rewriteBlock(Block *from, Block *to, TypeRange yieldTypes);
-  void rewrite(Operation *op);
-
-  IRRewriter &rewriter;
-  scf::ForOp original;            // 待扁平化的原循环
-  scf::ForOp replacement;         // 重建中的新循环
-  int64_t rows;                   // 提升行数 R
-  int64_t dotRows;                // dot 的 M 维
-  IRMapping mapping;              // 旧值 -> 新布局值
-  DenseMap<Value, Value> captures;// 循环外不变量的边界视图缓存
-};
-
-} // namespace
-
-LoopRowFlattener::LoopRowFlattener(IRRewriter &rewriter, scf::ForOp loop,
-                                 int64_t rows, int64_t dotRows)
-    : rewriter(rewriter), original(loop), rows(rows), dotRows(dotRows) {}
-
-// 在旧循环之前新建一个循环：初值、循环参数和结果都换成扁平布局，逐句重写
-// 循环体后把结果 view 回逻辑布局，最后删除旧循环。
-// Builds a replacement loop whose initial values, iter args and results use the
-// flattened layout, rewrites the body statement by statement, views the results
-// back to the logical layout and erases the original loop.
-void LoopRowFlattener::run() {
-  rewriter.setInsertionPoint(original);
-  SmallVector<Value> initial;
-  for (Value value : original.getInitArgs())
-    initial.push_back(get(value, flatType(value.getType())));
-  replacement = rewriter.create<scf::ForOp>(
-      original.getLoc(), original.getLowerBound(), original.getUpperBound(),
-      original.getStep(), initial);
-  replacement->setAttrs(original->getAttrs());
-  mapping.map(original.getInductionVar(), replacement.getInductionVar());
-  mapping.map(original.getRegionIterArgs(), replacement.getRegionIterArgs());
-  rewriteBlock(original.getBody(), replacement.getBody(),
-               replacement.getResultTypes());
-
-  rewriter.setInsertionPointAfter(replacement);
-  for (auto [oldValue, newValue] :
-       llvm::zip(original.getResults(), replacement.getResults())) {
-    Value result = view(newValue, oldValue.getType());
-    oldValue.replaceAllUsesWith(result);
+// 只读规划：从原始 dot 确定 M，循环只创建一次，计算操作直接使用最终布局。
+// 只有轴语义允许的逐元素、归约和视图操作进入计算区域；访存保持逻辑行布局。
+void RowLiftBuilder::planFlatCompute(scf::ForOp loop) {
+  if (!features.flatCompute)
+    return;
+  bool consistent = true;
+  loop.walk([&](triton::DotOp dot) {
+    int64_t m = cast<RankedTensorType>(dot.getType()).getShape()[0];
+    consistent &= !dotRows || dotRows == m;
+    dotRows = m;
+  });
+  if (!consistent || !dotRows) {
+    dotRows = 0;
+    return;
   }
-  rewriter.eraseOp(original);
-  rewriter.setInsertionPointAfter(replacement);
+  computeLoop = loop;
+  auto collapsible = [&](Type type) {
+    return getLiftedType(type, true) != getLiftedType(type);
+  };
+  auto canFlatten = [&](Operation *op) {
+    if (op->getNumResults() == 0 ||
+        !llvm::all_of(op->getResultTypes(), collapsible))
+      return false;
+    if (isa<triton::DotOp, triton::ReshapeOp>(op))
+      return true;
+    if (auto reduce = dyn_cast<triton::ReduceOp>(op))
+      return reduce.getAxis() > 0 &&
+             llvm::all_of(reduce.getOperandTypes(), collapsible);
+    if (auto expand = dyn_cast<triton::ExpandDimsOp>(op))
+      return expand.getAxis() > 0 && collapsible(expand.getSrc().getType());
+    return ((op->hasTrait<OpTrait::Elementwise>() && !op->getNumRegions()) ||
+            isa<triton::BroadcastOp>(op)) &&
+           llvm::all_of(op->getOperandTypes(), [&](Type type) {
+             return !isa<RankedTensorType>(type) || collapsible(type);
+           });
+  };
+  SmallVector<Value> captures;
+  loop.walk([&](Operation *op) {
+    if (isa<scf::IfOp>(op) || canFlatten(op)) {
+      flatOperations.insert(op);
+      llvm::append_range(captures, op->getOperands());
+    }
+  });
+  // Q 的 cast/scale、lse/delta 广播直接在循环外生成计算布局，
+  // 不先生成逻辑布局算术再复制一份。共享 K/V 和访存不会沿此路径提升。
+  while (!captures.empty()) {
+    Value value = captures.pop_back_val();
+    Operation *op = value.getDefiningOp();
+    if (!op || !loop.isDefinedOutsideOfLoop(value) ||
+        isa<triton::DotOp>(op) || !canFlatten(op) ||
+        !flatOperations.insert(op).second)
+      continue;
+    llvm::append_range(captures, op->getOperands());
+  }
 }
 
-// 只有前两维恰好是 [rows, dotRows]、没有 encoding、且元素为 float/int 的张量
-// 才折叠成 [rows*dotRows, ...]；其它类型原样返回，保持边界布局不变。
-// Collapse [rows, dotRows, ...] into [rows*dotRows, ...] only for plain
-// float/integer tensors whose leading two extents match the loop shape; every
-// other type is returned unchanged and keeps its boundary layout.
-Type LoopRowFlattener::flatType(Type type) const {
+// 仅折叠逻辑形状的 R、M 两轴；指针、编码类型和逐行标量保持原形状。
+Type RowLiftBuilder::flatType(Type type) const {
   auto tensor = dyn_cast<RankedTensorType>(type);
-  if (!tensor || tensor.getRank() < 2 || tensor.getEncoding() ||
-      tensor.getShape()[0] != rows || tensor.getShape()[1] != dotRows ||
+  if (!dotRows || !tensor || tensor.getRank() < 2 || tensor.getEncoding() ||
+      tensor.getShape()[0] != candidate.rowsPerProgram ||
+      tensor.getShape()[1] != dotRows ||
       !isa<FloatType, IntegerType>(tensor.getElementType()))
     return type;
-  SmallVector<int64_t> shape{rows * dotRows};
+  SmallVector<int64_t> shape{candidate.rowsPerProgram * dotRows};
   llvm::append_range(shape, tensor.getShape().drop_front(2));
   return RankedTensorType::get(shape, tensor.getElementType());
 }
 
-// 把 `value` 转成目标类型：类型已一致时零开销返回，否则插入一条逻辑上
-// 等价的 tt.reshape 作为布局边界。
-// Converts `value` to `type`: returns it directly when the type already
-// matches, otherwise inserts an equivalent tt.reshape as the layout boundary.
-Value LoopRowFlattener::view(Value value, Type type) {
-  if (value.getType() == type)
-    return value;
-  return rewriter.create<triton::ReshapeOp>(
-      value.getLoc(), cast<RankedTensorType>(type), value, false);
-}
-
-// 取 `value` 在目标布局下的表示：类型已一致直接用映射结果；循环外定义的
-// 不变量（含 softmax 递推用到的常量）在循环外建立并缓存边界视图；循环内
-// 的值则就地插入视图。
-// Returns `value` in the requested layout: a matching mapped value is used
-// as-is, an invariant defined outside the loop gets its boundary view built
-// and cached above the loop, and a loop-local value is viewed in place.
-Value LoopRowFlattener::get(Value value, Type type) {
-  Value mapped = mapping.lookupOrDefault(value);
-  if (mapped.getType() == type)
-    return mapped;
-  // 循环外捕获值和初值都是不变量，它们的边界视图应建在循环之外，softmax
-  // 递推用到的常量也一样。
-  // Captures and initial values are invariant: their boundary views belong
-  // above the loop, including constants used by the softmax recurrence.
-  if (original.isDefinedOutsideOfLoop(value)) {
-    auto found = captures.find(value);
-    if (found != captures.end() && found->second.getType() == type)
-      return found->second;
-    OpBuilder::InsertionGuard guard(rewriter);
-    rewriter.setInsertionPoint(replacement ? replacement : original);
-    Value result = flattenCapture(value, type);
-    if (!result)
-      result = view(mapped, type);
-    captures[value] = result;
-    return result;
-  }
-  return view(mapped, type);
-}
-
-// 让循环外的不变量计算直接产出与循环内消费者一致的布局。如果先按 [R,M,N]
-// 算完再 view，bufferization 可能同时保留两种布局（Q 缩放和 lse 尤其明显）。
-// 只有单结果、结果类型可折叠，且操作是 expand_dims / elementwise / broadcast
-// / splat 时才原位重算；否则返回空，交由调用方退回普通 view。
-// Keep invariant computation in the same layout as its loop consumers.
-// Viewing a fully broadcast [R,M,N] result only after computing it can make
-// bufferization materialize both layouts, notably for Q scaling and lse.
-Value LoopRowFlattener::flattenCapture(Value value, Type type) {
-  Operation *op = value.getDefiningOp();
-  if (!op || op->getNumResults() != 1 || flatType(value.getType()) != type)
-    return {};
-  // 可折叠的 expand_dims 在循环外重算：轴号左移一位，源先在扁平布局下取到。
-  // A collapsible expand_dims is rebuilt outside the loop with its axis
-  // shifted left by one and its source fetched in the flat layout.
-  if (auto expand = dyn_cast<triton::ExpandDimsOp>(op)) {
-    if (expand.getAxis() >= 2 &&
-        flatType(expand.getSrc().getType()) != expand.getSrc().getType())
-      return rewriter.create<triton::ExpandDimsOp>(
-          expand.getLoc(),
-          get(expand.getSrc(), flatType(expand.getSrc().getType())),
-          expand.getAxis() - 1);
-    return {};
-  }
-  bool elementwise =
-      op->hasTrait<OpTrait::Elementwise>() && op->getNumRegions() == 0;
-  if (!elementwise && !isa<triton::BroadcastOp, triton::SplatOp>(op))
-    return {};
-  if (!llvm::all_of(op->getOperandTypes(), [&](Type operandType) {
-        return !isa<RankedTensorType>(operandType) ||
-               flatType(operandType) != operandType;
-      }))
-    return {};
-  IRMapping operands;
-  for (Value operand : op->getOperands())
-    operands.map(operand, get(operand, flatType(operand.getType())));
-  Operation *next = rewriter.clone(*op, operands);
-  next->getResult(0).setType(type);
-  return next->getResult(0);
-}
-
-// 把 `from` 中的非终结指令逐条重写到 `to`，最后按 `yieldTypes` 把原 yield
-// 的操作数转成新布局，生成新的 scf.yield。
-// Rewrites every non-terminator of `from` into `to`, then emits a new
-// scf.yield whose operands are converted to `yieldTypes`.
-void LoopRowFlattener::rewriteBlock(Block *from, Block *to,
-                                   TypeRange yieldTypes) {
-  rewriter.setInsertionPointToEnd(to);
-  if (!to->empty() && isa<scf::YieldOp>(to->back()))
-    rewriter.eraseOp(to->getTerminator());
-  for (Operation &op : from->without_terminator())
-    rewrite(&op);
-  auto yield = cast<scf::YieldOp>(from->getTerminator());
-  SmallVector<Value> values;
-  for (auto [value, type] : llvm::zip(yield.getOperands(), yieldTypes))
-    values.push_back(get(value, type));
-  rewriter.create<scf::YieldOp>(yield.getLoc(), values);
-}
-
-// 单条指令的布局重写分派：scf.if / tt.reduce / expand_dims / reshape 需要
-// 结构性重建，其余 elementwise、broadcast、splat 只克隆后改结果类型。
-// Per-op dispatch: scf.if, tt.reduce, expand_dims and reshape need structural
-// rebuilding; other elementwise, broadcast and splat ops are cloned and have
-// their result types updated.
-void LoopRowFlattener::rewrite(Operation *op) {
-  // scf.if 的结果按扁平类型重建，两个分支用同一组结果类型重写；条件通常
-  // 是标量，也统一走 get 以保持映射一致。
-  // Rebuild scf.if with flattened result types and rewrite both branches
-  // against them; the condition is fetched through `get` as well.
-  if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
-    SmallVector<Type> types;
-    for (Type type : ifOp.getResultTypes())
-      types.push_back(flatType(type));
-    auto next = rewriter.create<scf::IfOp>(
-        ifOp.getLoc(), types,
-        get(ifOp.getCondition(), ifOp.getCondition().getType()),
-        !ifOp.getElseRegion().empty());
-    next->setAttrs(ifOp->getAttrs());
-    {
-      OpBuilder::InsertionGuard guard(rewriter);
-      rewriteBlock(ifOp.thenBlock(), next.thenBlock(), types);
-      if (!ifOp.getElseRegion().empty())
-        rewriteBlock(ifOp.elseBlock(), next.elseBlock(), types);
-    }
-    mapping.map(ifOp.getResults(), next.getResults());
-    return;
-  }
-
-  if (auto reduce = dyn_cast<triton::ReduceOp>(op)) {
-    // 折叠 R 和 M 不能改变任何一维上的归约语义，因此归约轴 >= 2 时才把轴号
-    // 前移一位并在扁平布局上重建，否则留在逻辑布局边界上。
-    // Collapsing R and M must never change a reduction over either axis.
-    // Such a reduction stays at the logical-layout boundary instead.
-    if (reduce.getAxis() >= 2 &&
-        llvm::all_of(reduce.getSrcs(), [&](Value value) {
-          return flatType(value.getType()) != value.getType();
-        })) {
-      SmallVector<Value> sources;
-      for (Value value : reduce.getSrcs())
-        sources.push_back(get(value, flatType(value.getType())));
-      auto next = rewriter.create<triton::ReduceOp>(reduce.getLoc(), sources,
-                                                    reduce.getAxis() - 1);
-      rewriter.cloneRegionBefore(reduce.getCombineOp(), next.getCombineOp(),
-                                 next.getCombineOp().end());
-      mapping.map(reduce.getResults(), next.getResults());
-      return;
-    }
-  }
-
-  // 折叠前两维后轴号左移一位；源不可折叠时保持原样，不在这里改写。
-  // The axis shifts left by one after the collapse; an unsplittable source is
-  // left untouched here.
-  if (auto expand = dyn_cast<triton::ExpandDimsOp>(op)) {
-    if (expand.getAxis() >= 2 &&
-        flatType(expand.getSrc().getType()) != expand.getSrc().getType()) {
-      auto next = rewriter.create<triton::ExpandDimsOp>(
-          expand.getLoc(),
-          get(expand.getSrc(), flatType(expand.getSrc().getType())),
-          expand.getAxis() - 1);
-      mapping.map(expand.getResult(), next.getResult());
-      return;
-    }
-  }
-
-  if (auto reshape = dyn_cast<triton::ReshapeOp>(op)) {
-    // 这里也覆盖 dot 进出计算区域的视图：两侧都已是计算布局时，视图会直接
-    // 消失，而不是每轮迭代重建一次。
-    // This includes the dot's entry/exit views. Once both sides have the
-    // compute layout, the view disappears instead of being recreated per trip.
-    Value source = mapping.lookupOrDefault(reshape.getSrc());
-    Type type = flatType(reshape.getType());
-    if (original.isDefinedOutsideOfLoop(reshape.getSrc()))
-      source = get(reshape.getSrc(), flatType(reshape.getSrc().getType()));
-    mapping.map(reshape.getResult(), view(source, type));
-    return;
-  }
-
-  // 普通指令：elementwise、broadcast、splat 在结果可折叠时也进入扁平布局，
-  // 否则按原类型克隆。broadcast 只在第 0 个操作数可折叠（源本身就按扁平
-  // 布局广播）时才算可折叠。
-  // Plain ops: elementwise, broadcast and splat also join the flat layout when
-  // their results can be collapsed; a broadcast additionally requires operand
-  // 0 to be collapsible, i.e. the source itself broadcasts in the flat layout.
-  bool elementwise =
-      op->hasTrait<OpTrait::Elementwise>() && op->getNumRegions() == 0;
-  bool broadcast =
-      isa<triton::BroadcastOp>(op) &&
-      flatType(op->getOperand(0).getType()) != op->getOperand(0).getType();
-  bool flatten = (elementwise || broadcast || isa<triton::SplatOp>(op)) &&
-                 llvm::all_of(op->getResultTypes(), [&](Type type) {
-                   return flatType(type) != type;
-                 });
-  // 被折叠的 elementwise / broadcast 指令，其每个张量操作数都必须带上两个
-  // 逻辑行轴。逐查询的掩码或权重先在逻辑布局里广播，再在边界处 view 进
-  // 计算区域。只有 splat 的源是标量，不受此限。
-  // Every tensor operand of a collapsed elementwise/broadcast op must carry
-  // both logical row axes. A per-query mask or weight is broadcast in its
-  // logical layout first, then viewed at the boundary into the compute region.
-  if (flatten && !isa<triton::SplatOp>(op))
-    flatten = llvm::all_of(op->getOperandTypes(), [&](Type type) {
-      return !isa<RankedTensorType>(type) || flatType(type) != type;
-    });
-
-  IRMapping operands = mapping;
-  for (Value operand : op->getOperands())
-    operands.map(operand, get(operand, flatten ? flatType(operand.getType())
-                                               : operand.getType()));
-  Operation *next = rewriter.clone(*op, operands);
-  // 克隆复用同一操作，结果类型需手工改成折叠后的形状。
-  // The cloned results still carry the original logical shape.
-  if (flatten)
-    for (Value result : next->getResults())
-      result.setType(flatType(result.getType()));
-  mapping.map(op->getResults(), next->getResults());
-}
-
-// 收集函数内所有循环，逐个找出 dot 结果被 reshape 成 [rows, M, ...] 的 M；
-// 同一循环内各 dot 给出的 M 必须一致，确认后对该循环做计算区域扁平化。
-// Walks every loop in the function, derives the dot M from the reshape of a dot
-// result to [rows, M, ...] and requires one consistent M per loop before
-// flattening that loop's compute region.
-static void flattenLoopCompute(IRRewriter &rewriter, triton::FuncOp fn,
-                               int64_t rows) {
-  SmallVector<scf::ForOp> loops;
-  fn.walk([&](scf::ForOp loop) { loops.push_back(loop); });
-  for (scf::ForOp loop : loops) {
-    std::optional<int64_t> dotRows;
-    bool consistent = true;
-    loop.walk([&](triton::DotOp dot) {
-      for (Operation *user : dot.getResult().getUsers()) {
-        auto reshape = dyn_cast<triton::ReshapeOp>(user);
-        if (!reshape)
-          continue;
-        auto type = cast<RankedTensorType>(reshape.getType());
-        if (type.getRank() != 3 || type.getShape()[0] != rows)
-          continue;
-        int64_t m = type.getShape()[1];
-        consistent &= !dotRows || *dotRows == m;
-        dotRows = m;
-      }
-    });
-    if (dotRows && consistent)
-      LoopRowFlattener(rewriter, loop, rows, *dotRows).run();
-  }
+// 相同布局直接复用，只有实际跨越计算/访存边界时才生成保持顺序的视图。
+Value RowLiftBuilder::view(Value value, Type type) {
+  return value.getType() == type
+             ? value
+             : reshape(value, cast<RankedTensorType>(type).getShape());
 }
 
 //===----------------------------------------------------------------------===//
@@ -2114,7 +1858,9 @@ Value RowLiftBuilder::rebuildHalfOperand(Value original,
                        triton::ExpandDimsOp>(source))
     return Value();
   Value src = source->getOperand(0);
-  src = ensureRowDimension(src);
+  auto originalType = dyn_cast<RankedTensorType>(original.getType());
+  bool flat = originalType && halfType.getRank() == originalType.getRank();
+  src = getRowValue(src, flat);
   return collapseAcrossLastDim(src, halfType) ? broadcastRowValue(src, halfType)
                                               : Value();
 }
@@ -2273,26 +2019,27 @@ bool RowLiftBuilder::rewriteSplitDot(triton::DotOp dot) {
   if (!hasRowDimension(dot.getA()) || hasRowDimension(dot.getB()))
     return false;
 
-  // 累加器的两个半宽必须是同类型的 [R,G,W/2] 三维值。
+  // 两半累加器在计算区域为 [R*G,W/2]，旧 Dot 路径仍使用 [R,G,W/2]。
+  bool flat = flatOperations.contains(dot);
   auto accumulatorType =
       dyn_cast<RankedTensorType>(accumulator->second.first.getType());
-  if (!accumulatorType || accumulatorType.getRank() != 3)
+  if (!accumulatorType || accumulatorType.getRank() != (flat ? 2 : 3))
     return false;
   if (accumulator->second.second.getType() != accumulatorType)
     return false;
 
   // A 展平成 [R*G,K]；B 的两半必须是同形的 [K,W/2]，末维与累加器半宽一致。
-  Value a = flattenDotRows(ensureRowDimension(dot.getA()));
+  Value a = flattenDotRows(getRowValue(dot.getA(), flat));
   auto bType = dyn_cast<RankedTensorType>(b->second.first.getType());
   if (!bType || bType.getRank() != 2 || b->second.second.getType() != bType ||
       bType.getShape().back() != accumulatorType.getShape().back())
     return false;
 
-  int64_t rows = accumulatorType.getShape()[0];
-  int64_t flatRows = rows * accumulatorType.getShape()[1];
-  auto flatType =
-      RankedTensorType::get({flatRows, accumulatorType.getShape()[2]},
-                            accumulatorType.getElementType());
+  int64_t flatRows = candidate.rowsPerProgram *
+                     cast<RankedTensorType>(dot.getType()).getShape()[0];
+  auto dotType = RankedTensorType::get(
+      {flatRows, accumulatorType.getShape().back()},
+      accumulatorType.getElementType());
 
   // 对每个半宽各发一次 dot：A 与 B 的对应半宽、以及累加器的对应半宽。
   SmallVector<Value> operands0{a, b->second.first,
@@ -2303,9 +2050,10 @@ bool RowLiftBuilder::rewriteSplitDot(triton::DotOp dot) {
   for (const SmallVector<Value> &operands : {operands0, operands1}) {
     Operation *created =
         rewriter.create(dot.getLoc(), dot->getName().getIdentifier(), operands,
-                        TypeRange{flatType}, dot->getAttrs());
-    halves.push_back(
-        reshape(created->getResult(0), accumulatorType.getShape()));
+                        TypeRange{dotType}, dot->getAttrs());
+    halves.push_back(flat ? created->getResult(0)
+                          : reshape(created->getResult(0),
+                                    accumulatorType.getShape()));
   }
   // 结果仍以半宽对的形式登记，后续消费者继续走拆分感知路径。
   splitValues[dot.getResult()] = {halves[0], halves[1]};
@@ -2325,7 +2073,8 @@ bool RowLiftBuilder::rewriteSplitElementwise(Operation *op) {
     return false;
 
   // 结果的提升类型必须能均分，半宽形状即最后一维减半。
-  auto halfType = halvedType(getLiftedType(resultType));
+  bool flat = flatOperations.contains(op);
+  auto halfType = halvedType(getLiftedType(resultType, flat));
   if (!halfType)
     return false;
 
@@ -2342,8 +2091,7 @@ bool RowLiftBuilder::rewriteSplitElementwise(Operation *op) {
       operands.push_back({operand, operand});
       continue;
     }
-    auto operandHalfType =
-        halvedType(getLiftedType(cast<RankedTensorType>(operand.getType())));
+    auto operandHalfType = halvedType(getLiftedType(operand.getType(), flat));
     if (!operandHalfType)
       return false;
     auto split = splitValues.find(operand);
@@ -2511,6 +2259,7 @@ bool RowLiftBuilder::run(triton::FuncOp fn) {
   plannedHalfWidths.clear();
   if (!planWideAccumulatorSplits(loop))
     return false;
+  planFlatCompute(loop);
   // 新建一个空 block 作为重建目标，先挂到函数体尾部，成功后替换旧 block。
   auto *fresh = new Block();
   fn.getBody().push_back(fresh);
@@ -2524,7 +2273,25 @@ bool RowLiftBuilder::run(triton::FuncOp fn) {
   }
 
   rewriter.setInsertionPointToStart(fresh);
+  SmallVector<Operation *> captures;
   for (Operation &op : old->without_terminator()) {
+    // 循环外的纯计算捕获值延迟到使用前发出，保持原展平路径的活性区间。
+    // 这里只延迟首次生成，不创建或重写第二套 IR；提前使用的值先统一发出。
+    if (flatOperations.contains(&op) &&
+        !isPidInvariant(op.getResult(0), candidate.anchor->getResult(0))) {
+      captures.push_back(&op);
+      continue;
+    }
+    if (&op == computeLoop || llvm::any_of(captures, [&](Operation *capture) {
+          return llvm::any_of(capture->getUsers(), [&](Operation *user) {
+            return &op == user || op.isAncestor(user);
+          });
+        })) {
+      for (Operation *capture : captures)
+        if (!rewrite(capture))
+          return false;
+      captures.clear();
+    }
     // 锚点就是程序号 tt.get_program_id：把单个 pid 展开成组内连续行号，
     // 不把原 pid 交给后续指令。
     if (&op == candidate.anchor) {
@@ -2612,8 +2379,6 @@ bool RowLiftBuilder::run(triton::FuncOp fn) {
   rewriter.create<triton::ReturnOp>(fn.getLoc());
   old->dropAllDefinedValueUses();
   old->erase();
-  if (features.flatCompute)
-    flattenLoopCompute(rewriter, fn, candidate.rowsPerProgram);
   return true;
 }
 
@@ -2627,8 +2392,9 @@ bool RowLiftBuilder::run(triton::FuncOp fn) {
 //   3) 带 region 的形态（tt.reduce / tt.make_tensor_ptr / scf.if）逐个重建；
 //   4) 描述符访存、循环内行相关访存、dot / splat / expand / reshape / trans
 //      走各自的形状规则；
-//   5) 其余形态走通用克隆，操作数统一补行维、结果类型统一加行维。
+//   5) 其余形态按布局计划统一转换操作数与结果类型。
 bool RowLiftBuilder::rewrite(Operation *op) {
+  bool flat = flatOperations.contains(op);
   // 步骤 0：循环是唯一会改变循环进位值个数的形态。
   if (auto loop = dyn_cast<scf::ForOp>(op))
     return rewriteLoop(loop);
@@ -2725,43 +2491,44 @@ bool RowLiftBuilder::rewrite(Operation *op) {
     if (op->getParentOfType<scf::ForOp>() || candidate.runtimeGrid)
       return rewriteRowLoad(load);
 
-  // 步骤 4c：dot。只有 A 与查询行相关、B 与行无关时才提升：把 [R,M,K] 展平
-  // 成 [R*M,K] 复用普通 dot，结果再 reshape 回 [R,M,N]。
+  // 步骤 4c：只有 A 与查询行相关、B 与行无关时才提升 dot。计算布局直接
+  // 使用 [R*M,K]；未开启 flatCompute 的原 Dot 路径在边界恢复 [R,M,N]。
   if (auto dot = dyn_cast<triton::DotOp>(op)) {
     if (!hasRowDimension(dot.getA()) || hasRowDimension(dot.getB()))
       return false;
 
     auto result = cast<RankedTensorType>(dot.getType());
-    SmallVector<Value> operands{flattenDotRows(ensureRowDimension(dot.getA())),
+    SmallVector<Value> operands{flattenDotRows(getRowValue(dot.getA(), flat)),
                                 getMappedValue(dot.getB()),
-                                flattenDotRows(ensureRowDimension(dot.getC()))};
+                                flattenDotRows(getRowValue(dot.getC(), flat))};
     Type flatType = RankedTensorType::get(
         {candidate.rowsPerProgram * result.getShape()[0], result.getShape()[1]},
         result.getElementType());
     Operation *d =
         rewriter.create(op->getLoc(), op->getName().getIdentifier(), operands,
                         TypeRange{flatType}, op->getAttrs());
-    valueMapping.map(
-        dot.getResult(),
-        reshape(d->getResult(0), getLiftedType(result).getShape()));
+    valueMapping.map(dot.getResult(),
+                     flat ? d->getResult(0)
+                          : reshape(d->getResult(0),
+                                    getLiftedType(result).getShape()));
     return true;
   }
 
   // 步骤 4d：标量 splat 变成「先补行维再广播到提升形状」。
   if (auto splat = dyn_cast<triton::SplatOp>(op)) {
     valueMapping.map(splat.getResult(),
-                     broadcastRowValue(ensureRowDimension(splat.getSrc()),
+                     broadcastRowValue(getRowValue(splat.getSrc()),
                                        getLiftedType(splat.getType())));
     return true;
   }
 
-  // 步骤 4e：插入维度时轴号整体后移一位，因为行维占用了 0 号轴。
+  // 步骤 4e：逻辑布局的轴号后移一位；展平布局沿用原来 M 之后的插维轴。
   if (auto expand = dyn_cast<triton::ExpandDimsOp>(op)) {
     valueMapping.map(expand.getResult(),
                      rewriter
                          .create<triton::ExpandDimsOp>(
-                             op->getLoc(), ensureRowDimension(expand.getSrc()),
-                             expand.getAxis() + 1)
+                             op->getLoc(), getRowValue(expand.getSrc(), flat),
+                             expand.getAxis() + (flat ? 0 : 1))
                          .getResult());
     return true;
   }
@@ -2772,8 +2539,8 @@ bool RowLiftBuilder::rewrite(Operation *op) {
     // the lifted tensor could mix values belonging to different
     // programs.
     valueMapping.map(view.getResult(),
-                     reshape(ensureRowDimension(view.getSrc()),
-                             getLiftedType(view.getType()).getShape()));
+                     reshape(getRowValue(view.getSrc(), flat),
+                             getLiftedType(view.getType(), flat).getShape()));
     return true;
   }
 
@@ -2786,7 +2553,7 @@ bool RowLiftBuilder::rewrite(Operation *op) {
         trans.getResult(),
         rewriter
             .create<triton::TransOp>(op->getLoc(),
-                                     ensureRowDimension(trans.getSrc()), order)
+                                     getRowValue(trans.getSrc()), order)
             .getResult());
     return true;
   }
@@ -2810,14 +2577,14 @@ bool RowLiftBuilder::rewrite(Operation *op) {
       return false;
   }
 
-  // 步骤 5：通用克隆。操作数统一补行维，结果类型统一在首部插入 [R]。
+  // 步骤 5：操作数与结果使用同一计划布局，直接生成最终计算操作。
   SmallVector<Value> operands;
   for (Value v : op->getOperands())
-    operands.push_back(ensureRowDimension(v));
+    operands.push_back(getRowValue(v, flat));
 
   SmallVector<Type> types;
   for (Type t : op->getResultTypes())
-    types.push_back(getLiftedType(t));
+    types.push_back(getLiftedType(t, flat));
 
   Operation *cloned =
       rewriter.create(op->getLoc(), op->getName().getIdentifier(), operands,
