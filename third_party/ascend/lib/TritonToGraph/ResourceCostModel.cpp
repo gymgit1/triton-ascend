@@ -199,6 +199,74 @@ bool isPipelinedBuffer(Value value) {
   return false;
 }
 
+bool isDotOperation(Operation *operation) {
+  if (!operation)
+    return false;
+  const StringRef name = operation->getName().getStringRef();
+  return name == "tt.dot" || name == "tt.dot_scaled";
+}
+
+// Tensors that ssbuffer keeps two live copies of: the tiles handed from the
+// vector scope to the cube scope (dot operands: A/B tiles loaded or computed
+// in the loop) and the tiles handed back (dot results and accumulators that
+// the vector scope consumes). They appear as #hivm.tightly_coupled_buffer
+// memrefs in the lowered adapter, so at ttir level the dot sites are the
+// exact producers/consumers to look at.
+bool crossesCoreBoundary(Value value) {
+  if (isDotOperation(getValueDefiningOperation(value)))
+    return true;
+  return llvm::any_of(value.getUsers(), isDotOperation);
+}
+
+// A tensor whose only consumers are dots is staged in L1 (cbuf) by the
+// lowering (see the #hivm.address_space<cbuf> memrefs in the adapter), so it
+// never occupies UB and must not be charged to the UB budget. Dot results are
+// kept, they do land back in UB.
+bool isDotOperandOnly(Value value) {
+  if (isDotOperation(getValueDefiningOperation(value)))
+    return false;
+  bool hasUser = false;
+  for (Operation *user : value.getUsers()) {
+    hasUser = true;
+    if (!isDotOperation(user))
+      return false;
+  }
+  return hasUser;
+}
+
+// Tensors ssbuffer keeps three live copies of: loop-local values whose
+// producer and consumer are in the same core but in different iterations.
+// At ttir level that is a value defined in the loop body that escapes it or
+// is carried by scf.yield. GM loads are excluded, they follow the LoadStore
+// count, not the IntraCore one.
+bool isIntraCoreBuffer(Value value) {
+  Operation *owner = getValueDefiningOperation(value);
+  if (!owner || isa<BlockArgument>(value))
+    return false;
+  const StringRef name = owner->getName().getStringRef();
+  if (name == "tt.load" || name == "tt.descriptor_load")
+    return false;
+  Operation *loop = nullptr;
+  for (Operation *parent = owner->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    const StringRef parentName = parent->getName().getStringRef();
+    if (parentName == "scf.for" || parentName == "scf.while") {
+      loop = parent;
+      break;
+    }
+  }
+  if (!loop)
+    return false;
+  for (Operation *user : value.getUsers()) {
+    if (user->getParentOp() == loop &&
+        user->getName().getStringRef() == "scf.yield")
+      return true;
+    if (!loop->isAncestor(user))
+      return true;
+  }
+  return false;
+}
+
 struct ConditionalRegion {
   Operation *conditional = nullptr;
   unsigned region = 0;
@@ -472,11 +540,15 @@ LiveByteEstimate cfg::estimatePeakLiveBytes(Operation *root) {
     uint64_t end = 0;
     uint64_t bytes = 0;
     bool pipelined = false;
+    bool interCore = false;
+    bool intraCore = false;
   };
   llvm::DenseMap<Value, IntervalState> intervals;
 
   auto addValue = [&](Value value) {
     if (!isTensorValue(value) || !isUBResidentTensor(value))
+      return;
+    if (isDotOperandOnly(value))
       return;
     Value canonical = findCanonicalValue(value, canonicalValues);
     if (intervals.count(canonical))
@@ -499,7 +571,9 @@ LiveByteEstimate cfg::estimatePeakLiveBytes(Operation *root) {
     const uint64_t begin = getDefinitionOrder(canonical, order);
     intervals.try_emplace(canonical,
                           IntervalState{canonical, begin, begin, *bytes,
-                                        isPipelinedBuffer(canonical)});
+                                        isPipelinedBuffer(canonical),
+                                        crossesCoreBoundary(canonical),
+                                        isIntraCoreBuffer(canonical)});
   };
 
   for (Operation *operation : operations) {
@@ -593,10 +667,20 @@ LiveByteEstimate cfg::estimatePeakLiveBytes(Operation *root) {
         estimate.reason = ResourceCostRejectReason::Overflow;
         return estimate;
       }
+      uint64_t replication = 1;
+      if (state->pipelined &&
+          state->bytes <= kUBPipelinedReplicatedMaxBytes)
+        replication = kUBMultiBufferReplication;
+      // A CV-boundary buffer is ping-ponged by ssbuffer. The in-loop load that
+      // feeds a dot is covered by both mechanisms, but only one extra copy is
+      // materialized, so the factors combine with max(), never multiply.
+      if (state->interCore)
+        replication = std::max(replication, kUBInterCoreReplication);
+      // Loop-local same-core buffers are rotated by the IntraCore count.
+      if (state->intraCore)
+        replication = std::max(replication, kUBIntraCoreReplication);
       uint64_t demand = 0;
-      if (!checkedMul(state->bytes,
-                      state->pipelined ? kUBMultiBufferReplication : 1,
-                      demand) ||
+      if (!checkedMul(state->bytes, replication, demand) ||
           !checkedAdd(pipelinedBytes, demand, pipelinedBytes)) {
         estimate.overflow = true;
         estimate.reason = ResourceCostRejectReason::Overflow;

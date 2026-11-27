@@ -97,6 +97,23 @@ struct ResourceSnapshot {
 
 constexpr uint64_t kUBMultiBufferReplication = 2;
 
+// ssbuffer (dynamic CV pipeline) duplicates every buffer that crosses the
+// CUBE/VECTOR boundary as a ping-pong pair: the input copy is consumed while
+// the output copy is produced. That is one extra live copy per crossing
+// buffer, same replication factor as software pipelining.
+constexpr uint64_t kUBInterCoreReplication = 2;
+
+// ssbuffer also rotates the loop-local tensors whose producer and consumer sit
+// in the same core (BufferCountManager IntraCore default). GM loads are not
+// part of it: they use the LoadStore count of one.
+constexpr uint64_t kUBIntraCoreReplication = 3;
+
+// Measured on the NSA bwd dQ kernel: enabling multibuffer changes the real UB
+// allocation by ~2 KiB, i.e. only the small index/scalar buffers are really
+// duplicated. Large tensors reuse a single slot, so the pipelining factor is
+// only charged to buffers at or below this size.
+constexpr uint64_t kUBPipelinedReplicatedMaxBytes = 4096;
+
 struct LiveTensorInterval {
   Value value;
   uint64_t begin = 0;
